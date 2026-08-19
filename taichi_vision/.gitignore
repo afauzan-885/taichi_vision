@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+taichi_algorithm/aot_tcm/.cpu_aot_cache/
+taichi_algorithm/aot_tcm/**/.cpu_aot_cache/
+taichi_algorithm/aot_tcm/.quarantine*/
+taichi_algorithm/aot_py/**/*.obj
+taichi_algorithm/aot_py/**/*.exp
+taichi_algorithm/aot_py/**/*.lib
+taichi_algorithm/aot_py/test_output*/
+taichi_algorithm/aot_py/test_report.txt
