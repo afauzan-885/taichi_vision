@@ -45,7 +45,7 @@ class LLVM20RuntimePathTests(unittest.TestCase):
     def test_invalid_explicit_root_fails_closed(self) -> None:
         with mock.patch.dict(
             "os.environ",
-            {"PIXEL_REFINE_RUNTIME_ROOT": r"C:\\does-not-exist-pixel-refine"},
+            {"PIXEL_REFINE_RUNTIME_ROOT": "missing-runtime-root"},
             clear=False,
         ):
             with self.assertRaises(RuntimeError):

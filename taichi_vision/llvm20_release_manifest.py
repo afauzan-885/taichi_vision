@@ -17,7 +17,7 @@ from typing import Any
 import zipfile
 
 
-DEFAULT_ROOT = Path(r"D:\development_build\taichi_runtime_llvm20")
+DEFAULT_ROOT = Path(__file__).resolve().parent / "runtime"
 TARGETS = (
     "cpu_x86_64_windows",
     "cuda_x86_64_windows_nvidia",

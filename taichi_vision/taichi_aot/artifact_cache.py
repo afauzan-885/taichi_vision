@@ -25,7 +25,8 @@ def _cache_path():
 def artifact_key(path, backend, device_id=0, device_name="unknown"):
     # Windows paths are case-insensitive, but ``Path.resolve()`` and a
     # subprocess launched through a differently-cased drive letter can yield
-    # ``E:\\...`` versus ``e:\\...``.  Hash a canonical real path so a valid
+    # Case differences in drive-qualified paths are normalized by Path.resolve.
+    # Hash a canonical real path so a valid
     # artifact is not mistaken for a different (and quarantined) artifact.
     path = os.path.normcase(os.path.realpath(os.path.abspath(path)))
     st = os.stat(path) if os.path.isfile(path) else None

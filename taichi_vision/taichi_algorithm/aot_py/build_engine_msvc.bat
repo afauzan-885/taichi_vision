@@ -4,7 +4,7 @@ setlocal EnableExtensions
 set "SCRIPT_DIR=%~dp0."
 set "PROJECT_ROOT=%~dp0..\..\.."
 set "TAICHI_ROOT=%PROJECT_ROOT%\test_algorithm\taichi_upstream\stable-v1.7.4-development"
-set "VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
+if not defined VSDEVCMD if defined PIXEL_REFINE_VSDEVCMD set "VSDEVCMD=%PIXEL_REFINE_VSDEVCMD%"
 set "TAICHI_INC=%TAICHI_ROOT%\c_api\include"
 rem OpenGL and Vulkan are enabled together in the production pr-vk build.  The
 rem old pr-msvc cache has both GPU backends disabled and cannot link this
@@ -93,6 +93,10 @@ if /I not "%BRIDGE_CRT%"=="MT" if /I not "%BRIDGE_CRT%"=="MD" (
 )
 set "BRIDGE_CRT_FLAG=/%BRIDGE_CRT%"
 
+if not defined VSDEVCMD (
+  echo ERROR: set VSDEVCMD or PIXEL_REFINE_VSDEVCMD to VsDevCmd.bat.
+  exit /b 2
+)
 if not exist "%VSDEVCMD%" (
   echo ERROR: Visual Studio 2022 Build Tools were not found.
   exit /b 2

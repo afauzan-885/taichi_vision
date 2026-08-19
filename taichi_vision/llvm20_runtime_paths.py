@@ -14,13 +14,19 @@ packagers, compiler workers, and the runtime bridge loader.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 
-LLVM20_STAGING_ROOT = Path(r"D:\development_build\taichi_runtime_llvm20")
-LLVM20_RELEASE_ROOT = LLVM20_STAGING_ROOT / "release"
 PROJECT_ROOT = Path(__file__).resolve().parent
+FROZEN_ROOT = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT.parent)).resolve()
+# These are package-relative defaults.  They intentionally do not name a
+# developer workstation or drive letter.  Release builds may place a payload
+# under ``runtime/`` or directly beside the frozen application; source builds
+# normally use the checked-in project bridge/TCM fallback below.
+LLVM20_STAGING_ROOT = FROZEN_ROOT / "runtime"
+LLVM20_RELEASE_ROOT = LLVM20_STAGING_ROOT / "release"
 PROJECT_TCM_ROOT = PROJECT_ROOT / "taichi_algorithm" / "aot_tcm"
 PROJECT_BRIDGE_ROOT = PROJECT_ROOT / "taichi_algorithm" / "aot_py" / "aot_dll"
 
@@ -59,15 +65,23 @@ def runtime_root() -> Optional[Path]:
             )
         return candidate
 
-    # Auto-discovery is intentionally limited to the known developer staging
-    # root.  Prefer the pruned release payload so normal application launches
-    # do not accidentally bind to compiler/development artifacts.  Keep the
-    # parent staging tree as a compatibility fallback while the release is
-    # being assembled or when a developer explicitly needs its extra files.
-    if LLVM20_RELEASE_ROOT.is_dir() and (LLVM20_RELEASE_ROOT / "bundles").is_dir():
-        return LLVM20_RELEASE_ROOT
-    if LLVM20_STAGING_ROOT.is_dir() and (LLVM20_STAGING_ROOT / "bundles").is_dir():
-        return LLVM20_STAGING_ROOT
+    # Auto-discovery is relative to the package/frozen application only.
+    # Prefer a release payload over a staging payload and never reach into a
+    # developer-specific absolute path.
+    candidates = (
+        LLVM20_RELEASE_ROOT,
+        LLVM20_STAGING_ROOT,
+        FROZEN_ROOT / "release",
+        FROZEN_ROOT,
+    )
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_dir() and (candidate / "bundles").is_dir():
+            return candidate
     return None
 
 
