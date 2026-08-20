@@ -24,6 +24,11 @@ jobs:
   cpu-safe-hardening:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      AOT_MODE: "1"
+      AOT_ARCH: "cpu"
+      PIXEL_REFINE_AOT_ARCH: "cpu"
+      PIXEL_REFINE_BACKEND: "cpu"
 
     steps:
       - name: Checkout
