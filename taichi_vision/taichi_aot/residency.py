@@ -74,8 +74,15 @@ class DeviceResidencyCache:
         self._size_bytes = 0
         self._generation = count(1)
         self._lock = threading.RLock()
-        self._stats = {"hits": 0, "misses": 0, "admissions": 0, "rejects": 0,
-                       "evictions": 0, "bytes_evicted": 0}
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "admissions": 0,
+            "rejects": 0,
+            "evictions": 0,
+            "bytes_evicted": 0,
+            "dispose_errors": 0,
+        }
 
     @property
     def size_bytes(self):
@@ -89,9 +96,30 @@ class DeviceResidencyCache:
             )
 
     def set_budget(self, max_bytes):
+        disposals = []
         with self._lock:
             self.max_bytes = max(0, int(max_bytes))
-            self._collect(0)
+            disposals.extend(self._reap_invalidated_locked())
+            # Budget changes are authoritative immediately for admission and
+            # logical visibility.  Entries that cannot be disposed yet are
+            # marked invalidated so their final lease/fence release completes
+            # the transition rather than letting them become reusable again.
+            projected = self._size_bytes
+            for key, entry in self._eviction_candidates(""):
+                if projected <= self.max_bytes:
+                    break
+                if entry.invalidated:
+                    projected -= entry.size_bytes
+                    continue
+                if entry.can_evict():
+                    detached = self._detach_locked(key, entry)
+                    if detached is not None:
+                        disposals.append(detached)
+                    projected = self._size_bytes
+                else:
+                    entry.invalidated = True
+                    projected -= entry.size_bytes
+        self._dispose_detached(disposals)
 
     def _owner_usage(self, owner):
         return self._owner_bytes.get(owner, 0)
@@ -119,24 +147,75 @@ class DeviceResidencyCache:
             borrowed = self._owner_usage(entry.owner) > reservation.soft_bytes
             same_owner = entry.owner == requesting_owner
             return (not borrowed, not same_owner, entry.hit_count, entry.last_access)
+
         return sorted(self._entries.items(), key=priority)
 
-    def _evict(self, key, entry):
+    def _detach_locked(self, key, entry):
+        """Detach one entry atomically; caller must hold ``_lock``.
+
+        Native/resource disposal is intentionally *not* executed here.  The
+        returned callback payload is consumed after releasing the cache lock,
+        preventing residency -> engine/native lock inversion.
+        """
+        current = self._entries.get(key)
+        if current is not entry:
+            return None
         self._entries.pop(key, None)
-        self._size_bytes -= entry.size_bytes
-        self._owner_bytes[entry.owner] = max(0, self._owner_usage(entry.owner) - entry.size_bytes)
+        self._size_bytes = max(0, self._size_bytes - entry.size_bytes)
+        remaining = max(0, self._owner_usage(entry.owner) - entry.size_bytes)
+        if remaining:
+            self._owner_bytes[entry.owner] = remaining
+        else:
+            self._owner_bytes.pop(entry.owner, None)
         self._stats["evictions"] += 1
         self._stats["bytes_evicted"] += entry.size_bytes
-        if entry.dispose is not None:
-            entry.dispose(entry.buffer)
+        return (entry.dispose, entry.buffer)
 
-    def _collect(self, incoming_bytes, requesting_owner=""):
+    def _dispose_detached(self, disposals):
+        """Run detached resource callbacks without holding the residency lock."""
+        first_error = None
+        for callback, buffer in disposals:
+            if callback is None:
+                continue
+            try:
+                callback(buffer)
+            except Exception as exc:
+                with self._lock:
+                    self._stats["dispose_errors"] += 1
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def _reap_invalidated_locked(self):
+        """Detach invalidated entries whose lease/fence is now releasable."""
+        disposals = []
+        for key, entry in list(self._entries.items()):
+            if entry.invalidated and entry.can_evict():
+                detached = self._detach_locked(key, entry)
+                if detached is not None:
+                    disposals.append(detached)
+        return disposals
+
+    def _plan_admission_locked(self, incoming_bytes, requesting_owner, previous=None):
+        """Return evictions needed for admission without mutating the cache.
+
+        ``previous`` is a same-key entry that will be replaced atomically.  Its
+        bytes are removed from the projected footprint before deciding whether
+        additional entries need eviction, avoiding temporary double-counting.
+        """
+        projected = self._size_bytes - (previous.size_bytes if previous is not None else 0)
+        planned = []
         for key, entry in self._eviction_candidates(requesting_owner):
-            if self._size_bytes + incoming_bytes <= self.max_bytes:
+            if projected + incoming_bytes <= self.max_bytes:
                 break
-            if entry.can_evict():
-                self._evict(key, entry)
-        return self._size_bytes + incoming_bytes <= self.max_bytes
+            if previous is not None and entry is previous:
+                continue
+            if entry.invalidated or not entry.can_evict():
+                continue
+            planned.append((key, entry))
+            projected -= entry.size_bytes
+        return projected + incoming_bytes <= self.max_bytes, planned
 
     def put(
         self, key, owner, buffer, size_bytes, dispose=None, fence_ready=None,
@@ -145,85 +224,129 @@ class DeviceResidencyCache:
         key, owner, size_bytes = str(key), str(owner), int(size_bytes)
         if size_bytes <= 0:
             raise ValueError("resident entry size must be positive")
+
+        disposals = []
+        entry = None
         with self._lock:
-            reservation = self._reservation(owner, owner)
-            if (
-                self.max_bytes == 0
-                or size_bytes > self.max_bytes
-                or (reservation.hard_bytes is not None
-                    and self._owner_usage(owner) + size_bytes > reservation.hard_bytes)
-            ):
-                self._stats["rejects"] += 1
-                return None
+            disposals.extend(self._reap_invalidated_locked())
             previous = self._entries.get(key)
-            if previous is not None:
-                # A producer fence is an ownership boundary even when no
-                # Python lease is active yet.  Replacing an entry before its
-                # fence signals would dispose an in-flight native buffer and
-                # can race the queue.  Keep the old entry until it is safe;
-                # the caller can retry admission after synchronization.
-                if not previous.can_evict():
-                    self._stats["rejects"] += 1
-                    return None
-                self._evict(key, previous)
-            if not self._collect(size_bytes, owner):
+            if previous is not None and not previous.can_evict():
                 self._stats["rejects"] += 1
-                return None
-            entry = ResidentEntry(
-                key, owner, buffer, size_bytes,
-                generation=next(self._generation), last_access=time.monotonic(),
-                dispose=dispose, fence_ready=fence_ready,
-                checksum=checksum, source_checksum=source_checksum,
-            )
-            self._entries[key] = entry
-            self._size_bytes += size_bytes
-            self._owner_bytes[owner] = self._owner_usage(owner) + size_bytes
-            self._stats["admissions"] += 1
-            return entry
+                rejected = True
+            else:
+                reservation = self._reservation(owner, owner)
+                replaced_owner_bytes = (
+                    previous.size_bytes
+                    if previous is not None and previous.owner == owner
+                    else 0
+                )
+                projected_owner = self._owner_usage(owner) - replaced_owner_bytes + size_bytes
+                rejected = (
+                    self.max_bytes == 0
+                    or size_bytes > self.max_bytes
+                    or (
+                        reservation.hard_bytes is not None
+                        and projected_owner > reservation.hard_bytes
+                    )
+                )
+                planned = []
+                if not rejected:
+                    fits, planned = self._plan_admission_locked(
+                        size_bytes, owner, previous=previous
+                    )
+                    rejected = not fits
+
+                if rejected:
+                    self._stats["rejects"] += 1
+                else:
+                    # All admission checks succeeded without mutation.  Only
+                    # now detach the old key/additional victims, then publish
+                    # the replacement while the cache lock still serializes
+                    # visibility/accounting.
+                    if previous is not None:
+                        detached = self._detach_locked(key, previous)
+                        if detached is not None:
+                            disposals.append(detached)
+                    for victim_key, victim in planned:
+                        detached = self._detach_locked(victim_key, victim)
+                        if detached is not None:
+                            disposals.append(detached)
+
+                    entry = ResidentEntry(
+                        key,
+                        owner,
+                        buffer,
+                        size_bytes,
+                        generation=next(self._generation),
+                        last_access=time.monotonic(),
+                        dispose=dispose,
+                        fence_ready=fence_ready,
+                        checksum=checksum,
+                        source_checksum=source_checksum,
+                    )
+                    self._entries[key] = entry
+                    self._size_bytes += size_bytes
+                    self._owner_bytes[owner] = self._owner_usage(owner) + size_bytes
+                    self._stats["admissions"] += 1
+
+        self._dispose_detached(disposals)
+        return entry
 
     def peek(self, key):
         with self._lock:
             return self._entries.get(str(key))
 
     def invalidate(self, key):
+        key = str(key)
+        disposals = []
         with self._lock:
-            entry = self._entries.get(str(key))
-            # Invalidation disposes the native payload immediately.  Treat
-            # both active leases and an unsignalled/failed producer fence as
-            # non-evictable so explicit invalidation cannot race the queue.
-            if entry is None or not entry.can_evict():
-                return False
-            self._evict(str(key), entry)
-            return True
+            disposals.extend(self._reap_invalidated_locked())
+            entry = self._entries.get(key)
+            if entry is None:
+                found = False
+            else:
+                found = True
+                entry.invalidated = True
+                if entry.can_evict():
+                    detached = self._detach_locked(key, entry)
+                    if detached is not None:
+                        disposals.append(detached)
+        self._dispose_detached(disposals)
+        return found
 
     def invalidate_owner(self, owner):
-        """Evict idle resident entries owned by a quarantined operation."""
+        """Logically invalidate resident entries owned by a quarantined operation."""
         owner = str(owner)
         invalidated = 0
+        disposals = []
         with self._lock:
+            disposals.extend(self._reap_invalidated_locked())
             for key, entry in list(self._entries.items()):
                 if entry.owner != owner:
                     continue
-                # Do not dispose a buffer while another dispatch still leases
-                # it. Mark it stale instead; ``lease`` removes it as soon as
-                # the last consumer releases the entry.
-                if not entry.can_evict():
-                    entry.invalidated = True
-                    invalidated += 1
-                    continue
-                self._evict(key, entry)
+                entry.invalidated = True
                 invalidated += 1
+                if entry.can_evict():
+                    detached = self._detach_locked(key, entry)
+                    if detached is not None:
+                        disposals.append(detached)
+        self._dispose_detached(disposals)
         return invalidated
 
     def get(self, key):
+        key = str(key)
+        disposals = []
         with self._lock:
-            entry = self._entries.get(str(key))
+            disposals.extend(self._reap_invalidated_locked())
+            entry = self._entries.get(key)
             if entry is None or entry.invalidated:
                 if entry is not None and entry.can_evict():
-                    self._evict(str(key), entry)
+                    detached = self._detach_locked(key, entry)
+                    if detached is not None:
+                        disposals.append(detached)
                 self._stats["misses"] += 1
-                return None
-            if entry.fence_ready is not None:
+                result = None
+            elif entry.fence_ready is not None:
                 try:
                     ready = bool(entry.fence_ready())
                 except Exception:
@@ -233,40 +356,83 @@ class DeviceResidencyCache:
                     # entry resident, but do not hand its native handle to a
                     # consumer that could race the upload/dispatch.
                     self._stats["misses"] += 1
-                    return None
-            entry.hit_count += 1
-            entry.last_access = time.monotonic()
-            self._entries.move_to_end(str(key))
-            self._stats["hits"] += 1
-            return entry
+                    result = None
+                else:
+                    entry.hit_count += 1
+                    entry.last_access = time.monotonic()
+                    self._entries.move_to_end(key)
+                    self._stats["hits"] += 1
+                    result = entry
+            else:
+                entry.hit_count += 1
+                entry.last_access = time.monotonic()
+                self._entries.move_to_end(key)
+                self._stats["hits"] += 1
+                result = entry
+        self._dispose_detached(disposals)
+        return result
 
     @contextmanager
     def lease(self, key):
+        key = str(key)
+        disposals = []
         with self._lock:
-            entry = self.get(key)
-            if entry is not None:
-                entry.ref_count += 1
-                generation = entry.generation
-            else:
+            disposals.extend(self._reap_invalidated_locked())
+            entry = self._entries.get(key)
+            if entry is None or entry.invalidated:
+                entry = None
                 generation = None
+                self._stats["misses"] += 1
+            else:
+                if entry.fence_ready is not None:
+                    try:
+                        ready = bool(entry.fence_ready())
+                    except Exception:
+                        ready = False
+                    if not ready:
+                        entry = None
+                if entry is None:
+                    generation = None
+                    self._stats["misses"] += 1
+                else:
+                    entry.hit_count += 1
+                    entry.last_access = time.monotonic()
+                    self._entries.move_to_end(key)
+                    self._stats["hits"] += 1
+                    entry.ref_count += 1
+                    generation = entry.generation
+        self._dispose_detached(disposals)
+
         if entry is None:
             yield None
             return
         try:
             yield entry
         finally:
+            disposals = []
             with self._lock:
-                current = self._entries.get(str(key))
+                current = self._entries.get(key)
                 if current is not None and current.generation == generation:
                     current.ref_count = max(0, current.ref_count - 1)
                     if current.invalidated and current.can_evict():
-                        self._evict(str(key), current)
+                        detached = self._detach_locked(key, current)
+                        if detached is not None:
+                            disposals.append(detached)
+            self._dispose_detached(disposals)
 
     def clear(self):
+        disposals = []
         with self._lock:
+            disposals.extend(self._reap_invalidated_locked())
             for key, entry in list(self._entries.items()):
+                # Clear is a logical barrier immediately.  A current consumer
+                # may finish its lease, but no new consumer may see the entry.
+                entry.invalidated = True
                 if entry.can_evict():
-                    self._evict(key, entry)
+                    detached = self._detach_locked(key, entry)
+                    if detached is not None:
+                        disposals.append(detached)
+        self._dispose_detached(disposals)
 
     def stats(self):
         with self._lock:
