@@ -24,6 +24,9 @@
 
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define EXPORT __declspec(dllexport)
 #include <wincodec.h>
 #include <windows.h>

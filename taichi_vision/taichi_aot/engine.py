@@ -72,6 +72,74 @@ _MAX_CPU_AOT_MEMBER_BYTES = 256 * 1024 * 1024
 _MAX_CPU_AOT_TOTAL_BYTES = 1024 * 1024 * 1024
 
 
+class _CpuAotProcessLock:
+    """Portable advisory lock shared by processes extracting one CPU TCM."""
+
+    def __init__(self, path: str, timeout: float = 120.0) -> None:
+        self.path = path
+        self.timeout = max(1.0, float(timeout))
+        self._handle = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        handle = open(self.path, "a+b")
+        handle.seek(0)
+        handle.write(b"\0")
+        handle.flush()
+        deadline = time.monotonic() + self.timeout
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for CPU AOT extraction lock: {self.path}"
+                            )
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for CPU AOT extraction lock: {self.path}"
+                            )
+                        time.sleep(0.05)
+            self._handle = handle
+            return self
+        except Exception:
+            handle.close()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _checked_shape_nbytes(shape, dtype):
     """Normalize a graph shape and compute bytes without fixed-width overflow."""
 
@@ -124,11 +192,12 @@ def _materialize_cpu_aot_directory(artifact_path):
     cache_root = os.path.join(os.path.dirname(artifact_path), ".cpu_aot_cache")
     target = os.path.join(cache_root, digest.hexdigest())
     ready_marker = os.path.join(target, "__content__")
-    with _CPU_AOT_EXTRACTION_LOCK:
+    os.makedirs(cache_root, exist_ok=True)
+    process_lock = os.path.join(cache_root, ".extract.lock")
+    with _CPU_AOT_EXTRACTION_LOCK, _CpuAotProcessLock(process_lock):
         if os.path.isfile(ready_marker):
             return target
 
-        os.makedirs(cache_root, exist_ok=True)
         staging = tempfile.mkdtemp(prefix="extract-", dir=cache_root)
         try:
             staging_root = os.path.abspath(staging)
