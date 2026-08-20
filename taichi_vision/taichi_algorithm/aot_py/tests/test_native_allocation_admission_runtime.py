@@ -38,6 +38,7 @@ d.allocate_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int
 d.allocate_gpu_buffer.restype = ctypes.c_void_p
 d.write_to_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 d.free_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+d.copy_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 d.map_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 d.map_gpu_buffer.restype = ctypes.c_void_p
 d.unmap_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -49,15 +50,26 @@ assert r1 and r2
 assert d.get_runtime_arch_id(r1) == 0
 assert d.get_runtime_arch_id(r2) == 0
 b1 = d.allocate_gpu_buffer(r1, 16, 1)
+b3 = d.allocate_gpu_buffer(r1, 8, 1)
 b2 = d.allocate_gpu_buffer(r2, 16, 1)
-assert b1 and b2
+assert b1 and b2 and b3
 payload = (ctypes.c_ubyte * 16)(*range(16))
 d.write_to_gpu_buffer(r1, b1, payload, 17)
 assert b"capacity" in (d.get_last_engine_error(r1) or b"")
+d.copy_gpu_buffer(r1, b1, b3, 16)
+assert b"capacity" in (d.get_last_engine_error(r1) or b"")
+d.copy_gpu_buffer(r1, b1, b2, 16)
+assert b"does not belong" in (d.get_last_engine_error(r1) or b"")
 assert d.map_gpu_buffer(r1, b1)
 d.map_gpu_buffer(r1, b1)
 assert b"already mapped" in (d.get_last_engine_error(r1) or b"")
+d.free_gpu_buffer(r1, b1)
+assert b"already mapped" in (d.get_last_engine_error(r1) or b"")
 d.unmap_gpu_buffer(r1, b1)
+d.free_gpu_buffer(r1, b1)
+d.free_gpu_buffer(r1, b1)
+assert b"does not belong" in (d.get_last_engine_error(r1) or b"")
+d.free_gpu_buffer(r1, b3)
 d.free_gpu_buffer(r2, b1)
 assert b"does not belong" in (d.get_last_engine_error(r2) or b"")
 os._exit(0)
