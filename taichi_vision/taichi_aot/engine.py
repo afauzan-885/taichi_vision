@@ -1,6 +1,8 @@
 import ctypes
 import hashlib
 import json
+import math
+import numbers
 import os
 import sys
 import atexit
@@ -60,6 +62,50 @@ _UNSET = object()
 _CPU_AOT_EXTRACTION_LOCK = threading.RLock()
 _OPENGL_VENDOR_INJECTED = None
 
+_MAX_NATIVE_BYTES = (1 << 64) - 1
+_MAX_DYNAMIC_RANK = 8
+# CPU artifacts are supplied by the package or a trusted build pipeline, but
+# they are still ZIP containers.  Bound extraction before opening files so a
+# corrupt archive cannot turn one small download into an unbounded write.
+_MAX_CPU_AOT_MEMBERS = 65536
+_MAX_CPU_AOT_MEMBER_BYTES = 256 * 1024 * 1024
+_MAX_CPU_AOT_TOTAL_BYTES = 1024 * 1024 * 1024
+
+
+def _checked_shape_nbytes(shape, dtype):
+    """Normalize a graph shape and compute bytes without fixed-width overflow."""
+
+    if isinstance(shape, (str, bytes, bytearray)):
+        raise ValueError("shape must be an iterable of positive integer dimensions")
+    try:
+        normalized = tuple(shape)
+    except TypeError as exc:
+        raise ValueError(
+            "shape must be an iterable of positive integer dimensions"
+        ) from exc
+    if not normalized:
+        raise ValueError("shape must contain at least one dimension")
+    if len(normalized) > _MAX_DYNAMIC_RANK:
+        raise ValueError(
+            f"shape rank {len(normalized)} exceeds the native DynamicArg limit "
+            f"of {_MAX_DYNAMIC_RANK}"
+        )
+    checked = []
+    for dimension in normalized:
+        if isinstance(dimension, bool) or not isinstance(dimension, numbers.Integral):
+            raise ValueError("shape dimensions must be positive integers")
+        dimension = int(dimension)
+        if dimension <= 0 or dimension > 2**31 - 1:
+            raise ValueError(
+                "shape dimensions must be in the range 1..INT32_MAX"
+            )
+        checked.append(dimension)
+    itemsize = int(np.dtype(dtype).itemsize)
+    element_count = math.prod(checked)
+    if element_count > _MAX_NATIVE_BYTES // itemsize:
+        raise OverflowError("tensor byte size exceeds the native uint64 limit")
+    return tuple(checked), element_count * itemsize
+
 
 def _materialize_cpu_aot_directory(artifact_path):
     """Return a safe directory form of a packed CPU AOT artifact.
@@ -87,7 +133,29 @@ def _materialize_cpu_aot_directory(artifact_path):
         try:
             staging_root = os.path.abspath(staging)
             with zipfile.ZipFile(artifact_path) as archive:
-                for member in archive.infolist():
+                members = archive.infolist()
+                if len(members) > _MAX_CPU_AOT_MEMBERS:
+                    raise RuntimeError(
+                        "CPU AOT artifact contains too many members "
+                        f"({len(members)} > {_MAX_CPU_AOT_MEMBERS})"
+                    )
+                extracted_bytes = 0
+                destinations = set()
+                for member in members:
+                    if not member.filename or "\x00" in member.filename:
+                        raise RuntimeError(
+                            f"Invalid member in CPU AOT artifact: {member.filename!r}"
+                        )
+                    declared_size = int(member.file_size)
+                    if declared_size < 0 or declared_size > _MAX_CPU_AOT_MEMBER_BYTES:
+                        raise RuntimeError(
+                            f"CPU AOT member is too large: {member.filename!r}"
+                        )
+                    extracted_bytes += declared_size
+                    if extracted_bytes > _MAX_CPU_AOT_TOTAL_BYTES:
+                        raise RuntimeError(
+                            "CPU AOT artifact exceeds the extraction size limit"
+                        )
                     destination = os.path.abspath(
                         os.path.join(staging_root, member.filename)
                     )
@@ -95,14 +163,31 @@ def _materialize_cpu_aot_directory(artifact_path):
                         raise RuntimeError(
                             f"Unsafe member in CPU AOT artifact: {member.filename!r}"
                         )
+                    if destination in destinations:
+                        raise RuntimeError(
+                            f"Duplicate member in CPU AOT artifact: {member.filename!r}"
+                        )
+                    destinations.add(destination)
                     if member.is_dir():
                         os.makedirs(destination, exist_ok=True)
                         continue
                     os.makedirs(os.path.dirname(destination), exist_ok=True)
-                    with archive.open(member) as source, open(
-                        destination, "wb"
-                    ) as output:
-                        shutil.copyfileobj(source, output)
+                    written = 0
+                    with archive.open(member) as source, open(destination, "wb") as output:
+                        while True:
+                            chunk = source.read(min(1024 * 1024, declared_size - written + 1))
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > declared_size:
+                                raise RuntimeError(
+                                    f"CPU AOT member size mismatch: {member.filename!r}"
+                                )
+                            output.write(chunk)
+                    if written != declared_size:
+                        raise RuntimeError(
+                            f"CPU AOT member size mismatch: {member.filename!r}"
+                        )
 
             if not os.path.isfile(os.path.join(staging_root, "__content__")):
                 raise RuntimeError("CPU AOT artifact does not contain __content__")
@@ -135,8 +220,28 @@ def get_vulkan_device_name(device_id):
         pass
     try:
         import ctypes
+        import ctypes.util
 
-        vk = ctypes.CDLL("vulkan-1.dll")
+        loader_names = (
+            ("vulkan-1.dll",)
+            if os.name == "nt"
+            else ("libvulkan.so.1", "libvulkan.so")
+            if sys.platform.startswith("linux") or sys.platform == "android"
+            else ("libvulkan.dylib",)
+        )
+        vk = None
+        for loader_name in loader_names:
+            try:
+                vk = ctypes.CDLL(loader_name)
+                break
+            except OSError:
+                continue
+        if vk is None:
+            discovered = ctypes.util.find_library("vulkan")
+            if discovered:
+                vk = ctypes.CDLL(discovered)
+        if vk is None:
+            return None
 
         class VkApplicationInfo(ctypes.Structure):
             _fields_ = [
@@ -182,7 +287,8 @@ def get_vulkan_device_name(device_id):
         vk.vkGetPhysicalDeviceProperties.restype = None
 
         app_info = VkApplicationInfo(
-            sType=9,
+            # VK_STRUCTURE_TYPE_APPLICATION_INFO
+            sType=0,
             pNext=None,
             pApplicationName=b"Query",
             applicationVersion=1,
@@ -191,7 +297,8 @@ def get_vulkan_device_name(device_id):
             apiVersion=0x00400000,
         )
         create_info = VkInstanceCreateInfo(
-            sType=10,
+            # VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+            sType=1,
             pNext=None,
             flags=0,
             pApplicationInfo=ctypes.pointer(app_info),
@@ -201,6 +308,8 @@ def get_vulkan_device_name(device_id):
             ppEnabledExtensionNames=None,
         )
 
+        if int(device_id) < 0:
+            return None
         instance = ctypes.c_void_p()
         res = vk.vkCreateInstance(
             ctypes.pointer(create_info), None, ctypes.pointer(instance)
@@ -936,8 +1045,9 @@ dtype_map = {
     np.uint16: 3,
     np.int16: 4,
     np.float16: 5,
-    np.float64: 0,  # Fallback
 }
+
+_dtype_code_by_dtype = {np.dtype(key): value for key, value in dtype_map.items()}
 
 
 # -------------------------------------------------------------------------
@@ -947,7 +1057,13 @@ def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unkn
     """Internal helper to fill DynamicArg metadata consistently."""
     arg.name = name_bytes
 
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(
+            f"{context_name}: boolean scalars are not valid DynamicArg i32 values"
+        )
     if isinstance(value, (int, np.integer)):
+        if int(value) < -(2**31) or int(value) > 2**31 - 1:
+            raise OverflowError(f"{context_name}: scalar i32 value is out of range")
         arg.arg_type = 1
         arg.dtype = 1  # i32
         arg.val_u64 = int(value)
@@ -989,15 +1105,34 @@ def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unkn
         is_vec = getattr(value, "is_vector", False)
         v_dim = getattr(value, "vector_dim", 1)
 
-        val_dtype = value.dtype if hasattr(value, "dtype") else np.float32
-        if hasattr(val_dtype, "type"):
-            val_dtype = val_dtype.type
-        arg.dtype = dtype_map.get(val_dtype, 0)
+        val_dtype = np.dtype(value.dtype if hasattr(value, "dtype") else np.float32)
+        try:
+            arg.dtype = _dtype_code_by_dtype[val_dtype]
+        except KeyError as exc:
+            raise TypeError(
+                f"{context_name}: unsupported GPU buffer dtype {val_dtype}; "
+                "supported dtypes are float32, int32, uint8, uint16, int16, float16"
+            ) from exc
         arg.is_vector = 1 if is_vec else 0
-        arg.vector_dim = v_dim
+        if is_vec and v_dim not in (2, 3, 4):
+            raise ValueError(f"{context_name}: vector_dim must be 2, 3, or 4")
+        arg.vector_dim = int(v_dim)
 
-        shape = value.shape
+        shape = tuple(value.shape)
         dim_count = len(shape)
+        if not 1 <= dim_count <= _MAX_DYNAMIC_RANK:
+            raise ValueError(
+                f"{context_name}: buffer rank must be in 1..{_MAX_DYNAMIC_RANK}"
+            )
+        for dimension in shape:
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, numbers.Integral)
+                or not 0 < int(dimension) <= 2**31 - 1
+            ):
+                raise ValueError(
+                    f"{context_name}: buffer dimensions must be positive INT32 values"
+                )
 
         if is_vec:
             # Vector field: Distinguish between spatial and vector components
@@ -1005,21 +1140,21 @@ def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unkn
                 # Shape explicitly includes vector dim (e.g. H, W, 3) -> Strip it for Taichi
                 arg.dim_count = dim_count - 1
                 for d in range(dim_count - 1):
-                    arg.shape[d] = shape[d]
+                    arg.shape[d] = int(shape[d])
                 arg.elem_dim_count = 1
                 arg.elem_shape[0] = v_dim
             else:
                 # Shape is implicitly a grid of vectors (e.g. gn, gm, gl containing vec2)
                 arg.dim_count = dim_count
                 for d in range(dim_count):
-                    arg.shape[d] = shape[d]
+                    arg.shape[d] = int(shape[d])
                 arg.elem_dim_count = 1
                 arg.elem_shape[0] = v_dim
         else:
             # Scalar field
             arg.dim_count = dim_count
             for d in range(dim_count):
-                arg.shape[d] = shape[d]
+                arg.shape[d] = int(shape[d])
             arg.elem_dim_count = 0
 
         raw_handle = getattr(resolved_handle, "value", resolved_handle)
@@ -1029,10 +1164,22 @@ def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unkn
         if hasattr(value, "ptr"):
             arg.arg_type = 0
             arg.val_u64 = value.ptr
-            arg.dtype = 0  # Assume f32
+            arg.dtype = 0
+            if not 1 <= len(value.shape) <= _MAX_DYNAMIC_RANK:
+                raise ValueError(
+                    f"{context_name}: direct ndarray rank exceeds native limit"
+                )
             arg.dim_count = len(value.shape)
             for d, s in enumerate(value.shape):
-                arg.shape[d] = s
+                if (
+                    isinstance(s, bool)
+                    or not isinstance(s, numbers.Integral)
+                    or not 0 < int(s) <= 2**31 - 1
+                ):
+                    raise ValueError(
+                        f"{context_name}: direct ndarray dimensions must be positive INT32 values"
+                    )
+                arg.shape[d] = int(s)
             arg.elem_dim_count = 0
         else:
             name_str = (
@@ -1258,6 +1405,12 @@ def _init_aot_bridge(backend=None):
     try:
         _LIB.get_runtime_context_backend.argtypes = [ctypes.c_void_p]
         _LIB.get_runtime_context_backend.restype = ctypes.c_char_p
+    except AttributeError:
+        pass
+
+    try:
+        _LIB.get_runtime_arch_id.argtypes = [ctypes.c_void_p]
+        _LIB.get_runtime_arch_id.restype = ctypes.c_int
     except AttributeError:
         pass
 
@@ -1660,7 +1813,10 @@ def configure_taichi_backend(prefer: str = None, device_memory_GB: float = None)
 
     arch = arch_map.get(arch_choice, None)
     if arch is None:
-        arch = getattr(ti, "vulkan", getattr(ti, "gpu", ti.cpu))
+        raise RuntimeError(
+            f"Taichi backend {arch_choice!r} is not available in this installation; "
+            "refusing to substitute a different backend"
+        )
 
     init_kwargs = {"default_fp": ti.f32}
     if device_memory_GB is not None:
@@ -1714,6 +1870,20 @@ def _get_runtime_context_backend(runtime):
         return str(raw or "").strip()
     except (AttributeError, OSError, TypeError):
         return ""
+
+
+def _get_runtime_arch_id(runtime):
+    """Return native backend identity when the bridge exposes the probe."""
+    if not _LIB or not runtime:
+        return None
+    try:
+        getter = _LIB.get_runtime_arch_id
+    except AttributeError:
+        return None
+    try:
+        return int(getter(runtime))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def _get_last_init_error():
@@ -1942,9 +2112,16 @@ class TaichiGPUBuffer:
         host_accessible=False,
         vector_dim=3,
     ):
-        self.size_bytes = size_bytes
+        normalized_shape, expected_bytes = _checked_shape_nbytes(shape, dtype)
+        if int(size_bytes) != expected_bytes:
+            raise ValueError(
+                "GPU buffer metadata capacity mismatch: "
+                f"size_bytes={size_bytes}, expected={expected_bytes} "
+                f"for shape={normalized_shape} dtype={np.dtype(dtype)}"
+            )
+        self.size_bytes = int(size_bytes)
         self.handle = handle
-        self.shape = shape
+        self.shape = normalized_shape
         self.dtype = dtype
         self.is_vector = is_vector
         self.vector_dim = vector_dim
@@ -2222,7 +2399,7 @@ class TaichiGPUBuffer:
             src_ptr = self.map()
             dst_ptr = dst.map()
             try:
-                num_elements = np.prod(self.shape)
+                num_elements = math.prod(self.shape)
                 _LIB.ti_cast_buffer(
                     ctypes.c_void_p(src_ptr),
                     ctypes.c_void_p(dst_ptr),
@@ -2783,6 +2960,17 @@ class AOTEngine:
                 raise RuntimeError(
                     f"Failed to initialize {arch.upper()} AOT Runtime on device {device_id}."
                     + (f" {init_error}" if init_error else "")
+                )
+
+            native_arch_id = _get_runtime_arch_id(instance.runtime)
+            if native_arch_id is not None and native_arch_id != arch_id:
+                try:
+                    _LIB.destroy_aot_engine(instance.runtime)
+                finally:
+                    instance.runtime = None
+                raise RuntimeError(
+                    "Native AOT backend identity mismatch: requested "
+                    f"arch_id={arch_id}, initialized arch_id={native_arch_id}"
                 )
 
             gpu_name = (
@@ -3872,7 +4060,7 @@ class AOTEngine:
         _lock_wait_begin("allocate")
         with self._lock:
             _lock_wait_end()
-            size = int(np.prod(shape) * np.dtype(dtype).itemsize)
+            shape, size = _checked_shape_nbytes(shape, dtype)
 
             # Admit a pipeline allocation before entering the native driver.
             # OpenGL ICDs commonly report GL_INVALID_OPERATION from glGenBuffers
@@ -4956,7 +5144,7 @@ class AOTEngine:
         return self.acquire_staging_buffer(shape, dtype)
 
     def acquire_staging_buffer(self, shape, dtype):
-        size = int(np.prod(shape) * np.dtype(dtype).itemsize)
+        shape, size = _checked_shape_nbytes(shape, dtype)
         key = (size, np.dtype(dtype).name)
         with self._lock:
             if key not in self._staging_pool:
@@ -5372,10 +5560,34 @@ class AOTEngine:
                 _op_end()
         if not handle:
             raise RuntimeError(f"Failed to load image: {path}")
+        def release_invalid_handle():
+            try:
+                with self._lock:
+                    _LIB.free_gpu_buffer(self.runtime, handle)
+            except Exception:
+                pass
+        if d.value not in (8, 16) or c.value not in (1, 3):
+            release_invalid_handle()
+            raise RuntimeError(
+                f"Native image reader returned unsupported format: "
+                f"width={w.value}, height={h.value}, channels={c.value}, depth={d.value}"
+            )
         dtype = np.uint8 if d.value == 8 else np.uint16
         shape = (h.value, w.value) if c.value == 1 else (h.value, w.value, c.value)
+        try:
+            _normalized_shape, expected_bytes = _checked_shape_nbytes(shape, dtype)
+        except (TypeError, ValueError, OverflowError) as exc:
+            release_invalid_handle()
+            raise RuntimeError(f"Native image reader returned invalid dimensions: {exc}") from exc
+        reported_bytes = int(w.value) * int(h.value) * int(c.value) * (int(d.value) // 8)
+        if reported_bytes != expected_bytes:
+            release_invalid_handle()
+            raise RuntimeError(
+                "Native image reader returned inconsistent byte metadata: "
+                f"reported={reported_bytes}, expected={expected_bytes}"
+            )
         return TaichiGPUBuffer(
-            w.value * h.value * c.value * (d.value // 8),
+            expected_bytes,
             handle,
             shape,
             dtype,
@@ -5386,9 +5598,26 @@ class AOTEngine:
     def imwrite(self, path, buf):
         _heartbeat()
         _init_aot_bridge()
-        h, w = buf.shape[0], buf.shape[1]
-        c = 1 if len(buf.shape) == 2 else buf.shape[2]
-        d = 8 if buf.dtype == np.uint8 else 16
+        shape = tuple(buf.shape)
+        if len(shape) not in (2, 3):
+            raise ValueError("Native image writer supports only 2D or 3D images")
+        h, w = shape[0], shape[1]
+        c = 1 if len(shape) == 2 else shape[2]
+        if c not in (1, 3):
+            raise ValueError("Native image writer supports only 1 or 3 channels")
+        dtype = np.dtype(buf.dtype)
+        if dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            raise TypeError(
+                "Native image writer supports only uint8 and uint16 buffers; "
+                f"got {dtype}"
+            )
+        _normalized_shape, expected_bytes = _checked_shape_nbytes(shape, dtype)
+        if int(getattr(buf, "size_bytes", 0)) != expected_bytes:
+            raise ValueError(
+                "GPU image buffer metadata does not match its shape/dtype: "
+                f"size_bytes={getattr(buf, 'size_bytes', None)}, expected={expected_bytes}"
+            )
+        d = 8 if dtype == np.dtype(np.uint8) else 16
         _lock_wait_begin("imwrite")
         with self._lock:
             _lock_wait_end()
@@ -5747,7 +5976,7 @@ def _track_child_pid(pid):
 
 
 def _kill_tracked_children():
-    """Kill all tracked child processes to prevent zombies."""
+    """Terminate and reap only helper processes owned by this runtime."""
     with _child_pids_lock:
         pids = list(_child_pids)
         _child_pids.clear()
@@ -5759,96 +5988,25 @@ def _kill_tracked_children():
                 )
             else:
                 os.kill(pid, signal.SIGKILL)
+                try:
+                    os.waitpid(pid, 0)
+                except (ChildProcessError, OSError):
+                    pass
         except Exception:
             pass
 
 
 def _cleanup_zombie_gpu_processes():
-    """Kill zombie GPU processes (vulkaninfo.exe, orphaned python.exe) that
-    are holding VRAM but are no longer responsive.
+    """Clean up only helper processes created and tracked by this runtime.
 
-    This prevents the NVIDIA WDDM driver from accumulating ghost GPU context
-    entries that block future Vulkan init and consume VRAM reservations.
+    Process-name scans are intentionally forbidden here: importing the
+    runtime must never terminate another application's ``vulkaninfo`` or
+    ``python`` process.  POSIX zombies are reaped by their owning parent in
+    ``_kill_tracked_children``; untracked processes are outside our authority.
     """
     if not _CLEAN_ZOMBIES:
         return
-
-    my_pid = os.getpid()
-    killed = []
-
-    try:
-        if os.name == "nt":
-            # Windows: use tasklist to find GPU-holding zombie processes
-            result = _subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            for line in result.stdout.strip().split("\n"):
-                parts = line.strip().strip('"').split('","')
-                if len(parts) < 2:
-                    continue
-                proc_name = parts[0].lower()
-                try:
-                    pid = int(parts[1])
-                except (ValueError, IndexError):
-                    continue
-
-                # Skip our own process
-                if pid == my_pid:
-                    continue
-
-                # Kill vulkaninfo.exe zombies (spawned by Vulkan device scanning)
-                if "vulkaninfo" in proc_name:
-                    try:
-                        _subprocess.run(
-                            ["taskkill", "/F", "/PID", str(pid)],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        killed.append((pid, proc_name))
-                    except Exception:
-                        pass
-        else:
-            # Linux: use ps to find zombie GPU processes
-            result = _subprocess.run(
-                ["ps", "-eo", "pid,comm,state", "--no-headers"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            for line in result.stdout.strip().split("\n"):
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                try:
-                    pid = int(parts[0])
-                except ValueError:
-                    continue
-                comm = parts[1].lower()
-                state = parts[2]
-
-                if pid == my_pid:
-                    continue
-
-                # Kill zombie state processes related to GPU
-                if state == "Z" and ("vulkan" in comm or "python" in comm):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        killed.append((pid, comm))
-                    except Exception:
-                        pass
-    except Exception as e:
-        sys.stderr.write(f"[AOTEngine] Zombie cleanup scan failed: {e}\n")
-        sys.stderr.flush()
-
-    if killed:
-        sys.stderr.write(
-            f"[AOTEngine] Cleaned {len(killed)} zombie GPU process(es): "
-            f"{', '.join(f'{name}(pid={pid})' for pid, name in killed)}\n"
-        )
-        sys.stderr.flush()
+    _kill_tracked_children()
 
 
 def emergency_cleanup():

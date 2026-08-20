@@ -121,28 +121,10 @@ def _solve_5pt_numpy(pts1_norm, pts2_norm):
     # With E = x*E1 + y*E2 + z*E3 + 1*E4 (set w=1 for affine parameterization)
     # This yields a system of cubic polynomial equations in (x, y, z)
 
-    # For robustness, use cv2.findEssentialMat as the primary solver
-    # and return its results directly
-    try:
-        import cv2
-        pts1_h = np.ascontiguousarray(pts1_norm, dtype=np.float64)
-        pts2_h = np.ascontiguousarray(pts2_norm, dtype=np.float64)
-        E_cv, mask = cv2.findEssentialMat(pts1_h, pts2_h, focal=1.0, pp=(0.0, 0.0),
-                                           method=cv2.RANSAC, prob=0.999, threshold=0.001)
-        if E_cv is not None:
-            E_cv = E_cv.astype(np.float64)
-            if E_cv.shape == (3, 3):
-                return [E_cv]
-            elif E_cv.ndim == 2 and E_cv.shape[1] == 3 and E_cv.shape[0] % 3 == 0:
-                # OpenCV may return more than two candidates for the
-                # five-point problem (for example a 12x3 stack).  Preserve
-                # every complete 3x3 candidate instead of silently falling
-                # through to the underconstrained SVD vector.
-                return [E_cv[i : i + 3] for i in range(0, E_cv.shape[0], 3)]
-    except Exception:
-        pass
-
-    # Fallback: return the null space vector reshaped as E (single candidate)
+    # The polynomial refinement is intentionally kept inside the TCM graph
+    # boundary.  This host-side compatibility helper only returns the
+    # deterministic constrained null-space estimate when called directly;
+    # production AOT callers must dispatch the qualified SfM graph.
     E_approx = Vt[8].reshape(3, 3).astype(np.float64)
     U, S, Vt2 = np.linalg.svd(E_approx)
     S = np.array([1.0, 1.0, 0.0])
@@ -181,32 +163,6 @@ def solve_five_point(pts1, pts2, K1=None, K2=None):
         K2_inv = np.linalg.inv(K2.astype(np.float64))
         pts2_h = np.hstack([pts2, np.ones((len(pts2), 1))])
         pts2 = (K2_inv @ pts2_h.T).T[:, :2]
-
-    # OpenCV's five-point implementation already solves the polynomial
-    # constraints in the same camera-coordinate domain as the caller.  Use
-    # that result before Hartley-normalizing; denormalizing an approximate
-    # multi-candidate result can otherwise magnify residuals on five-point
-    # inputs.  The existing normalized NumPy path remains the dependency-free
-    # fallback below.
-    try:
-        import cv2
-
-        E_cv, _mask = cv2.findEssentialMat(
-            np.ascontiguousarray(pts1[:5]),
-            np.ascontiguousarray(pts2[:5]),
-            focal=1.0,
-            pp=(0.0, 0.0),
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=1.0e-3,
-        )
-        if E_cv is not None and E_cv.ndim == 2 and E_cv.shape[1] == 3 and E_cv.shape[0] % 3 == 0:
-            return [
-                common.enforce_essential_np(E_cv[i : i + 3].astype(np.float64))
-                for i in range(0, E_cv.shape[0], 3)
-            ]
-    except Exception:
-        pass
 
     # Hartley normalization
     T1, pts1_norm = common.hartley_normalize(pts1[:5])

@@ -173,8 +173,8 @@ def _normalize_target(value: Any) -> dict[str, Any]:
     vendor = _canonical_vendor(target.get("vendor", "unknown"))
     if backend not in _BACKENDS:
         raise TcmContractError(f"unsupported TCM target backend {backend!r}")
-    abi = str(target.get("abi", "") or "").strip()
-    variant = str(target.get("variant", "") or "").strip()
+    abi = str(target.get("abi", "") or "").strip().lower()
+    variant = str(target.get("variant", "") or "").strip().lower()
     if backend == "cuda" and vendor not in {"unknown", "nvidia"}:
         raise TcmContractError("CUDA TCM targets must use the NVIDIA vendor")
     if backend == "gles" and os_name not in {"android", "linux", "unknown"}:
@@ -289,6 +289,20 @@ def validate_manifest(
             raise TcmContractError(
                 f"TCM target mismatch for vendor: manifest={target['vendor']!r}, requested={requested['vendor']!r}"
             )
+        # ABI and optimized variant are part of the executable identity.  A
+        # coarse backend/arch match is not enough to prove that a payload can
+        # be loaded by this runtime.  If either side declares a qualifier,
+        # both sides must declare the same normalized value.
+        for field in ("abi", "variant"):
+            manifest_value = str(target.get(field, "") or "").strip().lower()
+            requested_value = str(
+                _target_value(requested_target, field, "") or ""
+            ).strip().lower()
+            if manifest_value != requested_value:
+                raise TcmContractError(
+                    f"TCM target mismatch for {field}: "
+                    f"manifest={manifest_value!r}, requested={requested_value!r}"
+                )
 
     payloads = source.get("payloads", [])
     if isinstance(payloads, (str, bytes, bytearray)) or not isinstance(payloads, Iterable):

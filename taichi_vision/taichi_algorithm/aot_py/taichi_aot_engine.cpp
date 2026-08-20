@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1095,12 +1096,14 @@ class ScopedOpenGLContext {
 extern "C" {
 
 EXPORT const char *get_last_init_error() {
+  static thread_local std::string snapshot;
   std::lock_guard<std::mutex> lock(init_error_mutex);
-  return last_init_error.c_str();
+  snapshot = last_init_error;
+  return snapshot.c_str();
 }
 
 EXPORT const char *scan_vulkan_devices() {
-  static std::string device_list;
+  static thread_local std::string device_list;
   device_list = "";
 #ifdef _WIN32
   FILE *pipe = _popen("vulkaninfo --summary", "r");
@@ -1255,7 +1258,14 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
       return nullptr;
     try {
       auto ctx = std::make_unique<EngineContext>();
+      // The compatibility path is a negotiated CPU runtime, never the
+      // originally requested GPU identity.  Populate every identity field so
+      // diagnostics and the Python-side arch probe cannot masquerade it as
+      // the failed backend.
+      ctx->arch = TI_ARCH_X64;
       ctx->runtime = new ti::Runtime(TI_ARCH_X64, 0);
+      ctx->device_name = "CPU (legacy fallback)";
+      ctx->last_error = "requested backend failed; explicit CPU fallback was enabled";
       ctx->destroying = false;
       ctx->session_id = next_session_id++;
       {
@@ -1271,10 +1281,14 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
 
 EXPORT const char *get_runtime_device_name(void *runtime) {
   EngineContext *ctx = as_engine(runtime);
+  static thread_local std::string snapshot;
   if (!ctx)
-    return "";
-  std::lock_guard<std::mutex> lock(ctx->mutex);
-  return ctx->device_name.c_str();
+    return snapshot.c_str();
+  {
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    snapshot = ctx->device_name;
+  }
+  return snapshot.c_str();
 }
 
 EXPORT const char *get_runtime_context_backend(void *runtime) {
@@ -1284,7 +1298,12 @@ EXPORT const char *get_runtime_context_backend(void *runtime) {
   // bridge/artifacts), but it still belongs to the native graphics family for
   // diagnostics.  Returning an empty string here made mobile diagnostics look
   // like an uninitialised runtime even when the GLES bridge was loaded.
-  if (!ctx || (ctx->arch != TI_ARCH_OPENGL && ctx->arch != TI_ARCH_GLES)) {
+  if (!ctx) {
+    backend.clear();
+    return backend.c_str();
+  }
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  if (ctx->arch != TI_ARCH_OPENGL && ctx->arch != TI_ARCH_GLES) {
     backend.clear();
     return backend.c_str();
   }
@@ -1305,12 +1324,34 @@ EXPORT const char *get_runtime_context_backend(void *runtime) {
   return backend.c_str();
 }
 
-EXPORT const char *get_last_engine_error(void *runtime) {
+EXPORT int get_runtime_arch_id(void *runtime) {
   EngineContext *ctx = as_engine(runtime);
   if (!ctx)
-    return "";
+    return -1;
   std::lock_guard<std::mutex> lock(ctx->mutex);
-  return ctx->last_error.c_str();
+  if (ctx->arch == TI_ARCH_CUDA)
+    return 1;
+  if (ctx->arch == TI_ARCH_X64)
+    return 2;
+  if (ctx->arch == TI_ARCH_OPENGL)
+    return 3;
+  if (ctx->arch == TI_ARCH_GLES)
+    return 4;
+  if (ctx->arch == TI_ARCH_VULKAN)
+    return 0;
+  return -1;
+}
+
+EXPORT const char *get_last_engine_error(void *runtime) {
+  EngineContext *ctx = as_engine(runtime);
+  static thread_local std::string snapshot;
+  if (!ctx)
+    return snapshot.c_str();
+  {
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    snapshot = ctx->last_error;
+  }
+  return snapshot.c_str();
 }
 
 EXPORT void clear_last_engine_error(void *runtime) {
@@ -1644,6 +1685,28 @@ EXPORT void sync_runtime(void *runtime) {
 // -----------------------------------------------------------------------
 // High-Performance Image IO (Smart Loader)
 // -----------------------------------------------------------------------
+static bool checked_image_geometry(int width, int height, int channels,
+                                   int bit_depth, uint64_t *stride_out,
+                                   uint64_t *size_out) {
+  if (width <= 0 || height <= 0 || (channels != 1 && channels != 3) ||
+      (bit_depth != 8 && bit_depth != 16) || !stride_out || !size_out)
+    return false;
+  const uint64_t max_value = std::numeric_limits<uint64_t>::max();
+  const uint64_t bytes_per_channel = static_cast<uint64_t>(bit_depth / 8);
+  uint64_t stride = static_cast<uint64_t>(width);
+  if (stride > max_value / static_cast<uint64_t>(channels))
+    return false;
+  stride *= static_cast<uint64_t>(channels);
+  if (stride > max_value / bytes_per_channel)
+    return false;
+  stride *= bytes_per_channel;
+  if (stride > max_value / static_cast<uint64_t>(height))
+    return false;
+  *stride_out = stride;
+  *size_out = stride * static_cast<uint64_t>(height);
+  return true;
+}
+
 EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
                               int *out_height, int *out_channels,
                               int *out_bit_depth) {
@@ -1652,8 +1715,13 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   if (!gl_scope.ready())
     return nullptr;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt || !path)
+  if (!rt || !path || !out_width || !out_height || !out_channels ||
+      !out_bit_depth)
     return nullptr;
+  *out_width = 0;
+  *out_height = 0;
+  *out_channels = 0;
+  *out_bit_depth = 0;
 
 #ifdef _WIN32
   init_wic();
@@ -1662,7 +1730,8 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
 
   IWICBitmapDecoder *decoder = nullptr;
   wchar_t w_path[MAX_PATH];
-  MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
+  if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH))
+    return nullptr;
 
   if (FAILED(g_wic_factory->CreateDecoderFromFilename(
           w_path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
@@ -1671,15 +1740,28 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   }
 
   IWICBitmapFrameDecode *frame = nullptr;
-  decoder->GetFrame(0, &frame);
+  if (FAILED(decoder->GetFrame(0, &frame)) || !frame) {
+    decoder->Release();
+    return nullptr;
+  }
 
-  UINT w, h;
-  frame->GetSize(&w, &h);
+  UINT w = 0, h = 0;
+  if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0 ||
+      w > static_cast<UINT>(std::numeric_limits<int>::max()) ||
+      h > static_cast<UINT>(std::numeric_limits<int>::max())) {
+    frame->Release();
+    decoder->Release();
+    return nullptr;
+  }
   *out_width = (int)w;
   *out_height = (int)h;
 
   WICPixelFormatGUID pixel_format;
-  frame->GetPixelFormat(&pixel_format);
+  if (FAILED(frame->GetPixelFormat(&pixel_format))) {
+    frame->Release();
+    decoder->Release();
+    return nullptr;
+  }
 
   // Determine channels and bit depth
   int channels = 1;
@@ -1705,7 +1787,9 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
     bit_depth = 16;
     target_format = GUID_WICPixelFormat48bppBGR;
   } else {
-    // Default fallback to 8-bit BGR
+    // WIC conversion is allowed for formats with a supported target, but all
+    // conversion results below are checked.  Never expose an uninitialized
+    // allocation when a codec/format operation fails.
     channels = 3;
     bit_depth = 8;
     target_format = GUID_WICPixelFormat24bppBGR;
@@ -1715,7 +1799,14 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   *out_bit_depth = bit_depth;
 
   // Allocate GPU memory
-  uint64_t size_bytes = (uint64_t)w * h * channels * (bit_depth / 8);
+  uint64_t row_bytes = 0;
+  uint64_t size_bytes = 0;
+  if (!checked_image_geometry((int)w, (int)h, channels, bit_depth, &row_bytes,
+                              &size_bytes)) {
+    frame->Release();
+    decoder->Release();
+    return nullptr;
+  }
   TiMemoryAllocateInfo allocate_info = {};
   allocate_info.size = size_bytes;
   allocate_info.usage = TI_MEMORY_USAGE_STORAGE_BIT;
@@ -1735,21 +1826,53 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   // Copy pixels directly to GPU (using mapped memory if possible, or
   // intermediate buffer)
   void *gpu_ptr = ti_map_memory(rt->runtime(), gpu_mem);
-  if (gpu_ptr) {
-    if (pixel_format != target_format) {
+  if (!gpu_ptr) {
+    {
+      std::lock_guard<std::mutex> lock(engine->mutex);
+      engine->buffers.erase(gpu_mem);
+    }
+    ti_free_memory(rt->runtime(), gpu_mem);
+    frame->Release();
+    decoder->Release();
+    return nullptr;
+  }
+
+  bool copy_ok = false;
+  if (pixel_format != target_format) {
       // Need conversion
       IWICFormatConverter *converter = nullptr;
-      g_wic_factory->CreateFormatConverter(&converter);
-      converter->Initialize(frame, target_format, WICBitmapDitherTypeNone, NULL,
-                            0.0, WICBitmapPaletteTypeCustom);
-      converter->CopyPixels(NULL, (UINT)(w * channels * (bit_depth / 8)),
-                            (UINT)size_bytes, (BYTE *)gpu_ptr);
-      converter->Release();
-    } else {
-      frame->CopyPixels(NULL, (UINT)(w * channels * (bit_depth / 8)),
-                        (UINT)size_bytes, (BYTE *)gpu_ptr);
+      if (SUCCEEDED(g_wic_factory->CreateFormatConverter(&converter)) &&
+          converter &&
+          SUCCEEDED(converter->Initialize(
+              frame, target_format, WICBitmapDitherTypeNone, NULL, 0.0,
+              WICBitmapPaletteTypeCustom)) &&
+          size_bytes <= std::numeric_limits<UINT>::max()) {
+        copy_ok = SUCCEEDED(converter->CopyPixels(
+            NULL, static_cast<UINT>(row_bytes), static_cast<UINT>(size_bytes),
+            (BYTE *)gpu_ptr));
+      }
+      if (converter)
+        converter->Release();
+  } else if (size_bytes <= std::numeric_limits<UINT>::max()) {
+      copy_ok = SUCCEEDED(frame->CopyPixels(
+          NULL, static_cast<UINT>(row_bytes), static_cast<UINT>(size_bytes),
+          (BYTE *)gpu_ptr));
+  }
+  ti_unmap_memory(rt->runtime(), gpu_mem);
+
+  if (!copy_ok) {
+    {
+      std::lock_guard<std::mutex> lock(engine->mutex);
+      engine->buffers.erase(gpu_mem);
     }
-    ti_unmap_memory(rt->runtime(), gpu_mem);
+    ti_free_memory(rt->runtime(), gpu_mem);
+    frame->Release();
+    decoder->Release();
+    *out_width = 0;
+    *out_height = 0;
+    *out_channels = 0;
+    *out_bit_depth = 0;
+    return nullptr;
   }
 
   frame->Release();
@@ -1778,18 +1901,45 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
   if (!g_wic_factory)
     return false;
 
+  uint64_t stride64 = 0;
+  uint64_t size64 = 0;
+  if (!checked_image_geometry(width, height, channels, bit_depth, &stride64,
+                              &size64) ||
+      stride64 > std::numeric_limits<UINT>::max() ||
+      size64 > std::numeric_limits<UINT>::max())
+    return false;
+
   IWICStream *stream = nullptr;
-  g_wic_factory->CreateStream(&stream);
+  IWICBitmapEncoder *encoder = nullptr;
+  IWICBitmapFrameEncode *frame = nullptr;
+  auto cleanup = [&]() {
+    if (frame) {
+      frame->Release();
+      frame = nullptr;
+    }
+    if (encoder) {
+      encoder->Release();
+      encoder = nullptr;
+    }
+    if (stream) {
+      stream->Release();
+      stream = nullptr;
+    }
+  };
+  if (FAILED(g_wic_factory->CreateStream(&stream)) || !stream)
+    return false;
 
   wchar_t w_path[MAX_PATH];
-  MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
-
-  if (FAILED(stream->InitializeFromFilename(w_path, GENERIC_WRITE))) {
-    stream->Release();
+  if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH)) {
+    cleanup();
     return false;
   }
 
-  IWICBitmapEncoder *encoder = nullptr;
+  if (FAILED(stream->InitializeFromFilename(w_path, GENERIC_WRITE))) {
+    cleanup();
+    return false;
+  }
+
   // Auto-detect encoder based on extension
   GUID encoder_guid = GUID_ContainerFormatPng;
   std::string s_path = path;
@@ -1801,16 +1951,20 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
   }
 
   if (FAILED(g_wic_factory->CreateEncoder(encoder_guid, NULL, &encoder))) {
-    stream->Release();
+    cleanup();
     return false;
   }
 
-  encoder->Initialize(stream, WICBitmapEncoderNoCache);
+  if (FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache))) {
+    cleanup();
+    return false;
+  }
 
-  IWICBitmapFrameEncode *frame = nullptr;
-  encoder->CreateNewFrame(&frame, NULL);
-  frame->Initialize(NULL);
-  frame->SetSize(width, height);
+  if (FAILED(encoder->CreateNewFrame(&frame, NULL)) || !frame ||
+      FAILED(frame->Initialize(NULL)) || FAILED(frame->SetSize(width, height))) {
+    cleanup();
+    return false;
+  }
 
   WICPixelFormatGUID format_guid = GUID_WICPixelFormat8bppGray;
   if (bit_depth == 8) {
@@ -1821,22 +1975,26 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
                                   : GUID_WICPixelFormat48bppBGR;
   }
 
-  frame->SetPixelFormat(&format_guid);
-
-  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
-  if (gpu_ptr) {
-    UINT stride = width * channels * (bit_depth / 8);
-    UINT size = stride * height;
-    frame->WritePixels(height, stride, size, (BYTE *)gpu_ptr);
-    ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
+  if (FAILED(frame->SetPixelFormat(&format_guid))) {
+    cleanup();
+    return false;
   }
 
-  frame->Commit();
-  encoder->Commit();
+  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
+  if (!gpu_ptr) {
+    cleanup();
+    return false;
+  }
+  HRESULT write_result = frame->WritePixels(
+      static_cast<UINT>(height), static_cast<UINT>(stride64),
+      static_cast<UINT>(size64), (BYTE *)gpu_ptr);
+  ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
+  if (FAILED(write_result) || FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
+    cleanup();
+    return false;
+  }
 
-  frame->Release();
-  encoder->Release();
-  stream->Release();
+  cleanup();
   return true;
 #else
   return false;
@@ -2296,7 +2454,7 @@ EXPORT bool ti_cast_buffer(void *src_ptr, void *dst_ptr,
 // -----------------------------------------------------------------------
 // Internal Helper for Argument Mapping
 // -----------------------------------------------------------------------
-static void _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
+static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
                          int i) {
   arg.name = dyn_arg.name;
   /*
@@ -2310,7 +2468,11 @@ static void _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
   }
   */
 
+  if (dyn_arg.arg_type != 0 && dyn_arg.arg_type != 1)
+    return false;
   if (dyn_arg.arg_type == 1) { // Scalar
+    if (dyn_arg.dtype != 0 && dyn_arg.dtype != 1)
+      return false;
     if (dyn_arg.dtype == 0) {  // f32
       arg.argument.type = TI_ARGUMENT_TYPE_F32;
       union {
@@ -2338,6 +2500,21 @@ static void _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
       }
     }
   } else { // NDArray
+    if (dyn_arg.dtype < 0 || dyn_arg.dtype > 5 || dyn_arg.val_u64 == 0 ||
+        dyn_arg.dim_count < 1 || dyn_arg.dim_count > 8 ||
+        dyn_arg.elem_dim_count < 0 || dyn_arg.elem_dim_count > 8 ||
+        (dyn_arg.is_vector != 0 && dyn_arg.is_vector != 1) ||
+        (dyn_arg.is_vector &&
+         (dyn_arg.vector_dim < 2 || dyn_arg.vector_dim > 4)))
+      return false;
+    for (int d = 0; d < dyn_arg.dim_count; d++) {
+      if (dyn_arg.shape[d] <= 0)
+        return false;
+    }
+    for (int d = 0; d < dyn_arg.elem_dim_count; d++) {
+      if (dyn_arg.elem_shape[d] <= 0)
+        return false;
+    }
     arg.argument.type = TI_ARGUMENT_TYPE_NDARRAY;
     arg.argument.value.ndarray.memory = (TiMemory)dyn_arg.val_u64;
 
@@ -2363,6 +2540,7 @@ static void _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
       arg.argument.value.ndarray.elem_shape.dims[d] = dyn_arg.elem_shape[d];
     }
   }
+  return true;
 }
 
 // -----------------------------------------------------------------------
@@ -2407,7 +2585,10 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
     ti_args.reserve(num_args);
     for (int i = 0; i < num_args; i++) {
       TiNamedArgument arg = {};
-      _fill_ti_arg(arg, args_array[i], i);
+      if (!_fill_ti_arg(arg, args_array[i], i)) {
+        set_engine_error(engine, "run_aot_graph: invalid DynamicArg descriptor");
+        return;
+      }
       ti_args.push_back(arg);
     }
 
@@ -2498,6 +2679,11 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
 
   for (int i = 0; i < num_args; i++) {
     DynamicArg arg = args_array[i];
+    TiNamedArgument validation = {};
+    if (!_fill_ti_arg(validation, arg, i)) {
+      set_engine_error(mod->owner, "add_to_pipeline: invalid DynamicArg descriptor");
+      return;
+    }
     // Allocate storage for name string to keep it alive
     dispatch.arg_names.push_back(args_array[i].name);
     arg.name = dispatch.arg_names.back().c_str();
@@ -2590,7 +2776,10 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
             }
           }
         }
-        _fill_ti_arg(arg, *final_arg, arg_idx++);
+        if (!_fill_ti_arg(arg, *final_arg, arg_idx++)) {
+          set_engine_error(engine, "run_pipeline: invalid DynamicArg descriptor");
+          return;
+        }
 
         // CRITICAL: Always use the original name from the recorded step.
         // The override argument from Python might have a generic name like
