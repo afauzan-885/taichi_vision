@@ -77,10 +77,12 @@ def _read_prefix(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
     limit: int,
+    *,
+    require_complete: bool = False,
 ) -> bytes:
     """Read only the bounded prefix needed for target qualification."""
 
-    if int(info.file_size) > limit:
+    if require_complete and int(info.file_size) > limit:
         raise TcmContractError(
             f"target inspection exceeds the limit: {info.filename}"
         )
@@ -89,6 +91,10 @@ def _read_prefix(
     if len(payload) > limit:
         raise TcmContractError(
             f"target inspection exceeds the limit: {info.filename}"
+        )
+    if require_complete and len(payload) != int(info.file_size):
+        raise TcmContractError(
+            f"target inspection is truncated: {info.filename}"
         )
     return payload
 
@@ -338,6 +344,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                             archive,
                             members["graphs.json"],
                             _MAX_GRAPH_INDEX_BYTES,
+                            require_complete=True,
                         )
                     )
                 except (
@@ -370,6 +377,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                     archive,
                     members[name],
                     _MAX_TARGET_INSPECTION_BYTES,
+                    require_complete=True,
                 ).decode("utf-8", errors="replace")
                 for name in llvm_files
             ]
