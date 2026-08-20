@@ -485,6 +485,40 @@ def _validate_legacy_payload_target(
         info for info in archive.infolist()
         if info.filename.lower().endswith((".ll", ".tic"))
     ]
+    if backend == "cuda":
+        triples = []
+        for info in llvm_entries:
+            try:
+                text = _read_legacy_member_text(archive, info)
+            except (KeyError, OSError):
+                continue
+            triples.extend(re.findall(r'target triple = "([^"]+)"', text))
+        if not triples:
+            return
+        normalized = tuple(triple.lower() for triple in triples)
+        if not any("nvptx64" in triple for triple in normalized):
+            raise TcmContractError(
+                "legacy CUDA payload target mismatch: expected NVPTX LLVM triple (NVPTX64)"
+            )
+        expected_arch = _canonical_arch(_target_value(requested_target, "arch"))
+        for triple in normalized:
+            if "nvptx" in triple:
+                continue
+            host_arch_ok = (
+                (expected_arch == "x86_64" and ("x86_64" in triple or "amd64" in triple))
+                or (expected_arch == "arm64" and ("aarch64" in triple or "arm64" in triple))
+            )
+            host_os_ok = (
+                (target_os == "windows" and ("windows" in triple or "win32" in triple or "msvc" in triple))
+                or (target_os == "linux" and "linux" in triple and "android" not in triple)
+                or (target_os == "android" and "android" in triple)
+            )
+            if not (host_arch_ok and host_os_ok):
+                raise TcmContractError(
+                    f"legacy CUDA host-helper target mismatch: {triple}"
+                )
+        return
+
     for info in llvm_entries:
         name = info.filename
         try:
@@ -493,12 +527,6 @@ def _validate_legacy_payload_target(
             continue
         triples = re.findall(r'target triple = "([^"]+)"', text)
         if not triples:
-            continue
-        if backend == "cuda":
-            if any("nvptx" not in triple.lower() for triple in triples):
-                raise TcmContractError(
-                    f"legacy CUDA payload target mismatch in {name}: expected NVPTX LLVM triple"
-                )
             continue
         # CPU archives are also target-qualified.  Reject an obvious host
         # relabel (for example Windows/MSVC IR placed under the Linux target)
