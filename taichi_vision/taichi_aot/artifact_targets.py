@@ -89,9 +89,11 @@ def _read_prefix(
     with archive.open(info, "r") as source:
         payload = source.read(limit + 1)
     if len(payload) > limit:
-        raise TcmContractError(
-            f"target inspection exceeds the limit: {info.filename}"
-        )
+        if require_complete:
+            raise TcmContractError(
+                f"target inspection exceeds the limit: {info.filename}"
+            )
+        return payload[:limit]
     if require_complete and len(payload) != int(info.file_size):
         raise TcmContractError(
             f"target inspection is truncated: {info.filename}"
