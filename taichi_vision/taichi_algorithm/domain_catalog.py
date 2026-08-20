@@ -134,7 +134,7 @@ ALGORITHM_CATALOG: tuple[AlgorithmSpec, ...] = (
         notes=(
             "AOT mode dispatches the qualified sfm_build_5pt_system_f32 leaf "
             "before the canonical host candidate solve; JIT mode remains the "
-            "full NumPy/OpenCV reference"
+            "full NumPy reference"
         ),
     ),
     AlgorithmSpec(
@@ -176,7 +176,7 @@ ALGORITHM_CATALOG: tuple[AlgorithmSpec, ...] = (
         "aot-or-taichi-jit-or-numpy",
         notes="AOT integration is qualified on CPU Windows and Vulkan NVIDIA artifacts; other targets remain fail-closed",
     ),
-    AlgorithmSpec("PnP_quality_gate", "sfm", "taichi_vision.taichi_algorithm.sfm.registration", "solve_pnp_checked", "opencv-reference", notes="explicit reference backend; no fabricated fallback"),
+    AlgorithmSpec("PnP_quality_gate", "sfm", "taichi_vision.taichi_algorithm.sfm.registration", "solve_pnp_checked", "tcm-required", notes="fails closed until a target-qualified sfm_pnp TCM graph is available; no OpenCV or host fallback"),
     AlgorithmSpec("Poisson_surface", "sfm", "taichi_vision.taichi_algorithm.sfm.reconstruction_pipeline", "run_point_cloud_pipeline", "aot-or-numpy"),
     AlgorithmSpec(
         "texture_UV_atlas",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import unittest
-import importlib.util
 
 import numpy as np
 
@@ -251,8 +250,6 @@ class ReconstructionPipelineTests(unittest.TestCase):
             )
 
     def test_projection_and_pnp_quality_gate(self):
-        if importlib.util.find_spec("cv2") is None:
-            self.skipTest("OpenCV reference backend is unavailable")
         object_points = np.array(
             [[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0], [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
             dtype=np.float64,
@@ -260,10 +257,8 @@ class ReconstructionPipelineTests(unittest.TestCase):
         translation = np.array([0.0, 0.0, 4.0], dtype=np.float64)
         image_points, valid = project_points(object_points, self.K, np.eye(3), translation)
         self.assertTrue(valid.all())
-        result = solve_pnp_checked(object_points, image_points, self.K)
-        self.assertTrue(result.success, result.report.warnings)
-        self.assertEqual(int(np.count_nonzero(result.inlier_mask)), len(object_points))
-        self.assertLess(float(np.median(result.reprojection_error_px)), 1.0e-4)
+        with self.assertRaisesRegex(NotImplementedError, "sfm_pnp TCM"):
+            solve_pnp_checked(object_points, image_points, self.K)
 
     def test_poisson_small_cloud_reference_path(self):
         points = np.array(
