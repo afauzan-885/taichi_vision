@@ -54,11 +54,13 @@ from taichi_vision.device_selection import (
     is_translation_device,
     make_device_selector,
     query_vulkan_memory_budget,
+    query_vulkan_capability_snapshot,
     resolve_device_selector,
     scan_cuda_device_records,
     scan_vulkan_device_records,
 )
 from .artifact_targets import detect_target
+from .gfx_capabilities import negotiate_graphics_capabilities, unknown_graphics_snapshot
 from .tcm_preflight import preflight_tcm
 
 _UNSET = object()
@@ -512,6 +514,48 @@ _STDERR_REDIRECT_LOCK = threading.Lock()
 _PROCESS_JOB_HANDLE = None
 _PROCESS_JOB_ACTIVE = False
 _QUALIFICATION_NOTICES = set()
+_GRAPHICS_CAPABILITY_SNAPSHOT_CACHE = {}
+_GRAPHICS_CAPABILITY_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _graphics_capability_snapshot(backend: str, device_id: int, device_name: str = ""):
+    """Return the negotiated capability snapshot for one runtime identity."""
+
+    backend = str(backend or "").lower()
+    if backend == "vulkan":
+        key = (backend, int(device_id))
+        with _GRAPHICS_CAPABILITY_SNAPSHOT_LOCK:
+            if key in _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE:
+                return _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE[key]
+        try:
+            evidence = query_vulkan_capability_snapshot(int(device_id))
+            snapshot = negotiate_graphics_capabilities(backend, evidence)
+        except Exception as exc:
+            snapshot = unknown_graphics_snapshot(
+                backend,
+                f"Vulkan capability probe failed: {type(exc).__name__}: {exc}",
+                source="vulkan-probe",
+            )
+        with _GRAPHICS_CAPABILITY_SNAPSHOT_LOCK:
+            _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE[key] = snapshot
+        return snapshot
+    if backend in {"opengl", "gles"}:
+        # OpenGL/GLES evidence must come from the active embedding context;
+        # an optional JSON hand-off is accepted only as an explicitly labelled
+        # probe record.  A renderer name alone is not capability evidence.
+        raw = os.environ.get("AOT_GRAPHICS_CAPABILITY_JSON", "")
+        if raw:
+            try:
+                evidence = json.loads(raw)
+            except (TypeError, ValueError):
+                evidence = None
+            if isinstance(evidence, dict):
+                return negotiate_graphics_capabilities(backend, evidence)
+        return unknown_graphics_snapshot(
+            backend,
+            "active OpenGL/GLES capability probe evidence is unavailable",
+        )
+    return None
 
 
 def _intel_vulkan_probe_override():
@@ -1783,7 +1827,16 @@ def select_backend(prefer=None, device_id=None):
     if probe_id is None:
         probe_id = 0
     name = get_vulkan_device_name(probe_id) or "unknown"
-    selected = BackendManager(name).decide("auto").selected
+    snapshot = _graphics_capability_snapshot("vulkan", probe_id, name)
+    probe_device = {
+        "name": name,
+        "vendor": normalize_vendor(name),
+        "ordinal": probe_id,
+        "api_version": snapshot.decision.api_version,
+        "features": {feature: True for feature in snapshot.features},
+        "capability_source": snapshot.evidence_source,
+    }
+    selected = BackendManager(probe_device).decide("auto").selected
     if (
         "intel" in name.lower()
         and selected != "vulkan"
@@ -3095,6 +3148,9 @@ class AOTEngine:
             instance.arch = arch
             instance.device_id = device_id
             instance._backend_config = config
+            instance._graphics_capability_snapshot = _graphics_capability_snapshot(
+                arch, device_id, getattr(config, "device_name", "")
+            )
 
             # Map arch to arch_id
             arch_id = {
@@ -5702,17 +5758,29 @@ class AOTEngine:
                 )
                 feature_text = os.environ.get("AOT_TCM_RUNTIME_FEATURES", "")
                 if feature_text.strip():
-                    runtime_features = {
-                        item.strip().upper()
-                        for item in feature_text.split(",")
-                        if item.strip()
-                    }
+                    override_allowed = (
+                        os.environ.get("AOT_CAPABILITY_OVERRIDE") == "1"
+                        and _EXPERIMENT_MODE
+                    )
+                    runtime_features = (
+                        {
+                            item.strip().upper()
+                            for item in feature_text.split(",")
+                            if item.strip()
+                        }
+                        if override_allowed
+                        else set()
+                    )
                 elif self.arch.lower() in {"vulkan", "opengl", "gles"}:
-                    # The graphics AOT profile is compute/SSBO based.  A
-                    # future native capability probe can replace this default
-                    # through AOT_TCM_RUNTIME_FEATURES without changing the
-                    # manifest or public algorithm API.
-                    runtime_features = {"COMPUTE", "SSBO"}
+                    # Never manufacture graphics capability evidence from the
+                    # backend name.  A probe/negotiated snapshot must provide
+                    # the feature set, or preflight fails closed.
+                    snapshot = getattr(self, "_graphics_capability_snapshot", None)
+                    runtime_features = set(
+                        getattr(snapshot, "features", ())
+                        if getattr(snapshot, "usable", False)
+                        else ()
+                    )
                 else:
                     runtime_features = set()
                 try:

@@ -8,8 +8,11 @@ the dispatcher can quarantine a backend without changing public APIs.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import importlib.util
 import os
 import json
+import sys
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,19 @@ from taichi_vision.cuda_arch_matrix import (
     load_bridge_manifest,
     profile_for,
 )
+try:
+    from .gfx_capabilities import negotiate_graphics_capabilities
+except (ImportError, ValueError):
+    _GFX_PATH = Path(__file__).with_name("gfx_capabilities.py")
+    _GFX_SPEC = importlib.util.spec_from_file_location(
+        "taichi_aot_gfx_capabilities_fallback", _GFX_PATH
+    )
+    if _GFX_SPEC is None or _GFX_SPEC.loader is None:  # pragma: no cover
+        raise RuntimeError(f"cannot load graphics capability policy: {_GFX_PATH}")
+    _GFX_MODULE = importlib.util.module_from_spec(_GFX_SPEC)
+    sys.modules[_GFX_SPEC.name] = _GFX_MODULE
+    _GFX_SPEC.loader.exec_module(_GFX_MODULE)
+    negotiate_graphics_capabilities = _GFX_MODULE.negotiate_graphics_capabilities
 
 
 @dataclass(frozen=True)
@@ -210,41 +226,84 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             safe=True,
             reason="NVIDIA CUDA selected; compute capability will be validated by the native runtime",
         )
-    if backend == "vulkan" and vendor == "intel":
-        validated = _intel_vulkan_validated(metadata)
-        if validated:
+    if backend == "vulkan":
+        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        if not snapshot.usable:
             return BackendCapabilities(
                 backend,
                 vendor,
                 device_name,
                 driver,
-                safe=True,
-                reason="Intel Vulkan lifecycle, parity, and pipeline manifest validated",
+                safe=False,
+                reason=f"graphics capability snapshot rejected: {snapshot.decision.reason}",
             )
-        ordinal = _device_ordinal(metadata)
-        reason = (
-            "Intel Vulkan AOT is quarantined after ABI/pipeline failures"
-            if ordinal is not None
-            else "Intel Vulkan qualification requires the exact evaluated device identity"
-        )
-        return BackendCapabilities(
-            backend,
-            vendor,
-            device_name,
-            driver,
-            safe=False,
-            reason=reason,
-        )
-    if backend == "opengl":
+        if vendor == "intel":
+            validated = _intel_vulkan_validated(metadata)
+            if not validated:
+                ordinal = _device_ordinal(metadata)
+                reason = (
+                    "Intel Vulkan AOT is quarantined after ABI/pipeline failures"
+                    if ordinal is not None
+                    else "Intel Vulkan qualification requires the exact evaluated device identity"
+                )
+                return BackendCapabilities(
+                    backend,
+                    vendor,
+                    device_name,
+                    driver,
+                    safe=False,
+                    reason=reason,
+                )
+            reason = "Intel Vulkan lifecycle, parity, and pipeline manifest validated"
+        else:
+            reason = (
+                "Vulkan capability snapshot validated: "
+                f"{snapshot.decision.profile} ({snapshot.evidence_source})"
+            )
         return BackendCapabilities(
             backend,
             vendor,
             device_name,
             driver,
             safe=True,
-            reason="OpenGL artifact/load smoke tests validated",
+            reason=reason,
+        )
+    if backend == "opengl":
+        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        if not snapshot.usable:
+            return BackendCapabilities(
+                backend,
+                vendor,
+                device_name,
+                driver,
+                safe=False,
+                reason=f"graphics capability snapshot rejected: {snapshot.decision.reason}",
+            )
+        return BackendCapabilities(
+            backend,
+            vendor,
+            device_name,
+            driver,
+            safe=True,
+            reason=(
+                "OpenGL capability snapshot validated: "
+                f"{snapshot.decision.profile} ({snapshot.evidence_source})"
+            ),
         )
     if backend == "gles":
+        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        if snapshot.usable:
+            return BackendCapabilities(
+                backend,
+                vendor,
+                device_name,
+                driver,
+                safe=True,
+                reason=(
+                    "GLES capability snapshot validated: "
+                    f"{snapshot.decision.profile} ({snapshot.evidence_source})"
+                ),
+            )
         # GLES artifacts and the ARM64 bridge are statically validated, but a
         # real Android GLES context is required before automatic dispatch can
         # call this target.  Keep it visible to diagnostics without allowing a
@@ -255,7 +314,10 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             device_name,
             driver,
             safe=False,
-            reason="GLES TCM/bridge static gates passed; Android device execution is pending",
+            reason=(
+                "GLES capability snapshot rejected: "
+                f"{snapshot.decision.reason}"
+            ),
         )
     return BackendCapabilities(backend, vendor, device_name, driver)
 
