@@ -200,9 +200,10 @@ assert d.ti_imwrite_from_gpu(r, str(out).encode(), b, 4, 4, 3, 8)
 assert out.exists() and out.stat().st_size > 0
 for stage, expected in (("read_map", "map"), ("read_copy", "copy")):
     os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
-    rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
-    assert not d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
-    assert expected.encode() in (d.get_last_engine_error(r) or b"")
+    for _ in range(24):
+        rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
+        assert not d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
+        assert expected.encode() in (d.get_last_engine_error(r) or b"")
 os.environ.pop("PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO", None)
 rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
 read_handle = d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
@@ -214,9 +215,10 @@ assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 0, 4, 3, 8)
 assert sentinel.read_bytes() == b"keep"
 for stage, expected in (("map", "map"), ("encoder", "encoder"), ("frame_commit", "frame commit"), ("encoder_commit", "encoder commit"), ("replace", "replace")):
     os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
-    assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 4, 4, 3, 8)
-    assert expected.encode() in (d.get_last_engine_error(r) or b"")
-    assert sentinel.read_bytes() == b"keep", (stage, sentinel.read_bytes())
+    for _ in range(24):
+        assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 4, 4, 3, 8)
+        assert expected.encode() in (d.get_last_engine_error(r) or b"")
+        assert sentinel.read_bytes() == b"keep", (stage, sentinel.read_bytes())
 os._exit(0)
 '''
     completed = subprocess.run(
