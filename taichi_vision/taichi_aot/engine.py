@@ -4208,20 +4208,22 @@ class AOTEngine:
             return
         key = str(name)
         encoded_name = key.encode("utf-8")
-        # A recorded graph is owned by the module that first dispatched it;
-        # clearing only the legacy global slot can leave backend-local state
-        # alive on graphics drivers. Clear both the compatibility slot and
-        # every loaded module before switching to direct dispatch.
-        try:
-            _LIB.clear_pipeline(None, encoded_name)
-        except Exception:
-            pass
+        # A recorded graph is owned by its module. Passing ``None`` to the
+        # native compatibility API broadcasts the clear to every live engine,
+        # so use it only when no owner module is available at all.
+        owner_count = 0
         for module in tuple(getattr(self, "modules", {}).values()):
             module_ptr = getattr(module, "module_ptr", None)
             if not module_ptr:
                 continue
+            owner_count += 1
             try:
                 _LIB.clear_pipeline(module_ptr, encoded_name)
+            except Exception:
+                pass
+        if owner_count == 0:
+            try:
+                _LIB.clear_pipeline(None, encoded_name)
             except Exception:
                 pass
         self.recorded_pipelines.discard(key)
@@ -4468,7 +4470,16 @@ class AOTEngine:
         with self._lock:
             if name in self.recorded_pipelines:
                 self.recorded_pipelines.remove(name)
-            _LIB.clear_pipeline(None, name.encode("utf-8"))
+            encoded_name = name.encode("utf-8")
+            owner_count = 0
+            for module in tuple(getattr(self, "modules", {}).values()):
+                module_ptr = getattr(module, "module_ptr", None)
+                if not module_ptr:
+                    continue
+                owner_count += 1
+                _LIB.clear_pipeline(module_ptr, encoded_name)
+            if owner_count == 0:
+                _LIB.clear_pipeline(None, encoded_name)
             recordings = getattr(self, "_pipeline_recordings", None)
             if recordings is not None:
                 recordings.pop(name, None)
