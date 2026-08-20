@@ -774,8 +774,8 @@ class BlockCache:
                     0, self._owner_bytes.get(previous_owner, 0) - previous_bytes
                 )
                 previous.pending_remove = True
-                if previous is not record:
-                    previous.data = None if not previous.ref_count else previous.data
+                if previous is not record and not previous.ref_count:
+                    previous.data = None
             record.owner = str(record.owner or "default")
             record.generation = next(self._generation)
             self._records[record.block_id] = record
@@ -814,6 +814,9 @@ class BlockCache:
             record.source_checksum = None
             record.dirty = False
             self._remove_locked(block_id, record)
+            if self._owner_bytes.get(owner, 0) == 0:
+                self._owner_bytes.pop(owner, None)
+                self._owner_hits.pop(owner, None)
             if self._telemetry is not None:
                 self._telemetry.add("invalidations")
             return True
@@ -885,9 +888,6 @@ class BlockCache:
                 was_borrowed = (
                     self.max_bytes is not None
                     and self._owner_bytes.get(owner, 0) > (targets.get(owner) or 0)
-                )
-                self._owner_bytes[owner] = max(
-                    0, self._owner_bytes.get(owner, 0) - entry_bytes
                 )
                 record.state = BlockState.RELEASED
                 record.pending_remove = True
