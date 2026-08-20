@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import os
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 
 CANONICAL_BACKENDS = ("cpu", "cuda", "vulkan", "opengl", "gles")
@@ -189,6 +189,9 @@ class BackendConfig:
     explicit: bool = False
     source: str = "auto"
     strict: bool = False
+    # Optional immutable graphics negotiation object. Kept as Any here so
+    # this dependency-free module does not import the AOT policy layer.
+    capability_snapshot: Any = None
 
     def __post_init__(self):
         object.__setattr__(self, "backend", normalize_backend(self.backend, allow_auto=False, strict=True))
@@ -228,6 +231,12 @@ class BackendConfig:
             "explicit": self.explicit,
             "source": self.source,
             "strict": self.strict,
+            "capability_snapshot": (
+                self.capability_snapshot.as_dict()
+                if self.capability_snapshot is not None
+                and hasattr(self.capability_snapshot, "as_dict")
+                else None
+            ),
             "is_gpu": self.is_gpu,
             "target_family": self.target_family,
         }

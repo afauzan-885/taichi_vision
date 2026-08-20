@@ -539,14 +539,27 @@ def _graphics_capability_snapshot(backend: str, device_id: int, device_name: str
 
     backend = str(backend or "").lower()
     if backend == "vulkan":
-        key = (backend, int(device_id))
-        with _GRAPHICS_CAPABILITY_SNAPSHOT_LOCK:
-            if key in _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE:
-                return _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE[key]
         try:
             evidence = query_vulkan_capability_snapshot(int(device_id))
+            identity = tuple(
+                (field, str(evidence.get(field, "")))
+                for field in (
+                    "fingerprint",
+                    "device_uuid",
+                    "driver_uuid",
+                    "driver_version",
+                    "api_version",
+                    "spirv_version",
+                )
+            )
+            key = (backend, int(device_id), identity)
+            with _GRAPHICS_CAPABILITY_SNAPSHOT_LOCK:
+                if key in _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE:
+                    return _GRAPHICS_CAPABILITY_SNAPSHOT_CACHE[key]
             snapshot = negotiate_graphics_capabilities(backend, evidence)
         except Exception as exc:
+            key = (backend, int(device_id), "probe-error")
+            evidence = None
             snapshot = unknown_graphics_snapshot(
                 backend,
                 f"Vulkan capability probe failed: {type(exc).__name__}: {exc}",
@@ -1911,6 +1924,7 @@ def select_backend(prefer=None, device_id=None):
         "api_version": snapshot.decision.api_version,
         "features": {feature: True for feature in snapshot.features},
         "capability_source": snapshot.evidence_source,
+        "capability_snapshot": snapshot,
     }
     selected = BackendManager(probe_device).decide("auto").selected
     if (
@@ -2075,6 +2089,15 @@ def resolve_backend_config(arch=None, device_id=None, *, prefer=None, strict=Non
             )
         vendor = normalize_vendor(name)
 
+    capability_snapshot = _graphics_capability_snapshot(backend, ordinal, name)
+    if backend in {"vulkan", "opengl", "gles"} and not getattr(
+        capability_snapshot, "usable", False
+    ):
+        raise RuntimeError(
+            f"Graphics backend {backend!r} lacks qualified capability evidence: "
+            f"{getattr(getattr(capability_snapshot, 'decision', None), 'reason', 'unknown')}"
+        )
+
     config = BackendConfig(
         backend=backend,
         device_id=ordinal,
@@ -2083,6 +2106,7 @@ def resolve_backend_config(arch=None, device_id=None, *, prefer=None, strict=Non
         explicit=explicit,
         source=source,
         strict=bool(strict),
+        capability_snapshot=capability_snapshot,
     )
     # Keep child processes and old callers in sync with the canonical values.
     os.environ.update(backend_env(config))
@@ -3235,7 +3259,9 @@ class AOTEngine:
             instance.arch = arch
             instance.device_id = device_id
             instance._backend_config = config
-            instance._graphics_capability_snapshot = _graphics_capability_snapshot(
+            instance._graphics_capability_snapshot = getattr(
+                config, "capability_snapshot", None
+            ) or _graphics_capability_snapshot(
                 arch, device_id, getattr(config, "device_name", "")
             )
 

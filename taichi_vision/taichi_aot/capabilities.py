@@ -115,12 +115,24 @@ def _intel_vulkan_validated(metadata: Mapping[str, Any]) -> bool:
     ordinal = _device_ordinal(metadata)
     if ordinal is None:
         return False
+
     try:
         from taichi_vision.vulkan_probe import intel_vulkan_is_validated
 
         return bool(intel_vulkan_is_validated(device_id=ordinal))
     except Exception:
         return False
+
+
+def _negotiated_graphics_snapshot(backend: str, metadata: Mapping[str, Any]):
+    """Reuse a canonical snapshot when the resolver already supplied one."""
+
+    snapshot = metadata.get("capability_snapshot")
+    if snapshot is not None and getattr(
+        getattr(snapshot, "decision", None), "backend", None
+    ) == backend:
+        return snapshot
+    return negotiate_graphics_capabilities(backend, metadata)
 
 
 def classify_device(device: Any, backend: str, driver: str = "unknown"):
@@ -227,7 +239,7 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             reason="NVIDIA CUDA selected; compute capability will be validated by the native runtime",
         )
     if backend == "vulkan":
-        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        snapshot = _negotiated_graphics_snapshot(backend, metadata)
         if not snapshot.usable:
             return BackendCapabilities(
                 backend,
@@ -269,7 +281,7 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             reason=reason,
         )
     if backend == "opengl":
-        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        snapshot = _negotiated_graphics_snapshot(backend, metadata)
         if not snapshot.usable:
             return BackendCapabilities(
                 backend,
@@ -291,7 +303,7 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             ),
         )
     if backend == "gles":
-        snapshot = negotiate_graphics_capabilities(backend, metadata)
+        snapshot = _negotiated_graphics_snapshot(backend, metadata)
         if snapshot.usable:
             return BackendCapabilities(
                 backend,
