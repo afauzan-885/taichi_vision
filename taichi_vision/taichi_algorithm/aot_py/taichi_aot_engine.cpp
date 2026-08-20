@@ -155,6 +155,10 @@ struct ModuleContext {
   ti::AotModule *module;
   std::unordered_map<std::string, ti::ComputeGraph> graph_cache;
   std::mutex cache_mutex;
+  std::mutex lifetime_mutex;
+  std::condition_variable lifetime_cv;
+  uint32_t active_calls = 0;
+  bool destroying = false;
 };
 
 struct RawIcdContextTag;
@@ -243,6 +247,8 @@ static void APIENTRY raw_icd_set_proc_table(const RawIcdGlcltProcTable *) {}
 
 static std::unordered_set<EngineContext *> engine_contexts;
 static std::mutex engine_contexts_mutex;
+static std::unordered_set<ModuleContext *> module_contexts;
+static std::mutex module_contexts_mutex;
 static uint64_t next_session_id = 1;
 static std::mutex init_error_mutex;
 static std::string last_init_error;
@@ -289,6 +295,70 @@ public:
 private:
   EngineContext *ctx_ = nullptr;
 };
+
+class ModuleLease {
+public:
+  explicit ModuleLease(void *module_ctx) {
+    // As with EngineLease, validate and pin while holding the registry lock.
+    // A concurrent destroy therefore either waits for this lease or removes
+    // the pointer before this operation can dereference it.
+    std::unique_lock<std::mutex> registry_lock(module_contexts_mutex);
+    auto it = module_contexts.find((ModuleContext *)module_ctx);
+    if (it == module_contexts.end() || !*it)
+      return;
+    ModuleContext *candidate = *it;
+    std::lock_guard<std::mutex> lifetime_lock(candidate->lifetime_mutex);
+    if (candidate->destroying)
+      return;
+    candidate->active_calls++;
+    ctx_ = candidate;
+  }
+
+  ModuleLease(const ModuleLease &) = delete;
+  ModuleLease &operator=(const ModuleLease &) = delete;
+
+  ~ModuleLease() {
+    if (!ctx_)
+      return;
+    std::lock_guard<std::mutex> lock(ctx_->lifetime_mutex);
+    if (ctx_->active_calls > 0)
+      ctx_->active_calls--;
+    if (ctx_->active_calls == 0)
+      ctx_->lifetime_cv.notify_all();
+  }
+
+  ModuleContext *get() const { return ctx_; }
+  explicit operator bool() const { return ctx_ != nullptr; }
+
+private:
+  ModuleContext *ctx_ = nullptr;
+};
+
+static ModuleContext *begin_module_destroy(void *module_ctx) {
+  std::unique_lock<std::mutex> registry_lock(module_contexts_mutex);
+  auto it = module_contexts.find((ModuleContext *)module_ctx);
+  if (it == module_contexts.end() || !*it)
+    return nullptr;
+  ModuleContext *ctx = *it;
+  std::lock_guard<std::mutex> lifetime_lock(ctx->lifetime_mutex);
+  if (ctx->destroying)
+    return nullptr;
+  ctx->destroying = true;
+  module_contexts.erase(it);
+  return ctx;
+}
+
+static void finish_module_destroy(ModuleContext *ctx) {
+  if (!ctx)
+    return;
+  {
+    std::unique_lock<std::mutex> lock(ctx->lifetime_mutex);
+    ctx->lifetime_cv.wait(lock, [ctx] { return ctx->active_calls == 0; });
+  }
+  if (ctx->module)
+    delete ctx->module;
+  delete ctx;
+}
 
 static ti::Runtime *engine_runtime(EngineContext *ctx) {
   if (!ctx || ctx->destroying)
@@ -1483,6 +1553,10 @@ EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
       return nullptr;
     }
     {
+      std::lock_guard<std::mutex> lock(module_contexts_mutex);
+      module_contexts.insert(ctx);
+    }
+    {
       std::lock_guard<std::mutex> lock(engine->mutex);
       engine->modules.insert(ctx);
     }
@@ -1497,20 +1571,23 @@ EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
 }
 
 EXPORT void destroy_aot_module(void *module_ctx) {
-  ModuleContext *ctx = (ModuleContext *)module_ctx;
-  if (ctx) {
-    EngineContext *owner = ctx->owner;
-    ScopedOpenGLContext gl_scope(owner);
-    if (!gl_scope.ready())
-      return;
-    if (owner) {
-      std::lock_guard<std::mutex> lock(owner->mutex);
-      owner->modules.erase(ctx);
-    }
-    if (ctx->module)
-      delete ctx->module;
-    delete ctx;
+  ModuleContext *ctx = begin_module_destroy(module_ctx);
+  if (!ctx)
+    return;
+  EngineContext *owner = ctx->owner;
+  EngineLease owner_lease(owner);
+  if (owner_lease) {
+    std::lock_guard<std::mutex> lock(owner_lease.get()->mutex);
+    owner_lease.get()->modules.erase(ctx);
   }
+  if (owner_lease) {
+    ScopedOpenGLContext gl_scope(owner_lease.get());
+    // Module admission is closed and active module leases are drained by the
+    // finalizer even if an optional graphics rebind is unavailable.
+    finish_module_destroy(ctx);
+    return;
+  }
+  finish_module_destroy(ctx);
 }
 
 EXPORT void destroy_aot_engine(void *runtime) {
@@ -1562,9 +1639,8 @@ EXPORT void destroy_aot_engine(void *runtime) {
 
   for (auto *mod : modules) {
     try {
-      if (mod && mod->module)
-        delete mod->module;
-      delete mod;
+      ModuleContext *retired = begin_module_destroy(mod);
+      finish_module_destroy(retired);
     } catch (...) {
     }
   }
@@ -2615,7 +2691,8 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  ModuleContext *ctx = (ModuleContext *)module_ctx;
+  ModuleLease module_lease(module_ctx);
+  ModuleContext *ctx = module_lease.get();
   if (!rt || !ctx || !ctx->module || !args_array)
     return;
 
@@ -2705,7 +2782,8 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
 // -----------------------------------------------------------------------
 
 EXPORT void clear_pipeline(void *module_ctx, const char *pipeline_name) {
-  ModuleContext *mod = (ModuleContext *)module_ctx;
+  ModuleLease module_lease(module_ctx);
+  ModuleContext *mod = module_lease.get();
   if (mod && mod->owner) {
     std::lock_guard<std::mutex> lock(mod->owner->mutex);
     mod->owner->pipelines.erase(pipeline_name);
@@ -2728,7 +2806,8 @@ EXPORT void clear_pipeline(void *module_ctx, const char *pipeline_name) {
 EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
                             const char *graph_name, DynamicArg *args_array,
                             int num_args) {
-  ModuleContext *mod = (ModuleContext *)module_ctx;
+  ModuleLease module_lease(module_ctx);
+  ModuleContext *mod = module_lease.get();
   if (!args_array || !mod)
     return;
 
@@ -2807,7 +2886,8 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
   try {
     clear_engine_error(engine);
     for (auto &step : pipe.steps) {
-      ModuleContext *ctx = (ModuleContext *)step.module_ctx;
+      ModuleLease module_lease(step.module_ctx);
+      ModuleContext *ctx = module_lease.get();
       if (!ctx)
         continue;
 

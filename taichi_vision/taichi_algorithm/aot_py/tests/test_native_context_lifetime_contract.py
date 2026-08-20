@@ -24,3 +24,12 @@ def test_destroy_closes_admission_before_graphics_rebind():
         "ScopedOpenGLContext gl_scope"
     )
     assert "active_calls == 0" in destroy_source
+
+
+def test_native_pipeline_module_handles_are_leased():
+    assert "class ModuleLease" in SOURCE
+    assert "module_contexts" in SOURCE
+    assert "ModuleLease module_lease(module_ctx)" in SOURCE
+    assert "ModuleLease module_lease(step.module_ctx)" in SOURCE
+    assert "begin_module_destroy" in SOURCE
+    assert "finish_module_destroy" in SOURCE
