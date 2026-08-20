@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import re
 from typing import Iterable, Mapping
 
+from taichi_vision.backend_config import parse_policy_bool
+
 
 # Keep probe spellings interchangeable while exposing one stable policy name.
 # Vulkan probes commonly report ``storage_buffer`` or
@@ -70,10 +72,20 @@ def _feature_set(features: Iterable[str] | Mapping[str, object]) -> frozenset[st
         return _FEATURE_ALIASES.get(raw, raw)
 
     if isinstance(features, Mapping):
+        # Mapping values often cross JSON/subprocess/persisted-data boundaries.
+        # Never let a non-empty string such as "false" enable a capability.
         return frozenset(
-            canonical(key) for key, enabled in features.items() if bool(enabled)
+            canonical(key)
+            for key, enabled in features.items()
+            if parse_policy_bool(enabled, default=False) is True
         )
     return frozenset(canonical(feature) for feature in features)
+
+
+def _explicit_capability(value: object) -> bool:
+    """Return an explicit capability flag with ambiguous evidence fail-closed."""
+
+    return parse_policy_bool(value, default=False) is True
 
 
 def classify_desktop_opengl(
@@ -93,10 +105,10 @@ def classify_desktop_opengl(
             f"desktop OpenGL API {api} is outside the qualified 2.0-{_OPENGL_MAX_API[0]}.{_OPENGL_MAX_API[1]} range",
             api,
         )
-    has_compute = bool(compute_shader) if compute_shader is not None else (
+    has_compute = _explicit_capability(compute_shader) if compute_shader is not None else (
         api >= (4, 3) or "gl_arb_compute_shader" in ext
     )
-    has_ssbo = bool(ssbo) if ssbo is not None else (
+    has_ssbo = _explicit_capability(ssbo) if ssbo is not None else (
         api >= (4, 3)
         or "gl_shader_storage_buffer_object" in ext
         or "gl_arb_shader_storage_buffer_object" in ext
@@ -126,8 +138,8 @@ def classify_gles(
             f"OpenGLES API {api} is outside the qualified 2.0-{_GLES_MAX_API[0]}.{_GLES_MAX_API[1]} range",
             api,
         )
-    has_compute = bool(compute_shader) if compute_shader is not None else api >= (3, 1)
-    has_ssbo = bool(ssbo) if ssbo is not None else api >= (3, 1)
+    has_compute = _explicit_capability(compute_shader) if compute_shader is not None else api >= (3, 1)
+    has_ssbo = _explicit_capability(ssbo) if ssbo is not None else api >= (3, 1)
     if api < (3, 1):
         return GfxDecision("gles", "legacy_render", "gles-legacy", "compute shaders are unavailable below GLES 3.1", api)
     if not (has_compute and has_ssbo):

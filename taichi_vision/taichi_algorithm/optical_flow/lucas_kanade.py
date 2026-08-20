@@ -18,11 +18,6 @@ import os
 
 import numpy as np
 
-try:
-    import cv2
-except ImportError:  # pragma: no cover - optional CPU fallback only
-    cv2 = None
-
 TAICHI_AVAILABLE = False
 ti = None
 
@@ -48,10 +43,7 @@ DEFAULT_MOTION_MODE = "fast"
 
 def _as_gray_f32(image):
     if image.ndim == 3:
-        if cv2 is None:
-            image = image.mean(axis=2)
-        else:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = image.mean(axis=2)
     return np.ascontiguousarray(image, dtype=np.float32)
 
 
@@ -96,8 +88,6 @@ def _cpu_dense_from_sparse(height, width, source, target, grid_step):
     if np.any(valid):
         flow[valid, 0] /= weights[valid]
         flow[valid, 1] /= weights[valid]
-    if cv2 is not None:
-        flow = cv2.GaussianBlur(flow, (5, 5), 0)
     return flow
 
 
@@ -110,44 +100,10 @@ def _cpu_calc_pyr_lk_dense(
     max_level=DEFAULT_MAX_LEVEL,
     criteria=None,
 ):
-    if cv2 is None:
-        raise ImportError("cv2 is required for CPU Lucas-Kanade fallback")
-
-    prev_f = _as_gray_f32(prev)
-    next_f = _as_gray_f32(next)
-    height, width = prev_f.shape[:2]
-    points = _cpu_grid_points(width, height, grid_step, border_margin)
-    if points is None or len(points) < 4:
-        return np.zeros((height, width, 2), dtype=np.float32)
-
-    if criteria is None:
-        criteria = (
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-            DEFAULT_ITERATIONS,
-            DEFAULT_EPSILON,
-        )
-
-    win_size = max(5, int(win_size))
-    if win_size % 2 == 0:
-        win_size += 1
-    next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-        prev_f.astype(np.uint8, copy=False),
-        next_f.astype(np.uint8, copy=False),
-        points,
-        None,
-        winSize=(win_size, win_size),
-        maxLevel=max(0, int(max_level)),
-        criteria=criteria,
+    raise RuntimeError(
+        "legacy Lucas-Kanade execution is disabled; use the validated "
+        "taichi_vision AOT/TCM facade"
     )
-    if next_points is None or status is None:
-        return np.zeros((height, width, 2), dtype=np.float32)
-
-    valid = status.reshape(-1).astype(bool)
-    source = points.reshape(-1, 2)[valid]
-    target = next_points.reshape(-1, 2)[valid]
-    if len(source) < 4:
-        return np.zeros((height, width, 2), dtype=np.float32)
-    return _cpu_dense_from_sparse(height, width, source, target, grid_step)
 
 
 if TAICHI_AVAILABLE:
@@ -617,22 +573,10 @@ def calcOpticalFlowPyrLK(
 ):
     """Dense grid Lucas-Kanade flow with cv2-like name and no point setup."""
     if not TAICHI_AVAILABLE:
-        result = _cpu_calc_pyr_lk_dense(
-            prev,
-            next,
-            grid_step=grid_step,
-            border_margin=border_margin,
-            win_size=winSize[0] if isinstance(winSize, tuple) else winSize,
-            max_level=maxLevel,
-            criteria=criteria,
+        raise RuntimeError(
+            "calcOpticalFlowPyrLK requires the taichi_vision AOT/TCM facade; "
+            "legacy CPU/OpenCV fallback is disabled"
         )
-        if return_diagnostics:
-            return result, {
-                "motion_mode": str(motion_mode or "fast").lower(),
-                "selected_max_level": int(maxLevel),
-                "backend": "cpu_fallback",
-            }
-        return result
 
     from taichi_vision.taichi_algorithm import common
 

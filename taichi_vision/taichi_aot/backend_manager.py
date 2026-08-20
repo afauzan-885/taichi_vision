@@ -6,7 +6,7 @@ can call it repeatedly while the public algorithm API remains unchanged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import tempfile
@@ -16,10 +16,15 @@ from taichi_vision.backend_config import normalize_backend
 
 @dataclass
 class BackendDecision:
-    selected: str
+    selected: str | None
     candidates: list[str]
     device: str
     reason: str
+    # Keep the historical four positional fields intact while exposing the
+    # actual filtered decision set.  Execution must consume ``eligible`` rather
+    # than reinterpreting the original candidate list independently.
+    eligible: list[str] = field(default_factory=list)
+    rejected: dict[str, str] = field(default_factory=dict)
 
 
 class BackendManager:
@@ -49,44 +54,65 @@ class BackendManager:
                 pass
         return result
 
+    def _candidate_rejection(self, backend):
+        """Return a bounded rejection reason or ``None`` when backend is eligible."""
+        status = self.validated.get(backend, "unknown")
+        caps = classify_device(self.device, backend)
+        exact_intel_manifest = (
+            backend == "vulkan"
+            and caps.vendor == "intel"
+            and caps.safe
+            and "manifest validated" in caps.reason.lower()
+        )
+        # The legacy runtime cache is not keyed by device fingerprint, driver,
+        # or artifact digest. An exact current Intel manifest is stronger
+        # evidence and must supersede a stale generic quarantine.
+        if status in ("quarantined", "unsupported") and not exact_intel_manifest:
+            return caps.reason or status
+        if not caps.safe:
+            return caps.reason or status or "capability policy rejected backend"
+        return None
+
     def decide(self, requested="auto"):
         requested = normalize_backend(requested, allow_auto=True)
         candidates = (
-            [requested] if requested != "auto" else backend_candidates(self.device)
+            [requested] if requested != "auto" else list(backend_candidates(self.device))
         )
-        rejected = []
+        eligible = []
+        rejected = {}
         for backend in candidates:
-            status = self.validated.get(backend, "unknown")
-            caps = classify_device(self.device, backend)
-            exact_intel_manifest = (
-                backend == "vulkan"
-                and caps.vendor == "intel"
-                and caps.safe
-                and "manifest validated" in caps.reason.lower()
+            reason = self._candidate_rejection(backend)
+            if reason is not None:
+                rejected[backend] = str(reason)
+            else:
+                eligible.append(backend)
+
+        selected = eligible[0] if eligible else None
+        if selected is not None:
+            reason = "selected after capability/status filtering"
+        else:
+            details = "; ".join(
+                f"{backend}: {rejected.get(backend, 'rejected')}"
+                for backend in candidates
             )
-            # The legacy runtime cache is not keyed by device fingerprint,
-            # driver, or artifact digest. An exact current Intel manifest is
-            # stronger evidence and must supersede a stale generic quarantine.
-            if (
-                status in ("quarantined", "unsupported") and not exact_intel_manifest
-            ) or not caps.safe:
-                rejected.append(f"{backend}: {caps.reason or status}")
-                continue
-            return BackendDecision(
-                backend,
-                candidates,
-                self.device,
-                "selected after capability/status filtering",
+            prefix = (
+                f"explicit backend {requested!r} rejected"
+                if requested != "auto"
+                else "all automatic candidates rejected"
             )
+            reason = prefix + (f": {details}" if details else "")
+
         return BackendDecision(
-            "cpu",
+            selected,
             candidates,
             self.device,
-            "all candidates rejected: " + "; ".join(rejected),
+            reason,
+            eligible=eligible,
+            rejected=rejected,
         )
 
     def run_with_fallback(self, operation, requested="auto"):
-        """Run an operation against isolated backend contexts.
+        """Run an operation against capability/status-approved backend contexts.
 
         ``operation(backend)`` must create/upload resources for that backend;
         this prevents accidental reuse of native buffers across contexts.
@@ -95,22 +121,25 @@ class BackendManager:
         requested = normalize_backend(requested, allow_auto=True)
         decision = self.decide(requested)
         errors = {}
-        # Explicit backend selection is a strict contract.  Do not silently
-        # switch an explicitly requested OpenGL/Vulkan/CPU operation to CPU;
-        # callers that want recovery can compose that policy externally.
         strict = requested != "auto"
-        for backend in decision.candidates:
-            if self.validated.get(backend) in ("quarantined", "unsupported"):
-                continue
+
+        if not decision.eligible:
+            mode = "explicit backend" if strict else "automatic backend candidates"
+            raise RuntimeError(
+                f"{mode} rejected before execution: {decision.reason}"
+            )
+
+        # ``decide`` is the single authority for capability/status filtering.
+        # Never iterate the unfiltered candidate list again here; doing so can
+        # re-admit a backend that was rejected solely by capability policy.
+        for backend in decision.eligible:
             try:
                 return operation(backend), backend, errors
             except Exception as exc:
                 errors[backend] = f"{type(exc).__name__}: {exc}"
-        if not strict and "cpu" not in errors and decision.selected != "cpu":
-            try:
-                return operation("cpu"), "cpu", errors
-            except Exception as exc:
-                errors["cpu"] = f"{type(exc).__name__}: {exc}"
+                if strict:
+                    break
+
         mode = "explicit backend" if strict else "automatic backend candidates"
         raise RuntimeError(f"{mode} failed without implicit fallback: {errors}")
 

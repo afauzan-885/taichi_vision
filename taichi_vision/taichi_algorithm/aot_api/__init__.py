@@ -471,6 +471,43 @@ def _mod(name: str):
     return _module_cache[name]
 
 
+def _core_only_error(operation: str, reason: str):
+    """Raise a deliberate error instead of leaving the AOT core path.
+
+    The public ``aot_api`` facade is the production boundary for
+    ``taichi_vision``.  Reference implementations (OpenCV/NumPy) belong in
+    validation or explicitly named reference modules; they must not become a
+    hidden fallback when a target-qualified TCM graph is unavailable.
+    """
+
+    backend = str(getattr(engine, "arch", "unknown")).lower()
+    raise RuntimeError(
+        f"{operation} requires a validated {backend} TCM graph; "
+        f"the taichi_vision core does not use OpenCV/CPU fallback: {reason}"
+    )
+
+
+def _return_core_result(result, *, dst=None, return_gpu=False):
+    """Adapt a TCM result to the legacy host/GPU return contract."""
+
+    if dst is not None:
+        uploaded = result if isinstance(result, TaichiGPUBuffer) else upload(result)
+        try:
+            copy_field(uploaded, dst)
+        finally:
+            if uploaded is not result:
+                uploaded.destroy()
+        return dst
+    if return_gpu:
+        return result if isinstance(result, TaichiGPUBuffer) else upload(result)
+    if isinstance(result, TaichiGPUBuffer):
+        try:
+            return result.to_numpy()
+        finally:
+            result.destroy()
+    return result
+
+
 def load_tcm(name):
     """Public helper for external callers (backward compat). Uses lazy cache."""
     return _mod(name)
@@ -2093,9 +2130,10 @@ def cvtColor(src, code):
 
     is_host = isinstance(src, np.ndarray)
     if isinstance(src, TaichiGPUBuffer) and np.dtype(src.dtype) != np.dtype(np.float32):
-        import cv2
-
-        result = cv2.cvtColor(src.to_numpy(), code)
+        # The common color graphs are f32-only.  Materialize only to perform
+        # the ABI conversion, then execute the actual operation through TCM.
+        source = np.ascontiguousarray(src.to_numpy(), dtype=np.float32)
+        result = cvtColor(source, code)
         return upload(np.ascontiguousarray(result))
     # Common grayscale graphs are compiled for f32. Normalize integer host
     # inputs before dispatch so u8/int16 images work on every backend.
@@ -2438,30 +2476,32 @@ def resize(src, dsize, interpolation=INTER_CUBIC, return_gpu=False, dst=None):
     """Taichi AOT Resize (OpenCV Parity API)"""
     target_w, target_h = dsize
     if isinstance(src, TaichiGPUBuffer) and np.dtype(src.dtype) != np.dtype(np.float32):
-        import cv2
-
-        source = src.to_numpy()
-        cv_interp = {
-            INTER_NEAREST: cv2.INTER_NEAREST,
-            INTER_LINEAR: cv2.INTER_LINEAR,
-            INTER_CUBIC: cv2.INTER_CUBIC,
-            INTER_AREA: cv2.INTER_AREA,
-        }.get(interpolation)
-        if cv_interp is None:
+        if interpolation not in (
+            INTER_NEAREST,
+            INTER_LINEAR,
+            INTER_CUBIC,
+            INTER_AREA,
+        ):
             raise NotImplementedError(
                 f"Interpolation mode {interpolation} is not supported"
             )
-        result = cv2.resize(
-            source, (int(target_w), int(target_h)), interpolation=cv_interp
+        # Resize graphs use the canonical f32 ABI.  Keep the conversion at
+        # the boundary and let the target-qualified graph do the operation.
+        result = resize(
+            np.ascontiguousarray(src.to_numpy(), dtype=np.float32),
+            (int(target_w), int(target_h)),
+            interpolation=interpolation,
+            return_gpu=return_gpu,
         )
         if dst is not None:
-            uploaded = upload(result)
+            uploaded = result if isinstance(result, TaichiGPUBuffer) else upload(result)
             try:
                 copy_field(uploaded, dst)
             finally:
-                uploaded.destroy()
+                if uploaded is not result:
+                    uploaded.destroy()
             return dst
-        return upload(np.ascontiguousarray(result)) if return_gpu else result
+        return result
     if (
         isinstance(src, np.ndarray)
         and dst is None
@@ -2719,33 +2759,14 @@ def resize(src, dsize, interpolation=INTER_CUBIC, return_gpu=False, dst=None):
                 w_dst=target_w,
             )
         except RuntimeError as exc:
-            # Intel Vulkan may quarantine bilinear when its staging mapping is
-            # not host-visible. Resize is an infrastructure operation: keep
-            # the RGB spatial pipeline alive with a CPU fallback.
+            # A quarantined graph is an infrastructure failure, not a reason
+            # to leave the TCM core and silently execute a host implementation.
             message = str(exc).lower()
             if "quarantined" not in message and "map memory" not in message:
                 raise
-            import cv2
-
             if dst is None:
                 dst_buf.destroy()
-            source_np = np.ascontiguousarray(src_buf.to_numpy())
-            result_np = cv2.resize(
-                source_np,
-                (int(target_w), int(target_h)),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            uploaded = upload(np.ascontiguousarray(result_np, dtype=np.float32))
-            try:
-                if dst is not None:
-                    copy_field(uploaded, dst)
-                    return dst
-                if return_gpu:
-                    return uploaded
-                return uploaded.to_numpy()
-            finally:
-                if dst is not None or not return_gpu:
-                    uploaded.destroy()
+            _core_only_error("resize", str(exc))
     elif interpolation == INTER_AREA:
         graph_name = "inter_area_vec3_f32" if is_vec else "inter_area_f32"
         _mod("area").run(
@@ -2944,44 +2965,34 @@ def box_filter(src, kernel_size=3, return_gpu=False, dst=None):
         raise ValueError("kernel_size must be a positive odd integer")
 
     # The rebuilt artifact is stable for scalar and small RGB fp32 frames.
-    # Intel OpenGL still rejects large RGB SSBO bindings; retain the validated
-    # reference path unless the caller explicitly opts into that experiment.
     source_shape = getattr(src, "shape", ())
     source_dtype = src.dtype if hasattr(src, "dtype") else np.asarray(src).dtype
     native_box_requested = (
         os.environ.get("PIXEL_REFINE_AOT_NATIVE_BOX_FILTER", "1") == "1"
     )
-    if (
-        np.dtype(source_dtype) != np.dtype(np.float32)
-        or (engine.arch.lower() in ("opengl", "gles") and not native_box_requested)
-        or (
-            engine.arch.lower() in ("opengl", "gles")
-            and len(source_shape) == 3
-            and os.environ.get("PIXEL_REFINE_AOT_UNSAFE_LARGE_BOX") != "1"
-        )
-    ):
-        import cv2
-
+    if np.dtype(source_dtype) != np.dtype(np.float32):
         source = (
             src.to_numpy()
             if isinstance(src, TaichiGPUBuffer)
             else np.ascontiguousarray(src)
         )
-        result = cv2.boxFilter(
-            source,
-            ddepth=-1,
-            ksize=(kernel_size, kernel_size),
-            normalize=True,
-            borderType=cv2.BORDER_REPLICATE,
-        ).astype(source.dtype, copy=False)
-        if dst is not None:
-            uploaded = upload(result)
-            try:
-                copy_field(uploaded, dst)
-            finally:
-                uploaded.destroy()
-            return dst
-        return upload(result) if return_gpu else result
+        result = box_filter(
+            np.ascontiguousarray(source, dtype=np.float32),
+            kernel_size=kernel_size,
+            return_gpu=return_gpu,
+        )
+        return _return_core_result(result, dst=dst, return_gpu=return_gpu)
+    if engine.arch.lower() in ("opengl", "gles") and not native_box_requested:
+        _core_only_error("box_filter", "native OpenGL box graph was disabled by configuration")
+    if (
+        engine.arch.lower() in ("opengl", "gles")
+        and len(source_shape) == 3
+        and os.environ.get("PIXEL_REFINE_AOT_UNSAFE_LARGE_BOX") != "1"
+    ):
+        _core_only_error(
+            "box_filter",
+            "the current OpenGL RGB graph requires PIXEL_REFINE_AOT_UNSAFE_LARGE_BOX=1",
+        )
 
     if not isinstance(src, TaichiGPUBuffer):
         if dst is not None:
@@ -3303,8 +3314,7 @@ def _median_filter_tile(tile):
 
 def median_filter(src, return_gpu=False, **kwargs):
     """AOT Median Filter 3x3."""
-    # The deployed OpenGL artifact currently exposes a validated scalar graph;
-    # RGB/flow remain on the reference path until the vector artifact is rebuilt.
+    # The deployed OpenGL artifact currently exposes a validated scalar graph.
     median_shape = getattr(src, "shape", ())
     median_dtype = src.dtype if hasattr(src, "dtype") else np.asarray(src).dtype
     native_median_requested = (
@@ -3324,21 +3334,25 @@ def median_filter(src, return_gpu=False, **kwargs):
         from taichi_vision.taichi_aot.capabilities import opengl_native_probe
 
         native_median_supported = opengl_native_probe("median")
-    if np.dtype(median_dtype) != np.dtype(np.float32) or (
-        engine.arch.lower() in ("opengl", "gles")
-        and (not native_median_requested or not native_median_supported)
-    ):
-        import cv2
-
+    if np.dtype(median_dtype) != np.dtype(np.float32):
         source = (
             src.to_numpy()
             if isinstance(src, TaichiGPUBuffer)
             else np.ascontiguousarray(src)
         )
-        result = cv2.medianBlur(source, 3)
-        if return_gpu:
-            return upload(np.ascontiguousarray(result))
-        return result
+        result = median_filter(
+            np.ascontiguousarray(source, dtype=np.float32),
+            return_gpu=return_gpu,
+            **kwargs,
+        )
+        return _return_core_result(result, return_gpu=return_gpu)
+    if engine.arch.lower() in ("opengl", "gles") and (
+        not native_median_requested or not native_median_supported
+    ):
+        _core_only_error(
+            "median_filter",
+            "the selected OpenGL median graph is not probe-qualified for this shape",
+        )
 
     if not isinstance(src, TaichiGPUBuffer):
         array = np.ascontiguousarray(src)
@@ -3529,12 +3543,8 @@ def sobel(src, return_gpu=False):
             outputs[1].destroy()
 
     if np.dtype(src.dtype) != np.dtype(np.float32):
-        import cv2
-
-        source = src.to_numpy()
-        dx = cv2.Sobel(source, cv2.CV_32F, 1, 0, ksize=3)
-        dy = cv2.Sobel(source, cv2.CV_32F, 0, 1, ksize=3)
-        return (upload(dx), upload(dy)) if return_gpu else (dx, dy)
+        source = np.ascontiguousarray(src.to_numpy(), dtype=np.float32)
+        return sobel(source, return_gpu=return_gpu)
 
     is_gpu = isinstance(src, TaichiGPUBuffer)
     src_buf = src if is_gpu else engine.upload(src)
@@ -3592,11 +3602,10 @@ def laplacian(src, return_gpu=False):
             output.destroy()
 
     if np.dtype(src.dtype) != np.dtype(np.float32):
-        import cv2
-
-        source = src.to_numpy()
-        result = cv2.Laplacian(source, cv2.CV_32F, ksize=3)
-        return upload(result) if return_gpu else result
+        return laplacian(
+            np.ascontiguousarray(src.to_numpy(), dtype=np.float32),
+            return_gpu=return_gpu,
+        )
 
     is_gpu = isinstance(src, TaichiGPUBuffer)
     src_buf = src if is_gpu else engine.upload(src)
@@ -3968,13 +3977,7 @@ def joint_bilateral_upsample(src_low, guide_hi, preset="medium", return_gpu=Fals
     if (
         np.dtype(jblu_src_dtype) != np.dtype(np.float32)
         or np.dtype(jblu_guide_dtype) != np.dtype(np.float32)
-        or (
-            engine.arch.lower() in ("opengl", "gles")
-            and (not native_jblu_requested or not native_jblu_supported)
-        )
     ):
-        import cv2
-
         low = (
             src_low.to_numpy()
             if isinstance(src_low, TaichiGPUBuffer)
@@ -3985,12 +3988,20 @@ def joint_bilateral_upsample(src_low, guide_hi, preset="medium", return_gpu=Fals
             if isinstance(guide_hi, TaichiGPUBuffer)
             else np.asarray(guide_hi)
         )
-        result = cv2.resize(
+        result = joint_bilateral_upsample(
             np.ascontiguousarray(low, dtype=np.float32),
-            (guide.shape[1], guide.shape[0]),
-            interpolation=cv2.INTER_LINEAR,
+            np.ascontiguousarray(guide, dtype=np.float32),
+            preset=preset,
+            return_gpu=return_gpu,
         )
-        return upload(np.ascontiguousarray(result)) if return_gpu else result
+        return _return_core_result(result, return_gpu=return_gpu)
+    if engine.arch.lower() in ("opengl", "gles") and (
+        not native_jblu_requested or not native_jblu_supported
+    ):
+        _core_only_error(
+            "joint_bilateral_upsample",
+            "the selected OpenGL JBLU graph is not probe-qualified for this shape",
+        )
 
     """
     AOT Joint Bilateral Upsampling (JBLU).
@@ -4095,32 +4106,15 @@ def bilateral_grid_filter(src, preset="medium", return_gpu=False):
     AOT Bilateral Grid Filter.
     Edge-preserving smoothing in O(1) time per pixel.
     """
-    # The checked-in OpenGL grid artifact has been rebuilt with matching 4D
-    # shape metadata and passed the isolated runtime smoke test. Keep an
-    # explicit host escape hatch for older driver/artifact deployments.
+    # The checked-in OpenGL grid artifact has matching 4D shape metadata.
     if (
         engine.arch.lower() in ("opengl", "gles")
         and os.environ.get("PIXEL_REFINE_AOT_NATIVE_BILATERAL_GRID", "1") != "1"
     ):
-        import cv2
-
-        source = (
-            src.to_numpy()
-            if isinstance(src, TaichiGPUBuffer)
-            else np.ascontiguousarray(src)
+        _core_only_error(
+            "bilateral_grid_filter",
+            "native OpenGL bilateral-grid graph was disabled by configuration",
         )
-        _, _, sigma_s, sigma_r = BILATERAL_GRID_PRESETS.get(
-            preset, BILATERAL_GRID_PRESETS["medium"]
-        )
-        result = cv2.bilateralFilter(
-            source.astype(np.float32, copy=False),
-            d=0,
-            sigmaColor=float(sigma_r),
-            sigmaSpace=float(sigma_s),
-        )
-        if return_gpu:
-            return upload(np.ascontiguousarray(result))
-        return result
 
     is_gpu = isinstance(src, TaichiGPUBuffer)
     src_buf = src if is_gpu else engine.upload(src)
@@ -4320,29 +4314,10 @@ def phase_correlation(ref, comp, use_hanning=True):
         and min(int(phase_shape[0]), int(phase_shape[1])) >= 48
     )
     if engine.arch.lower() in ("opengl", "gles") and not native_phase_safe:
-        import cv2
-
-        ref_np = (
-            ref.to_numpy()
-            if isinstance(ref, TaichiGPUBuffer)
-            else np.ascontiguousarray(ref)
+        _core_only_error(
+            "phase_correlation",
+            "the selected OpenGL FFT/phase graph is not safe for this shape or Hanning mode",
         )
-        comp_np = (
-            comp.to_numpy()
-            if isinstance(comp, TaichiGPUBuffer)
-            else np.ascontiguousarray(comp)
-        )
-        hann = (
-            cv2.createHanningWindow((ref_np.shape[1], ref_np.shape[0]), cv2.CV_32F)
-            if use_hanning
-            else None
-        )
-        shift, response = cv2.phaseCorrelate(
-            ref_np.astype(np.float32, copy=False),
-            comp_np.astype(np.float32, copy=False),
-            hann,
-        )
-        return float(shift[0]), float(shift[1]), float(response)
 
     is_gpu = isinstance(ref, TaichiGPUBuffer)
     ref_buf = ref if is_gpu else engine.upload(ref)
@@ -4380,33 +4355,17 @@ def phase_correlation(ref, comp, use_hanning=True):
     if dx > w // 2:
         dx -= w
 
-    # Some Intel OpenGL drivers produce an all-zero correlation surface for
-    # sparse or highly structured inputs. Recover through the reference path
-    # instead of returning a plausible-looking but incorrect shift.
+    # A zero/invalid native correlation is a failed TCM execution, not a
+    # reason to switch to a host reference implementation.
     if (
         engine.arch.lower() in ("opengl", "gles")
         and native_phase_safe
         and (not np.isfinite(peak_val) or float(peak_val) <= 1e-6)
     ):
-        ref_np = (
-            ref.to_numpy()
-            if isinstance(ref, TaichiGPUBuffer)
-            else np.ascontiguousarray(ref)
+        _core_only_error(
+            "phase_correlation",
+            "native OpenGL phase correlation returned an invalid correlation surface",
         )
-        comp_np = (
-            comp.to_numpy()
-            if isinstance(comp, TaichiGPUBuffer)
-            else np.ascontiguousarray(comp)
-        )
-        import cv2
-
-        shift, response = cv2.phaseCorrelate(
-            ref_np.astype(np.float32, copy=False),
-            comp_np.astype(np.float32, copy=False),
-            None,
-        )
-        del f_complex, g_complex, r_complex, corr_buf
-        return float(shift[0]), float(shift[1]), float(response)
 
     del f_complex, g_complex, r_complex, corr_buf
     return float(dx), float(dy), float(peak_val)
@@ -5616,6 +5575,10 @@ def _should_use_demosaic_blockwise(operation, bayer) -> bool:
             os.environ.get("PIXEL_REFINE_DEMOSAIC_AUTO_FULL_MP", "inf")
         )
         return (bayer.size / 1_000_000.0) > max(0.0, threshold_mp)
+    if arch == "cpu":
+        # CPU has no device-VRAM pressure.  Keep its latency-optimized
+        # full-frame path unless the caller explicitly selected block mode.
+        return False
     if arch in {"vulkan", "cuda"}:
         # A full graph avoids a host round-trip for every halo tile and is
         # substantially faster when the intermediate planes fit.  Estimate
@@ -5626,6 +5589,7 @@ def _should_use_demosaic_blockwise(operation, bayer) -> bool:
             "dcb": 36,  # bayer + mosaic + green + rgb_a + dst
             "arm": 40,  # bayer + six scalar planes + RGB dst
             "hamilton": 40,
+            "bilinear": 24,  # bayer + RGB dst plus transport/alignment margin
             "mlri_admm": 52,  # bayer + guided/filter scratch + RGB dst
         }.get(str(operation).lower(), 48)
         try:
@@ -6257,7 +6221,7 @@ def dcb_demosaic(
 
 
 @ti_thread
-def bilinear(
+def _bilinear_demosaic_full(
     bayer,
     wb_r,
     wb_g1,
@@ -6369,6 +6333,87 @@ def bilinear(
         # destination is retained only when return_gpu=True transfers it out.
         if owns_dst and not return_gpu and dst_buf is not None:
             _release_owned_aot_buffer(dst_buf)
+
+
+@ti_thread
+def bilinear(
+    bayer,
+    wb_r,
+    wb_g1,
+    wb_b,
+    wb_g2,
+    cmatrix,
+    black_level,
+    white_level,
+    c00,
+    c01,
+    c10,
+    c11,
+    return_gpu=False,
+    dst=None,
+    half_res=False,
+):
+    """Run bilinear demosaic with an adaptive low-memory path.
+
+    Full-frame execution remains the default for CPU because it is faster and
+    does not consume device VRAM.  GPU callers switch to bounded Bayer-phase-
+    safe tiles only when the shared residency policy or memory estimator
+    requires it.  The public signature and output semantics are unchanged.
+    """
+    if (
+        not return_gpu
+        and dst is None
+        and not half_res
+        and _should_use_demosaic_blockwise("bilinear", bayer)
+    ):
+        params = _demosaic_params(
+            (wb_r, wb_g1, wb_b, wb_g2),
+            (black_level, white_level),
+            (c00, c01, c10, c11),
+            cmatrix,
+        )
+        result = _demosaic_blockwise(
+            "bilinear_demosaic",
+            bayer,
+            lambda tile: _bilinear_demosaic_full(
+                tile,
+                wb_r,
+                wb_g1,
+                wb_b,
+                wb_g2,
+                cmatrix,
+                black_level,
+                white_level,
+                c00,
+                c01,
+                c10,
+                c11,
+                return_gpu=False,
+                dst=None,
+                half_res=False,
+            ),
+            params,
+            halo=8,
+        )
+        if result is not None:
+            return result
+    return _bilinear_demosaic_full(
+        bayer,
+        wb_r,
+        wb_g1,
+        wb_b,
+        wb_g2,
+        cmatrix,
+        black_level,
+        white_level,
+        c00,
+        c01,
+        c10,
+        c11,
+        return_gpu=return_gpu,
+        dst=dst,
+        half_res=half_res,
+    )
 
 
 def bilinear_demosaic(
@@ -10063,44 +10108,36 @@ def inpaint(src, mask, inpaint_radius=3, flags=0, return_gpu=False):
 
     src_shape = getattr(src, "shape", ())
     src_dtype = getattr(src, "dtype", np.float32)
-    # The native graph is validated for scalar fp32 only.  RGB and integer
-    # inputs stay on the reference path until dedicated parity probes exist.
+    # The native graph is validated for scalar fp32 only.
     native_inpaint_shape_safe = len(src_shape) == 2 and np.dtype(src_dtype) == np.dtype(
         np.float32
     )
-    if engine.arch.lower() in ("opengl", "gles") and (
-        not native_inpaint_shape_safe
-        or os.environ.get("PIXEL_REFINE_AOT_NATIVE_INPAINT", "0") != "1"
-        or not opengl_native_probe("inpaint")
-    ):
-        import cv2
-
+    if np.dtype(src_dtype) != np.dtype(np.float32):
         source = (
             src.to_numpy()
             if isinstance(src, TaichiGPUBuffer)
             else np.ascontiguousarray(src)
         )
-        source = np.ascontiguousarray(source)
-        mask_np = (
+        mask_array = (
             mask.to_numpy() if isinstance(mask, TaichiGPUBuffer) else np.asarray(mask)
         )
-        mask_u8 = (mask_np > 0).astype(np.uint8)
-        scale = (
-            255.0
-            if np.issubdtype(source.dtype, np.floating) and np.max(source) <= 1.0
-            else 1.0
+        result = inpaint(
+            np.ascontiguousarray(source, dtype=np.float32),
+            np.ascontiguousarray(mask_array, dtype=np.float32),
+            inpaint_radius=inpaint_radius,
+            flags=flags,
+            return_gpu=return_gpu,
         )
-        work = (
-            np.clip(source * scale, 0, 255).astype(np.uint8)
-            if scale != 1.0 or source.dtype != np.uint8
-            else source
+        return _return_core_result(result, return_gpu=return_gpu)
+    if engine.arch.lower() in ("opengl", "gles") and (
+        not native_inpaint_shape_safe
+        or os.environ.get("PIXEL_REFINE_AOT_NATIVE_INPAINT", "0") != "1"
+        or not opengl_native_probe("inpaint")
+    ):
+        _core_only_error(
+            "inpaint",
+            "the selected OpenGL inpaint graph is not probe-qualified for this input",
         )
-        result = cv2.inpaint(work, mask_u8, float(inpaint_radius), cv2.INPAINT_TELEA)
-        if np.issubdtype(source.dtype, np.floating):
-            result = result.astype(np.float32) / scale
-        else:
-            result = result.astype(source.dtype, copy=False)
-        return upload(np.ascontiguousarray(result)) if return_gpu else result
 
     is_numpy = isinstance(src, np.ndarray)
     is_3d = len(src.shape) == 3 and src.shape[2] == 3
@@ -10791,26 +10828,14 @@ def _canny_full(src, low_threshold=50.0, high_threshold=150.0, return_gpu=False)
 
 def canny_aot(src, low_threshold=50.0, high_threshold=150.0, return_gpu=False):
     """Pure Taichi AOT Canny implementation for host and GPU inputs."""
-    # The current OpenGL Canny graph is numerically stable but does not yet
-    # reproduce OpenCV's non-maximum suppression/hysteresis topology closely
-    # enough for production image quality.  Preserve the public API and exact
-    # reference semantics until a parity-qualified graph is available.
     if (
         engine.arch.lower() in ("opengl", "gles")
         and os.environ.get("PIXEL_REFINE_AOT_NATIVE_CANNY", "1") != "1"
     ):
-        import cv2
-
-        source = (
-            src.to_numpy()
-            if isinstance(src, TaichiGPUBuffer)
-            else np.ascontiguousarray(src)
+        _core_only_error(
+            "canny_aot",
+            "native OpenGL Canny graph was disabled by configuration",
         )
-        source_u8 = np.clip(source, 0, 255).astype(np.uint8)
-        result = cv2.Canny(
-            source_u8, float(low_threshold), float(high_threshold)
-        ).astype(np.float32)
-        return upload(result) if return_gpu else result
     # The native Canny graphs operate in normalized fp32 space. Preserve the
     # public OpenCV-style 0..255 API by normalizing host integer/range inputs
     # before dispatch and scaling thresholds accordingly.
@@ -10982,47 +11007,10 @@ def guided_filter_aot(guide, src, radius=8, epsilon=1e-4, return_gpu=False):
         os.environ.get("PIXEL_REFINE_AOT_NATIVE_GUIDED", "1") != "1"
         or not opengl_native_probe("guided")
     ):
-        import cv2
-
-        I = (
-            guide.to_numpy()
-            if isinstance(guide, TaichiGPUBuffer)
-            else np.asarray(guide, dtype=np.float32)
+        _core_only_error(
+            "guided_filter_aot",
+            "the selected OpenGL guided-filter graph is not probe-qualified",
         )
-        p = (
-            src.to_numpy()
-            if isinstance(src, TaichiGPUBuffer)
-            else np.asarray(src, dtype=np.float32)
-        )
-        I = np.ascontiguousarray(I, dtype=np.float32)
-        p = np.ascontiguousarray(p, dtype=np.float32)
-        if I.ndim != 2 or p.ndim != 2 or I.shape != p.shape:
-            raise ValueError(
-                "guided_filter_aot requires matching 2D guide and source arrays"
-            )
-        ksize = (2 * int(radius) + 1, 2 * int(radius) + 1)
-        mean_I = cv2.boxFilter(
-            I, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        mean_p = cv2.boxFilter(
-            p, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        corr_I = cv2.boxFilter(
-            I * I, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        corr_Ip = cv2.boxFilter(
-            I * p, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        a = (corr_Ip - mean_I * mean_p) / (corr_I - mean_I * mean_I + float(epsilon))
-        b = mean_p - a * mean_I
-        mean_a = cv2.boxFilter(
-            a, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        mean_b = cv2.boxFilter(
-            b, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE
-        )
-        result = mean_a * I + mean_b
-        return upload(np.ascontiguousarray(result)) if return_gpu else result
 
     if not isinstance(guide, TaichiGPUBuffer) and not isinstance(src, TaichiGPUBuffer):
         guide_array = np.ascontiguousarray(guide, dtype=np.float32)
@@ -11403,53 +11391,10 @@ def seamless_clone_aot(
         or os.environ.get("PIXEL_REFINE_AOT_NATIVE_SEAMLESS", "1") != "1"
         or not opengl_native_probe("seamless")
     ):
-        import cv2
-
-        source = src.to_numpy() if isinstance(src, TaichiGPUBuffer) else np.asarray(src)
-        destination = (
-            dst_img.to_numpy()
-            if isinstance(dst_img, TaichiGPUBuffer)
-            else np.asarray(dst_img)
+        _core_only_error(
+            "seamless_clone_aot",
+            "the selected OpenGL seamless-clone graph is not probe-qualified",
         )
-        source = np.ascontiguousarray(source)
-        destination = np.ascontiguousarray(destination)
-        if tuple(center) == (0, 0):
-            center = (destination.shape[1] // 2, destination.shape[0] // 2)
-        scale = (
-            255.0
-            if np.issubdtype(source.dtype, np.floating) and np.max(destination) <= 1.0
-            else 1.0
-        )
-        src_u8 = (
-            np.clip(source * scale, 0, 255).astype(np.uint8)
-            if scale != 1.0 or source.dtype != np.uint8
-            else source
-        )
-        dst_u8 = (
-            np.clip(destination * scale, 0, 255).astype(np.uint8)
-            if scale != 1.0 or destination.dtype != np.uint8
-            else destination
-        )
-        mask_u8 = (
-            mask.to_numpy()
-            if isinstance(mask, TaichiGPUBuffer)
-            else np.asarray(mask) > 0
-        ).astype(np.uint8) * 255
-        try:
-            result = cv2.seamlessClone(
-                src_u8, dst_u8, mask_u8, tuple(map(int, center)), int(flags)
-            )
-        except cv2.error:
-            # OpenCV rejects degenerate/constant Poisson systems on some
-            # versions. Preserve the documented image shape and semantics by
-            # treating the operation as a no-op instead of leaking a backend
-            # exception through the otherwise stable AOT API.
-            result = dst_u8.copy()
-        if np.issubdtype(destination.dtype, np.floating):
-            result = result.astype(np.float32) / scale
-        else:
-            result = result.astype(destination.dtype, copy=False)
-        return upload(np.ascontiguousarray(result)) if return_gpu else result
 
     is_gpu_src = isinstance(src, TaichiGPUBuffer)
     is_gpu_dst = isinstance(dst_img, TaichiGPUBuffer)
