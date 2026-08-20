@@ -225,7 +225,7 @@ def private_bytes():
 private_before = private_bytes()
 for stage, expected in (("read_map", "map"), ("read_copy", "copy")):
     os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
-    for _ in range(24):
+    for _ in range(128):
         rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
         assert not d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
         assert expected.encode() in (d.get_last_engine_error(r) or b"")
@@ -240,7 +240,7 @@ assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 0, 4, 3, 8)
 assert sentinel.read_bytes() == b"keep"
 for stage, expected in (("map", "map"), ("encoder", "encoder"), ("frame_commit", "frame commit"), ("encoder_commit", "encoder commit"), ("replace", "replace")):
     os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
-    for _ in range(24):
+    for _ in range(128):
         assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 4, 4, 3, 8)
         assert expected.encode() in (d.get_last_engine_error(r) or b"")
         assert sentinel.read_bytes() == b"keep", (stage, sentinel.read_bytes())
