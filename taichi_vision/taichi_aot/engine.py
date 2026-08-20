@@ -5,6 +5,7 @@ import math
 import numbers
 import os
 import sys
+import platform
 import atexit
 import signal
 import shutil
@@ -49,10 +50,12 @@ from taichi_vision.backend_config import (
     is_android_runtime,
 )
 from taichi_vision.device_selection import (
+    device_fingerprint,
     is_translation_device,
     make_device_selector,
     query_vulkan_memory_budget,
     resolve_device_selector,
+    scan_cuda_device_records,
     scan_vulkan_device_records,
 )
 from .artifact_targets import detect_target
@@ -269,6 +272,19 @@ def _materialize_cpu_aot_directory(artifact_path):
                 shutil.rmtree(staging, ignore_errors=True)
 
 
+_VULKAN_PROBE_STATE = threading.local()
+
+
+def _set_vulkan_probe_diagnostic(message: str) -> None:
+    _VULKAN_PROBE_STATE.error = str(message)[:512]
+
+
+def get_vulkan_device_probe_diagnostic() -> str:
+    """Return the bounded diagnostic from the most recent Vulkan fallback."""
+
+    return str(getattr(_VULKAN_PROBE_STATE, "error", ""))
+
+
 def get_vulkan_device_name(device_id):
     # The AOT bridge and the runtime must use the same enumeration source.
     # Otherwise a UI ordinal can refer to NVIDIA in one list and Intel in a
@@ -285,8 +301,8 @@ def get_vulkan_device_name(device_id):
         )
         if record and record.get("name"):
             return str(record["name"])
-    except Exception:
-        pass
+    except Exception as exc:
+        _set_vulkan_probe_diagnostic(f"primary Vulkan device scan failed: {exc}")
     try:
         import ctypes
         import ctypes.util
@@ -310,11 +326,15 @@ def get_vulkan_device_name(device_id):
             if discovered:
                 vk = ctypes.CDLL(discovered)
         if vk is None:
+            _set_vulkan_probe_diagnostic(
+                "Vulkan fallback loader not found for platform "
+                f"{sys.platform}"
+            )
             return None
 
         class VkApplicationInfo(ctypes.Structure):
             _fields_ = [
-                ("sType", ctypes.c_int),
+                ("sType", ctypes.c_uint32),
                 ("pNext", ctypes.c_void_p),
                 ("pApplicationName", ctypes.c_char_p),
                 ("applicationVersion", ctypes.c_uint32),
@@ -325,7 +345,7 @@ def get_vulkan_device_name(device_id):
 
         class VkInstanceCreateInfo(ctypes.Structure):
             _fields_ = [
-                ("sType", ctypes.c_int),
+                ("sType", ctypes.c_uint32),
                 ("pNext", ctypes.c_void_p),
                 ("flags", ctypes.c_uint32),
                 ("pApplicationInfo", ctypes.POINTER(VkApplicationInfo)),
@@ -377,25 +397,46 @@ def get_vulkan_device_name(device_id):
             ppEnabledExtensionNames=None,
         )
 
-        if int(device_id) < 0:
+        index = int(device_id)
+        if index < 0:
             return None
         instance = ctypes.c_void_p()
         res = vk.vkCreateInstance(
             ctypes.pointer(create_info), None, ctypes.pointer(instance)
         )
         if res != 0:
+            _set_vulkan_probe_diagnostic(f"vkCreateInstance failed with VkResult {int(res)}")
             return None
 
         count = ctypes.c_uint32(0)
-        vk.vkEnumeratePhysicalDevices(instance, ctypes.pointer(count), None)
-        if count.value == 0 or device_id >= count.value:
+        res = vk.vkEnumeratePhysicalDevices(
+            instance, ctypes.pointer(count), None
+        )
+        if res != 0:
             vk.vkDestroyInstance(instance, None)
+            _set_vulkan_probe_diagnostic(
+                f"vkEnumeratePhysicalDevices(count) failed with VkResult {int(res)}"
+            )
+            return None
+        if count.value == 0 or index >= count.value:
+            vk.vkDestroyInstance(instance, None)
+            _set_vulkan_probe_diagnostic(
+                f"Vulkan device ordinal {index} is outside enumerated count {count.value}"
+            )
             return None
 
         devices = (ctypes.c_void_p * count.value)()
-        vk.vkEnumeratePhysicalDevices(instance, ctypes.pointer(count), devices)
+        res = vk.vkEnumeratePhysicalDevices(
+            instance, ctypes.pointer(count), devices
+        )
+        if res != 0:
+            vk.vkDestroyInstance(instance, None)
+            _set_vulkan_probe_diagnostic(
+                f"vkEnumeratePhysicalDevices(handles) failed with VkResult {int(res)}"
+            )
+            return None
 
-        dev = devices[device_id]
+        dev = devices[index]
         buf = (ctypes.c_byte * 1024)()
         vk.vkGetPhysicalDeviceProperties(dev, buf)
 
@@ -406,8 +447,17 @@ def get_vulkan_device_name(device_id):
         name = name_bytes.decode("utf-8", errors="ignore")
 
         vk.vkDestroyInstance(instance, None)
+        if not name:
+            _set_vulkan_probe_diagnostic(
+                f"Vulkan device ordinal {index} returned an empty device name"
+            )
+            return None
+        _set_vulkan_probe_diagnostic("")
         return name
-    except Exception:
+    except Exception as exc:
+        _set_vulkan_probe_diagnostic(
+            f"Vulkan fallback probe failed: {type(exc).__name__}: {exc}"
+        )
         return None
 
 
@@ -865,6 +915,7 @@ def _op_begin(name: str):
             "name": str(name),
             "thread_id": threading.get_ident(),
             "thread_name": threading.current_thread().name,
+            "thread": threading.current_thread(),
         }
         stack = getattr(_tracking_local, "operation_tokens", None)
         if stack is None:
@@ -905,6 +956,7 @@ def _lock_wait_begin(name: str):
             "name": str(name),
             "thread_id": threading.get_ident(),
             "thread_name": threading.current_thread().name,
+            "thread": threading.current_thread(),
         }
         stack = getattr(_tracking_local, "lock_wait_tokens", None)
         if stack is None:
@@ -931,6 +983,17 @@ def _watchdog_snapshot(now=None):
     if now is None:
         now = time.monotonic()
     with _heartbeat_lock:
+        # A worker can die between _begin and its finally block (for example
+        # an injected exception or interpreter cancellation).  Its token must
+        # not keep the watchdog in a permanent false-positive state.
+        for registry in (_active_operations, _active_lock_waits):
+            stale = [
+                token
+                for token, item in registry.items()
+                if not item.get("thread") or not item["thread"].is_alive()
+            ]
+            for token in stale:
+                registry.pop(token, None)
         operation = min(
             _active_operations.values(),
             key=lambda item: item["started"],
@@ -995,6 +1058,11 @@ def _watchdog_run():
     global _last_activity_time, _vram_reclaimed
     main_thread = threading.main_thread()
     while not _WATCHDOG_STOP.wait(_WATCHDOG_INTERVAL_S):
+        # During interpreter finalization the main thread is intentionally no
+        # longer alive.  Do not confuse that normal atexit transition with a
+        # fatal runtime hang, especially because the fatal path is a hard exit.
+        if _WATCHDOG_STOP.is_set() or getattr(sys, "is_finalizing", lambda: False)():
+            break
         # Eksperimen: Untuk backend CUDA, nonaktifkan Watchdog idle reclamation dan error circuit breaker
         # agar Primary CUDA Context tetap aktif 100% dan GC diatur murni per-algoritma.
         is_cuda = False
@@ -5528,6 +5596,53 @@ class AOTEngine:
             _op_end()
         return buf
 
+    def _artifact_identity(self, device_name: str) -> dict[str, str]:
+        """Return the immutable identity that scopes artifact quarantine."""
+
+        config = getattr(self, "_backend_config", None)
+        backend = str(getattr(self, "arch", "cpu")).lower()
+        identity = {
+            "target_id": "",
+            "device_fingerprint": "",
+            "driver_version": "",
+            "driver_uuid": "",
+        }
+        try:
+            identity["target_id"] = detect_target(
+                backend=backend,
+                device=device_name,
+            ).target_id
+        except Exception:
+            identity["target_id"] = f"{backend}:{platform.platform()}"
+
+        records = []
+        try:
+            if backend == "vulkan":
+                records = scan_vulkan_device_records()
+            elif backend == "cuda":
+                records = scan_cuda_device_records()
+        except Exception:
+            records = []
+        record = next(
+            (
+                item
+                for item in records
+                if int(item.get("ordinal", -1)) == int(self.device_id)
+            ),
+            None,
+        )
+        if record is not None:
+            identity["device_fingerprint"] = str(
+                record.get("fingerprint") or device_fingerprint(record)
+            )
+            identity["driver_version"] = str(record.get("driver_version") or "")
+            identity["driver_uuid"] = str(record.get("driver_uuid") or "")
+        elif config is not None:
+            identity["device_fingerprint"] = device_fingerprint(
+                getattr(config, "device_name", "") or device_name
+            )
+        return identity
+
     def load(self, path):
         with self._lock:
             base, ext = os.path.splitext(path)
@@ -5566,6 +5681,8 @@ class AOTEngine:
                 )
             else:
                 device_name = "logical-device"
+            artifact_identity = self._artifact_identity(device_name)
+            cache_artifact_path = tcm_manifest_path or p
             if tcm_manifest_path and os.environ.get("AOT_TCM_ABI_PREFLIGHT", "0") == "1":
                 target_device_name = device_name
                 if self.arch.lower() == "cuda":
@@ -5612,10 +5729,11 @@ class AOTEngine:
                 if not preflight.allowed:
                     set_status(
                         artifact_key(
-                            tcm_manifest_path,
+                            cache_artifact_path,
                             self.arch,
                             self.device_id,
                             device_name,
+                            **artifact_identity,
                         ),
                         "quarantined",
                         backend=self.arch,
@@ -5627,7 +5745,13 @@ class AOTEngine:
                         f"[AOTEngine TCM ABI] {preflight.status}: "
                         f"{os.path.basename(tcm_manifest_path)}: {preflight.reason}"
                     )
-            cache_key = artifact_key(p, self.arch, self.device_id, device_name)
+            cache_key = artifact_key(
+                cache_artifact_path,
+                self.arch,
+                self.device_id,
+                device_name,
+                **artifact_identity,
+            )
             cached = get_status(cache_key)
             if cached and cached.get("status") == "quarantined":
                 raise RuntimeError(
