@@ -57,27 +57,19 @@ jobs:
           import subprocess
           import sys
 
-          root = Path("taichi_vision/taichi_aot/tests")
-          names = (
-              "test_facade_import_failure.py",
-              "test_residency_hardening.py",
-              "test_intel_vulkan_device_identity.py",
-              "test_pipeline_scheduler_config_scope.py",
-              "test_backend_manager_authority.py",
-              "test_strict_policy_booleans.py",
-              "test_block_cache_leasing.py",
-              "test_archive_extraction_bounds.py",
-              "test_compute_block_registration_boundary.py",
-              "test_device_selector_ambiguity.py",
-              "test_tcm_target_qualifiers.py",
+          # The repository currently ships Windows and ARM Linux bridges, but
+          # no x86_64 Linux bridge.  Keep this Linux job portable: native AOT
+          # tests run in the target-runtime matrix, while this job verifies
+          # the dependency boundary without importing the native package.
+          tests = []
+          core_boundary = Path(
+              "taichi_vision/taichi_algorithm/aot_py/tests/"
+              "test_core_dependency_boundary.py"
           )
-          tests = [str(root / name) for name in names if (root / name).is_file()]
-          if not tests:
-              print("No CPU-safe hardening regression files are present on this ref yet.")
-              raise SystemExit(0)
-
-          core_boundary = Path("taichi_vision/taichi_algorithm/aot_py/tests/test_core_dependency_boundary.py")
           if core_boundary.is_file():
               tests.append(str(core_boundary))
+          if not tests:
+              print("No portable dependency-boundary tests are present on this ref yet.")
+              raise SystemExit(0)
           subprocess.check_call([sys.executable, "-m", "pytest", "-q", *tests])
           PY
