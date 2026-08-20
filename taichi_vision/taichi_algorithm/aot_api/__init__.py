@@ -515,9 +515,12 @@ def load_tcm(name):
 
 def unload_all_modules():
     """Release all cached TCM modules. Call after heavy processing to free VRAM."""
+    engine.clear_pipelines()
+    # Clear recorded pipelines while their module handles are still registered.
+    # Only then release the Python cache and native module registry; this keeps
+    # replay/unload races fail-closed instead of exposing stale raw pointers.
     _module_cache.clear()
     engine.modules.clear()
-    engine.clear_pipelines()
 
 
 # --- OpenCV-style Constants ---

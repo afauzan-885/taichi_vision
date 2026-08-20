@@ -35,6 +35,29 @@ def test_writer_unmaps_source_on_every_post_map_failure_path():
     assert "FAILED(write_result)" in body
 
 
+def test_writer_commits_to_a_sibling_temp_then_replaces_the_destination():
+    body = _function_body("bool ti_imwrite_from_gpu")
+    assert "pixelrefine.tmp" in body
+    assert "CREATE_NEW" in body
+    assert "MoveFileExW" in body
+    assert "MOVEFILE_REPLACE_EXISTING" in body
+    assert "DeleteFileW" in body
+
+
+def test_writer_records_bounded_native_failure_diagnostics():
+    body = _function_body("bool ti_imwrite_from_gpu")
+    assert "auto fail = [&](const char *operation, HRESULT hr)" in body
+    assert "HRESULT=0x" in body
+    for operation in (
+        "WIC stream creation",
+        "WIC encoder creation",
+        "WIC frame commit",
+        "WIC encoder commit",
+        "final file replace",
+    ):
+        assert operation in body
+
+
 def test_reader_exposes_handle_only_after_checked_pixel_copy():
     body = _function_body("void *ti_imread_to_gpu")
     return_pos = body.rindex("return (void *)gpu_mem")

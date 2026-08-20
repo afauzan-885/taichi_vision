@@ -57,3 +57,15 @@ def test_image_io_uses_the_same_allocation_contract():
     assert "validate_gpu_allocation_locked" in write_body
     assert "size64" in write_body
 
+
+def test_graph_and_pipeline_dynamic_args_use_native_capacity_admission():
+    dispatch_start = SOURCE.index("static bool _fill_ti_arg")
+    dispatch_end = SOURCE.index("EXPORT void run_aot_graph", dispatch_start)
+    dispatch = SOURCE[dispatch_start:dispatch_end]
+    assert "validate_dynamic_arg_allocation" in dispatch
+    assert "element_size" in SOURCE
+    assert "required_bytes" in SOURCE
+    assert "checked_mul_u64" in SOURCE
+    assert "_fill_ti_arg(arg, args_array[i], i, engine" in SOURCE
+    assert "_fill_ti_arg(validation, arg, i, mod->owner" in SOURCE
+    assert "_fill_ti_arg(arg, *final_arg, arg_idx++, engine" in SOURCE

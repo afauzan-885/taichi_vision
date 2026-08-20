@@ -2622,6 +2622,7 @@ class TaichiGPUBuffer:
                         _LIB.read_from_gpu_buffer(
                             runtime, handle, out.ctypes.data, self.size_bytes
                         )
+                        _raise_native_engine_error(runtime, "GPU readback")
                     except Exception:
                         _record_error()
                         raise
@@ -2635,12 +2636,14 @@ class TaichiGPUBuffer:
                             _LIB.copy_gpu_buffer(
                                 runtime, handle, staging.handle, self.size_bytes
                             )
+                            _raise_native_engine_error(runtime, "GPU staged copy")
                             _LIB.read_from_gpu_buffer(
                                 runtime,
                                 staging.handle,
                                 out.ctypes.data,
                                 self.size_bytes,
                             )
+                            _raise_native_engine_error(runtime, "GPU staged readback")
                         except Exception:
                             _record_error()
                             raise
@@ -2655,6 +2658,7 @@ class TaichiGPUBuffer:
                     _LIB.read_from_gpu_buffer(
                         runtime, handle, out.ctypes.data, self.size_bytes
                     )
+                    _raise_native_engine_error(runtime, "GPU readback")
                 except Exception:
                     _record_error()
                     raise
@@ -2670,8 +2674,14 @@ class TaichiGPUBuffer:
         runtime, handle = self._require_live("GPU buffer map")
         if self.engine and hasattr(self.engine, "_lock"):
             with self.engine._lock:
-                return _LIB.map_gpu_buffer(runtime, handle)
-        return _LIB.map_gpu_buffer(runtime, handle)
+                ptr = _LIB.map_gpu_buffer(runtime, handle)
+                if not ptr:
+                    _raise_native_engine_error(runtime, "GPU buffer map")
+                return ptr
+        ptr = _LIB.map_gpu_buffer(runtime, handle)
+        if not ptr:
+            _raise_native_engine_error(runtime, "GPU buffer map")
+        return ptr
 
     def unmap(self):
         if self.engine is not None:
@@ -2680,8 +2690,10 @@ class TaichiGPUBuffer:
         if self.engine and hasattr(self.engine, "_lock"):
             with self.engine._lock:
                 _LIB.unmap_gpu_buffer(runtime, handle)
+                _raise_native_engine_error(runtime, "GPU buffer unmap")
         else:
             _LIB.unmap_gpu_buffer(runtime, handle)
+            _raise_native_engine_error(runtime, "GPU buffer unmap")
 
     def cast(self, target_dtype, host_accessible=False):
         self_dtype_type = np.dtype(self.dtype).type
@@ -5718,6 +5730,7 @@ class AOTEngine:
                 _LIB.copy_gpu_buffer(
                     self.runtime, staging.handle, vram_target.handle, staging.nbytes
                 )
+                _raise_native_engine_error(self.runtime, "GPU buffer copy")
             except Exception:
                 _record_error()
                 raise
@@ -5769,6 +5782,7 @@ class AOTEngine:
             _LIB.write_to_gpu_buffer(
                 self.runtime, buf.handle, arr.ctypes.data, buf.nbytes
             )
+            _raise_native_engine_error(self.runtime, "GPU buffer upload")
         except Exception:
             _record_error()
             raise
@@ -6010,7 +6024,11 @@ class AOTEngine:
             finally:
                 _op_end()
         if not handle:
-            raise RuntimeError(f"Failed to load image: {path}")
+            detail = self.last_error()
+            raise RuntimeError(
+                f"Failed to load image: {path}"
+                + (f" ({detail})" if detail else "")
+            )
         def release_invalid_handle():
             try:
                 with self._lock:
@@ -6084,7 +6102,11 @@ class AOTEngine:
             finally:
                 _op_end()
         if not res:
-            raise RuntimeError(f"Failed to save image: {path}")
+            detail = self.last_error()
+            raise RuntimeError(
+                f"Failed to save image: {path}"
+                + (f" ({detail})" if detail else "")
+            )
 
     def sync(self):
         _lock_wait_begin("sync")
