@@ -414,6 +414,13 @@ static void clear_engine_error(EngineContext *ctx) {
   ctx->last_error.clear();
 }
 
+static bool engine_has_error(EngineContext *ctx) {
+  if (!ctx)
+    return false;
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  return !ctx->last_error.empty();
+}
+
 static bool validate_gpu_allocation_locked(
     EngineContext *ctx, TiMemory memory, uint64_t requested_size,
     const char *operation, bool reject_mapped = true) {
@@ -3047,7 +3054,8 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
     for (int i = 0; i < num_args; i++) {
       TiNamedArgument arg = {};
       if (!_fill_ti_arg(arg, args_array[i], i, engine, "run_aot_graph")) {
-        set_engine_error(engine, "run_aot_graph: invalid DynamicArg descriptor");
+        if (!engine_has_error(engine))
+          set_engine_error(engine, "run_aot_graph: invalid DynamicArg descriptor");
         return;
       }
       ti_args.push_back(arg);
@@ -3142,6 +3150,7 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
   ModuleContext *mod = module_lease.get();
   if (!args_array || !mod)
     return;
+  clear_engine_error(mod->owner);
 
   GraphDispatch dispatch;
   dispatch.module_ctx = module_ctx;
@@ -3153,7 +3162,8 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
     DynamicArg arg = args_array[i];
     TiNamedArgument validation = {};
     if (!_fill_ti_arg(validation, arg, i, mod->owner, "add_to_pipeline")) {
-      set_engine_error(mod->owner, "add_to_pipeline: invalid DynamicArg descriptor");
+      if (!engine_has_error(mod->owner))
+        set_engine_error(mod->owner, "add_to_pipeline: invalid DynamicArg descriptor");
       return;
     }
     // Allocate storage for name string to keep it alive
@@ -3258,7 +3268,8 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
           }
         }
         if (!_fill_ti_arg(arg, *final_arg, arg_idx++, engine, "run_pipeline")) {
-          set_engine_error(engine, "run_pipeline: invalid DynamicArg descriptor");
+          if (!engine_has_error(engine))
+            set_engine_error(engine, "run_pipeline: invalid DynamicArg descriptor");
           return;
         }
 
