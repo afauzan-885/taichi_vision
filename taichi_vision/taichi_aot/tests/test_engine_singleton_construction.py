@@ -25,21 +25,27 @@ def test_constructor_lock_serializes_same_key_acquisition(monkeypatch):
     calls = 0
     state_lock = threading.Lock()
     result = object()
+    results = []
 
     def fake_unlocked(cls, arch=None, device_id=None):
         nonlocal active, maximum, calls
         with state_lock:
-            calls += 1
             active += 1
             maximum = max(maximum, active)
         try:
             time.sleep(0.03)
-            return result
+            key = (arch, device_id)
+            if key not in cls._instances:
+                cls._instances[key] = result
+                calls += 1
+            results.append(cls._instances[key])
+            return cls._instances[key]
         finally:
             with state_lock:
                 active -= 1
 
     monkeypatch.setattr(engine.AOTEngine, "_new_unlocked", classmethod(fake_unlocked))
+    engine.AOTEngine._instances.clear()
     threads = [
         threading.Thread(
             target=lambda: engine.AOTEngine.__new__(engine.AOTEngine, "cpu", 0)
@@ -51,5 +57,7 @@ def test_constructor_lock_serializes_same_key_acquisition(monkeypatch):
     for thread in threads:
         thread.join(timeout=2)
 
-    assert calls == 8
+    assert calls == 1
     assert maximum == 1
+    assert len(results) == 8
+    assert all(item is result for item in results)
