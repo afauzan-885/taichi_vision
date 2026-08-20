@@ -777,10 +777,10 @@ def configure_auto_destroy(
 # -------------------------------------------------------------------------
 _heartbeat_lock = threading.Lock()
 _last_activity_time = time.monotonic()  # updated on every GPU op entry/exit
-_op_start_time = 0.0  # 0.0 = no operation in progress
-_op_name = ""  # human-readable label for logging
-_lock_wait_start = 0.0  # when a thread started waiting for _lock
-_lock_wait_name = ""  # what operation is waiting for lock
+_tracking_local = threading.local()
+_tracking_sequence = 0
+_active_operations = {}  # token -> {started, name, thread_id, thread_name}
+_active_lock_waits = {}  # token -> {started, name, thread_id, thread_name}
 _error_timestamps = []  # rolling list of time.monotonic() for circuit breaker
 _vram_reclaimed = (
     False  # Track if VRAM was already cleared during the current idle session
@@ -853,46 +853,106 @@ def _op_begin(name: str):
         if getattr(inst, "arch", "").lower() == "cuda":
             ensure_cuda_context(getattr(inst, "device_id", 0))
 
-    global _op_start_time, _op_name, _last_activity_time, _vram_reclaimed
+    global _tracking_sequence, _last_activity_time, _vram_reclaimed
     if not _AUTO_DESTROY_ENABLED:
-        return
+        return None
     with _heartbeat_lock:
-        _op_start_time = time.monotonic()
-        _op_name = name
-        _last_activity_time = _op_start_time
+        started = time.monotonic()
+        token = _tracking_sequence
+        _tracking_sequence += 1
+        _active_operations[token] = {
+            "started": started,
+            "name": str(name),
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+        }
+        stack = getattr(_tracking_local, "operation_tokens", None)
+        if stack is None:
+            stack = _tracking_local.operation_tokens = []
+        stack.append(token)
+        _last_activity_time = started
         _vram_reclaimed = False
+        return token
 
 
-def _op_end():
+def _op_end(token=None):
     """Mark the end of a blocking GPU/DLL operation."""
-    global _op_start_time, _op_name, _last_activity_time, _vram_reclaimed
+    global _last_activity_time, _vram_reclaimed
     if not _AUTO_DESTROY_ENABLED:
         return
     with _heartbeat_lock:
-        _op_start_time = 0.0
-        _op_name = ""
+        stack = getattr(_tracking_local, "operation_tokens", None) or []
+        if token is None:
+            token = stack[-1] if stack else None
+        if token is not None and token in stack:
+            stack.remove(token)
+            _active_operations.pop(token, None)
         _last_activity_time = time.monotonic()
         _vram_reclaimed = False
 
 
 def _lock_wait_begin(name: str):
     """Track when a thread starts blocking on engine._lock."""
-    global _lock_wait_start, _lock_wait_name
+    global _tracking_sequence
     if not _AUTO_DESTROY_ENABLED:
-        return
+        return None
     with _heartbeat_lock:
-        _lock_wait_start = time.monotonic()
-        _lock_wait_name = name
+        started = time.monotonic()
+        token = _tracking_sequence
+        _tracking_sequence += 1
+        _active_lock_waits[token] = {
+            "started": started,
+            "name": str(name),
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+        }
+        stack = getattr(_tracking_local, "lock_wait_tokens", None)
+        if stack is None:
+            stack = _tracking_local.lock_wait_tokens = []
+        stack.append(token)
+        return token
 
 
-def _lock_wait_end():
+def _lock_wait_end(token=None):
     """Clear lock wait tracking (called immediately after lock acquired)."""
-    global _lock_wait_start, _lock_wait_name
     if not _AUTO_DESTROY_ENABLED:
         return
     with _heartbeat_lock:
-        _lock_wait_start = 0.0
-        _lock_wait_name = ""
+        stack = getattr(_tracking_local, "lock_wait_tokens", None) or []
+        if token is None:
+            token = stack[-1] if stack else None
+        if token is not None and token in stack:
+            stack.remove(token)
+            _active_lock_waits.pop(token, None)
+
+
+def _watchdog_snapshot(now=None):
+    """Return the oldest active operation and lock wait atomically."""
+    if now is None:
+        now = time.monotonic()
+    with _heartbeat_lock:
+        operation = min(
+            _active_operations.values(),
+            key=lambda item: item["started"],
+            default=None,
+        )
+        lock_wait = min(
+            _active_lock_waits.values(),
+            key=lambda item: item["started"],
+            default=None,
+        )
+        return {
+            "activity_age": now - _last_activity_time,
+            "operation": operation,
+            "operation_elapsed": (
+                now - operation["started"] if operation is not None else 0.0
+            ),
+            "lock_wait": lock_wait,
+            "lock_wait_elapsed": (
+                now - lock_wait["started"] if lock_wait is not None else 0.0
+            ),
+            "recent_errors": len(_error_timestamps),
+        }
 
 
 def _record_error():
@@ -916,6 +976,21 @@ _WATCHDOG_INTERVAL_S = 2.0  # check every 2 seconds
 _WATCHDOG_STOP = threading.Event()
 
 
+def _fatal_exit(reason: str, code: int = 1) -> None:
+    """Terminate without entering Python/native cleanup paths.
+
+    This is deliberately a hard boundary for watchdog and crash-signal paths:
+    cleanup can acquire engine locks or wait for the same native call that
+    triggered the watchdog, so attempting cleanup here can prevent termination.
+    """
+    try:
+        sys.stderr.write(f"[AOTEngine Watchdog] fatal exit: {reason}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(int(code))
+
+
 def _watchdog_run():
     global _last_activity_time, _vram_reclaimed
     main_thread = threading.main_thread()
@@ -931,23 +1006,24 @@ def _watchdog_run():
         if not _AUTO_DESTROY_ENABLED or is_cuda:
             # If auto-destroy is disabled or CUDA is active, only check main thread liveness
             if not main_thread.is_alive():
-                _global_cleanup("watchdog-main-thread-dead")
-                os._exit(1)  # Hard kill when auto-destroy disabled
+                _fatal_exit("watchdog-main-thread-dead")
                 break
             continue
 
         now = time.monotonic()
 
         # Snapshot all monitored state atomically under the heartbeat lock
-        with _heartbeat_lock:
-            activity_age = now - _last_activity_time
-            op_elapsed = (now - _op_start_time) if _op_start_time > 0 else 0.0
-            current_op = _op_name
-            lock_wait_elapsed = (
-                (now - _lock_wait_start) if _lock_wait_start > 0 else 0.0
-            )
-            lock_wait_op = _lock_wait_name
-            recent_errors = len(_error_timestamps)
+        snapshot = _watchdog_snapshot(now)
+        activity_age = snapshot["activity_age"]
+        op_elapsed = snapshot["operation_elapsed"]
+        current_op = (
+            snapshot["operation"]["name"] if snapshot["operation"] is not None else ""
+        )
+        lock_wait_elapsed = snapshot["lock_wait_elapsed"]
+        lock_wait_op = (
+            snapshot["lock_wait"]["name"] if snapshot["lock_wait"] is not None else ""
+        )
+        recent_errors = snapshot["recent_errors"]
 
         # --- Condition 1: Main thread dead (original behavior) ---
         if not main_thread.is_alive():
@@ -959,10 +1035,7 @@ def _watchdog_run():
                 sys.stderr.flush()
             except Exception:
                 pass
-            _force_global_cleanup("watchdog-main-thread-dead")
-            os._exit(
-                1
-            )  # Hard kill: os._exit bypasses signal delivery (main thread may be dead)
+            _fatal_exit("watchdog-main-thread-dead")
             break
 
         # --- Condition 2: Single operation hung beyond timeout ---
@@ -976,10 +1049,7 @@ def _watchdog_run():
                 sys.stderr.flush()
             except Exception:
                 pass
-            _force_global_cleanup(f"op-timeout:{current_op}:{op_elapsed:.0f}s")
-            os._exit(
-                1
-            )  # Hard kill: os._exit bypasses signal delivery (main thread may be blocked)
+            _fatal_exit(f"op-timeout:{current_op}:{op_elapsed:.0f}s")
             break
 
         # --- Condition 3: Lock contention beyond timeout (deadlock detection) ---
@@ -993,12 +1063,9 @@ def _watchdog_run():
                 sys.stderr.flush()
             except Exception:
                 pass
-            _force_global_cleanup(
+            _fatal_exit(
                 f"lock-contention:{lock_wait_op}:{lock_wait_elapsed:.0f}s"
             )
-            os._exit(
-                1
-            )  # Hard kill: os._exit is REQUIRED here (main thread is blocked on RLock)
             break
 
         # --- Condition 4: Heartbeat stale (no GPU activity at all -> Idle) ---
@@ -1063,8 +1130,7 @@ def _watchdog_run():
                 sys.stderr.flush()
             except Exception:
                 pass
-            _force_global_cleanup(f"error-breaker:{recent_errors}-errors")
-            os._exit(1)  # Hard kill: os._exit bypasses signal delivery
+            _fatal_exit(f"error-breaker:{recent_errors}-errors")
             break
 
 
@@ -6266,10 +6332,9 @@ atexit.register(_shutdown_cleanup)
 
 # --- Signal handlers: SIGTERM / SIGBREAK (Windows) / SIGINT / Hardware Crash Signals ---
 def _signal_cleanup_handler(signum, frame):
-    _global_cleanup(f"signal-{signum}")
-    # Re-raise default behaviour so the OS knows the process ended
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
+    # Signal handlers must not acquire engine/native locks: the interrupted
+    # thread may already own one.  The OS will reclaim process resources.
+    _fatal_exit(f"signal-{signum}", code=128 + int(signum))
 
 
 # Register normal exit signals and critical crash signals (like Access Violation / Segfault)
