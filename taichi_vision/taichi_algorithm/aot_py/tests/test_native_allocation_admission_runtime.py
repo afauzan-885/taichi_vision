@@ -92,6 +92,9 @@ d.allocate_gpu_buffer.restype = ctypes.c_void_p
 d.write_to_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 d.ti_imwrite_from_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 d.ti_imwrite_from_gpu.restype = ctypes.c_bool
+d.ti_imread_to_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+d.ti_imread_to_gpu.restype = ctypes.c_void_p
+d.free_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 d.get_last_engine_error.argtypes = [ctypes.c_void_p]
 d.get_last_engine_error.restype = ctypes.c_char_p
 r = d.init_aot_engine(2, 0)
@@ -102,6 +105,16 @@ out = Path(tempfile.gettempdir()) / "taichi_vision_native_roundtrip.png"
 if out.exists(): out.unlink()
 assert d.ti_imwrite_from_gpu(r, str(out).encode(), b, 4, 4, 3, 8)
 assert out.exists() and out.stat().st_size > 0
+for stage, expected in (("read_map", "map"), ("read_copy", "copy")):
+    os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
+    rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
+    assert not d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
+    assert expected.encode() in (d.get_last_engine_error(r) or b"")
+os.environ.pop("PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO", None)
+rw, rh, rc, rd = (ctypes.c_int() for _ in range(4))
+read_handle = d.ti_imread_to_gpu(r, str(out).encode(), ctypes.byref(rw), ctypes.byref(rh), ctypes.byref(rc), ctypes.byref(rd))
+assert read_handle and (rw.value, rh.value, rc.value, rd.value) == (4, 4, 3, 8)
+d.free_gpu_buffer(r, read_handle)
 sentinel = Path(tempfile.gettempdir()) / "taichi_vision_native_sentinel.png"
 sentinel.write_bytes(b"keep")
 assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 0, 4, 3, 8)

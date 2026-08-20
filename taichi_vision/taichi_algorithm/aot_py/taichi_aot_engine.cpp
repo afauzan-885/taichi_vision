@@ -2149,7 +2149,12 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
     return nullptr;
   }
   void *gpu_ptr = ti_map_memory(rt->runtime(), gpu_mem);
-  if (!gpu_ptr) {
+  if (!gpu_ptr || image_io_test_failure("read_map")) {
+    engine->last_error = gpu_ptr
+                              ? "ti_imread_to_gpu: injected GPU map failure"
+                              : "ti_imread_to_gpu: GPU map failed";
+    if (gpu_ptr)
+      ti_unmap_memory(rt->runtime(), gpu_mem);
     engine->allocations.erase(allocation_it);
     allocation_lock.unlock();
     ti_free_memory(rt->runtime(), gpu_mem);
@@ -2160,7 +2165,9 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   allocation_it->second.mapped = true;
 
   bool copy_ok = false;
-  if (pixel_format != target_format) {
+  if (image_io_test_failure("read_copy")) {
+    engine->last_error = "ti_imread_to_gpu: injected pixel copy failure";
+  } else if (pixel_format != target_format) {
       // Need conversion
       IWICFormatConverter *converter = nullptr;
       if (SUCCEEDED(g_wic_factory->CreateFormatConverter(&converter)) &&
@@ -2184,6 +2191,8 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   allocation_it->second.mapped = false;
 
   if (!copy_ok) {
+    if (engine->last_error.empty())
+      engine->last_error = "ti_imread_to_gpu: WIC pixel copy/conversion failed";
     engine->allocations.erase(allocation_it);
     allocation_lock.unlock();
     ti_free_memory(rt->runtime(), gpu_mem);
