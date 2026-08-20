@@ -35,7 +35,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test runner
-        run: python -m pip install --disable-pip-version-check pytest
+        run: python -m pip install --disable-pip-version-check pytest "numpy>=2.0"
 
       - name: Compile runtime Python sources
         run: |
@@ -60,11 +60,19 @@ jobs:
               "test_pipeline_scheduler_config_scope.py",
               "test_backend_manager_authority.py",
               "test_strict_policy_booleans.py",
+              "test_block_cache_leasing.py",
+              "test_archive_extraction_bounds.py",
+              "test_compute_block_registration_boundary.py",
+              "test_device_selector_ambiguity.py",
+              "test_tcm_target_qualifiers.py",
           )
           tests = [str(root / name) for name in names if (root / name).is_file()]
           if not tests:
               print("No CPU-safe hardening regression files are present on this ref yet.")
               raise SystemExit(0)
 
+          core_boundary = Path("taichi_vision/taichi_algorithm/aot_py/tests/test_core_dependency_boundary.py")
+          if core_boundary.is_file():
+              tests.append(str(core_boundary))
           subprocess.check_call([sys.executable, "-m", "pytest", "-q", *tests])
           PY
