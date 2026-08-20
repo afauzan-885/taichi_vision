@@ -198,6 +198,31 @@ out = Path(tempfile.gettempdir()) / "taichi_vision_native_roundtrip.png"
 if out.exists(): out.unlink()
 assert d.ti_imwrite_from_gpu(r, str(out).encode(), b, 4, 4, 3, 8)
 assert out.exists() and out.stat().st_size > 0
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+psapi = ctypes.WinDLL("psapi.dll")
+kernel32 = ctypes.WinDLL("kernel32.dll")
+psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), ctypes.c_uint32]
+psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+def private_bytes():
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    assert psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb)
+    return counters.PrivateUsage
+private_before = private_bytes()
 for stage, expected in (("read_map", "map"), ("read_copy", "copy")):
     os.environ["PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO"] = stage
     for _ in range(24):
@@ -219,6 +244,8 @@ for stage, expected in (("map", "map"), ("encoder", "encoder"), ("frame_commit",
         assert not d.ti_imwrite_from_gpu(r, str(sentinel).encode(), b, 4, 4, 3, 8)
         assert expected.encode() in (d.get_last_engine_error(r) or b"")
         assert sentinel.read_bytes() == b"keep", (stage, sentinel.read_bytes())
+private_after = private_bytes()
+assert private_after - private_before < 128 * 1024 * 1024, (private_before, private_after)
 os._exit(0)
 '''
     completed = subprocess.run(
@@ -294,5 +321,117 @@ os._exit(0)
         capture_output=True,
         text=True,
         timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="compiled bridge smoke is Windows-specific")
+@pytest.mark.skipif(not BRIDGE.exists(), reason="publish CPU bridge is not built")
+@pytest.mark.skipif(
+    not (LLVM_BIN / "taichi_c_api.dll").exists(),
+    reason="LLVM20 C API runtime is unavailable",
+)
+def test_compiled_same_name_pipeline_clear_is_scoped_to_each_runtime():
+    code = r'''
+import ctypes, os
+from pathlib import Path
+os.add_dll_directory(r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin")
+os.environ["TI_LIB_DIR"] = r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\runtime"
+d = ctypes.WinDLL(str(Path(r"taichi_vision/taichi_algorithm/aot_py/taichi_aot_engine.dll").resolve()))
+class DynamicArg(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("arg_type", ctypes.c_int), ("dtype", ctypes.c_int), ("dim_count", ctypes.c_int), ("shape", ctypes.c_int * 8), ("elem_dim_count", ctypes.c_int), ("elem_shape", ctypes.c_int * 8), ("is_vector", ctypes.c_int), ("vector_dim", ctypes.c_int), ("val_u64", ctypes.c_uint64)]
+d.init_aot_engine.argtypes = [ctypes.c_int, ctypes.c_int]
+d.init_aot_engine.restype = ctypes.c_void_p
+d.load_aot_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+d.load_aot_module.restype = ctypes.c_void_p
+d.allocate_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+d.allocate_gpu_buffer.restype = ctypes.c_void_p
+d.clear_pipeline_for_engine.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+d.add_to_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(DynamicArg), ctypes.c_int]
+d.run_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(DynamicArg), ctypes.c_int]
+d.get_last_engine_error.argtypes = [ctypes.c_void_p]
+d.get_last_engine_error.restype = ctypes.c_char_p
+runtime_a = d.init_aot_engine(2, 0)
+runtime_b = d.init_aot_engine(2, 0)
+assert runtime_a and runtime_b and runtime_a != runtime_b
+tcm = next(Path(r"taichi_vision/taichi_algorithm/aot_tcm/cpu_x86_64_windows").glob("bilinear_demosaice*.tcm"))
+module_a = d.load_aot_module(runtime_a, str(tcm).encode())
+module_b = d.load_aot_module(runtime_b, str(tcm).encode())
+assert module_a and module_b
+def make_args(runtime):
+    bayer = d.allocate_gpu_buffer(runtime, 4 * 4 * 4, 1)
+    dst = d.allocate_gpu_buffer(runtime, 4 * 4 * 3 * 4, 1)
+    assert bayer and dst
+    specs = [(b"bayer", 0, 0, 2, bayer), (b"dst", 0, 0, 3, dst), (b"black", 1, 0, 0, 0), (b"white", 1, 0, 0, 65535), (b"h", 1, 1, 0, 4), (b"w", 1, 1, 0, 4), (b"c00", 1, 1, 0, 0), (b"c01", 1, 1, 0, 1), (b"c10", 1, 1, 0, 3), (b"c11", 1, 1, 0, 2)]
+    args = (DynamicArg * len(specs))()
+    for i, (name, arg_type, dtype, dim_count, value) in enumerate(specs):
+        args[i].name = name
+        args[i].arg_type = arg_type
+        args[i].dtype = dtype
+        args[i].dim_count = dim_count
+        if arg_type == 0:
+            args[i].shape[0] = 4
+            args[i].shape[1] = 4
+            if dim_count == 3:
+                args[i].shape[2] = 3
+        args[i].val_u64 = value
+    return args
+args_a = make_args(runtime_a)
+args_b = make_args(runtime_b)
+d.add_to_pipeline(module_a, b"same-name", b"pure_bilinear_demosaice", args_a, 10)
+d.add_to_pipeline(module_b, b"same-name", b"pure_bilinear_demosaice", args_b, 10)
+d.clear_pipeline_for_engine(runtime_a, b"same-name")
+d.run_pipeline(runtime_b, b"same-name", None, None, 0)
+assert not (d.get_last_engine_error(runtime_b) or b"")
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="compiled bridge smoke is Windows-specific")
+@pytest.mark.skipif(not BRIDGE.exists(), reason="publish CPU bridge is not built")
+@pytest.mark.skipif(
+    not (LLVM_BIN / "taichi_c_api.dll").exists(),
+    reason="LLVM20 C API runtime is unavailable",
+)
+def test_compiled_repeated_module_destroy_and_stale_replay_is_safe():
+    code = r'''
+import ctypes, os
+from pathlib import Path
+os.add_dll_directory(r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin")
+os.environ["TI_LIB_DIR"] = r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\runtime"
+d = ctypes.WinDLL(str(Path(r"taichi_vision/taichi_algorithm/aot_py/taichi_aot_engine.dll").resolve()))
+d.init_aot_engine.argtypes = [ctypes.c_int, ctypes.c_int]
+d.init_aot_engine.restype = ctypes.c_void_p
+d.load_aot_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+d.load_aot_module.restype = ctypes.c_void_p
+d.destroy_aot_module.argtypes = [ctypes.c_void_p]
+d.run_aot_graph.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
+d.get_last_engine_error.argtypes = [ctypes.c_void_p]
+d.get_last_engine_error.restype = ctypes.c_char_p
+runtime = d.init_aot_engine(2, 0)
+assert runtime
+tcm = next(Path(r"taichi_vision/taichi_algorithm/aot_tcm/cpu_x86_64_windows").glob("bilinear_demosaice*.tcm"))
+for _ in range(24):
+    module_ptr = d.load_aot_module(runtime, str(tcm).encode())
+    assert module_ptr
+    d.destroy_aot_module(module_ptr)
+    d.run_aot_graph(runtime, module_ptr, b"pure_bilinear_demosaice", None, 0)
+    assert b"stale" in (d.get_last_engine_error(runtime) or b"")
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
