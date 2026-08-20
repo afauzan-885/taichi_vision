@@ -166,11 +166,18 @@ struct ModuleContext {
 
 struct RawIcdContextTag;
 
+struct GpuAllocationRecord {
+  uint64_t size = 0;
+  bool mapped = false;
+};
+
 struct EngineContext {
   TiArch arch;
   ti::Runtime *runtime;
-  std::unordered_set<TiMemory> buffers;
-  std::unordered_set<TiMemory> mapped_buffers;
+  // Allocation handles are session-local.  Keeping the byte capacity and
+  // mapped state beside the handle lets every memory entry point reject a
+  // foreign handle or an out-of-range transfer before it reaches Taichi.
+  std::unordered_map<TiMemory, GpuAllocationRecord> allocations;
   std::unordered_set<ModuleContext *> modules;
   std::unordered_map<std::string, Pipeline> pipelines;
   std::mutex mutex;
@@ -381,6 +388,36 @@ static void clear_engine_error(EngineContext *ctx) {
     return;
   std::lock_guard<std::mutex> lock(ctx->mutex);
   ctx->last_error.clear();
+}
+
+static bool validate_gpu_allocation_locked(
+    EngineContext *ctx, TiMemory memory, uint64_t requested_size,
+    const char *operation, bool reject_mapped = true) {
+  if (!ctx || !memory) {
+    if (ctx)
+      ctx->last_error = std::string(operation) +
+                        ": null GPU allocation handle";
+    return false;
+  }
+  auto it = ctx->allocations.find(memory);
+  if (it == ctx->allocations.end()) {
+    ctx->last_error = std::string(operation) +
+                      ": GPU allocation does not belong to this runtime";
+    return false;
+  }
+  if (requested_size > it->second.size) {
+    ctx->last_error = std::string(operation) +
+                      ": transfer exceeds GPU allocation capacity (requested=" +
+                      std::to_string(requested_size) +
+                      ", capacity=" + std::to_string(it->second.size) + ")";
+    return false;
+  }
+  if (reject_mapped && it->second.mapped) {
+    ctx->last_error = std::string(operation) +
+                      ": GPU allocation is already mapped";
+    return false;
+  }
+  return true;
 }
 
 static std::string consume_ti_last_error() {
@@ -1627,16 +1664,15 @@ EXPORT void destroy_aot_engine(void *runtime) {
   }
 
   std::vector<ModuleContext *> modules;
-  std::vector<TiMemory> buffers;
+  std::vector<TiMemory> allocations;
   {
     std::lock_guard<std::mutex> lock(ctx->mutex);
     for (auto *mod : ctx->modules)
       modules.push_back(mod);
-    for (auto mem : ctx->buffers)
-      buffers.push_back(mem);
+    for (const auto &entry : ctx->allocations)
+      allocations.push_back(entry.first);
     ctx->modules.clear();
-    ctx->buffers.clear();
-    ctx->mapped_buffers.clear();
+    ctx->allocations.clear();
     ctx->pipelines.clear();
   }
 
@@ -1648,7 +1684,7 @@ EXPORT void destroy_aot_engine(void *runtime) {
     }
   }
 
-  for (auto mem : buffers) {
+  for (auto mem : allocations) {
     try {
       if (ctx->runtime && mem)
         ti_free_memory(ctx->runtime->runtime(), mem);
@@ -1695,7 +1731,7 @@ EXPORT void *allocate_gpu_buffer(void *runtime, uint64_t size,
   TiMemory mem = ti_allocate_memory(rt->runtime(), &allocate_info);
   if (mem) {
     std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->buffers.insert(mem);
+    engine->allocations.emplace(mem, GpuAllocationRecord{size, false});
   }
   return (void *)mem;
 }
@@ -1710,8 +1746,13 @@ EXPORT void free_gpu_buffer(void *runtime, void *memory) {
   if (rt && memory) {
     {
       std::lock_guard<std::mutex> lock(engine->mutex);
-      engine->mapped_buffers.erase((TiMemory)memory);
-      engine->buffers.erase((TiMemory)memory);
+      if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
+                                          "free_gpu_buffer"))
+        return;
+      // Reject freeing a mapped allocation.  The caller must make the
+      // map/unmap transition explicit so a later owner cannot observe a
+      // stale mapped state or an already-freed native handle.
+      engine->allocations.erase((TiMemory)memory);
     }
     ti_free_memory(rt->runtime(), (TiMemory)memory);
   }
@@ -1726,6 +1767,10 @@ EXPORT void write_to_gpu_buffer(void *runtime, void *memory, void *data,
     return;
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt || !memory || !data)
+    return;
+  std::lock_guard<std::mutex> lock(engine->mutex);
+  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, size,
+                                      "write_to_gpu_buffer"))
     return;
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
@@ -1744,6 +1789,10 @@ EXPORT void read_from_gpu_buffer(void *runtime, void *memory, void *data,
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt || !memory || !data)
     return;
+  std::lock_guard<std::mutex> lock(engine->mutex);
+  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, size,
+                                      "read_from_gpu_buffer"))
+    return;
   rt->wait(); // Ensure all kernels are done before reading
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
@@ -1761,10 +1810,15 @@ EXPORT void *map_gpu_buffer(void *runtime, void *memory) {
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt || !memory)
     return nullptr;
+  std::lock_guard<std::mutex> lock(engine->mutex);
+  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
+                                      "map_gpu_buffer"))
+    return nullptr;
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->mapped_buffers.insert((TiMemory)memory);
+    auto it = engine->allocations.find((TiMemory)memory);
+    if (it != engine->allocations.end())
+      it->second.mapped = true;
   }
   return ptr;
 }
@@ -1777,9 +1831,18 @@ EXPORT void unmap_gpu_buffer(void *runtime, void *memory) {
     return;
   ti::Runtime *rt = engine_runtime(engine);
   if (rt && memory) {
-    ti_unmap_memory(rt->runtime(), (TiMemory)memory);
     std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->mapped_buffers.erase((TiMemory)memory);
+    if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
+                                        "unmap_gpu_buffer", false))
+      return;
+    auto it = engine->allocations.find((TiMemory)memory);
+    if (!it->second.mapped) {
+      engine->last_error =
+          "unmap_gpu_buffer: GPU allocation is not currently mapped";
+      return;
+    }
+    ti_unmap_memory(rt->runtime(), (TiMemory)memory);
+    it->second.mapped = false;
   }
 }
 
@@ -1792,6 +1855,13 @@ EXPORT void copy_gpu_buffer(void *runtime, void *src, void *dst,
     return;
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt || !src || !dst)
+    return;
+
+  std::lock_guard<std::mutex> lock(engine->mutex);
+  if (!validate_gpu_allocation_locked(engine, (TiMemory)src, size,
+                                      "copy_gpu_buffer") ||
+      !validate_gpu_allocation_locked(engine, (TiMemory)dst, size,
+                                      "copy_gpu_buffer"))
     return;
 
   TiMemorySlice src_slice = {};
@@ -1958,22 +2028,33 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   }
   {
     std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->buffers.insert(gpu_mem);
+    engine->allocations.emplace(gpu_mem,
+                                GpuAllocationRecord{size_bytes, false});
   }
 
   // Copy pixels directly to GPU (using mapped memory if possible, or
   // intermediate buffer)
-  void *gpu_ptr = ti_map_memory(rt->runtime(), gpu_mem);
-  if (!gpu_ptr) {
-    {
-      std::lock_guard<std::mutex> lock(engine->mutex);
-      engine->buffers.erase(gpu_mem);
-    }
+  std::unique_lock<std::mutex> allocation_lock(engine->mutex);
+  auto allocation_it = engine->allocations.find(gpu_mem);
+  if (allocation_it == engine->allocations.end()) {
+    engine->last_error =
+        "ti_imread_to_gpu: allocation was not registered with this runtime";
+    allocation_lock.unlock();
     ti_free_memory(rt->runtime(), gpu_mem);
     frame->Release();
     decoder->Release();
     return nullptr;
   }
+  void *gpu_ptr = ti_map_memory(rt->runtime(), gpu_mem);
+  if (!gpu_ptr) {
+    engine->allocations.erase(allocation_it);
+    allocation_lock.unlock();
+    ti_free_memory(rt->runtime(), gpu_mem);
+    frame->Release();
+    decoder->Release();
+    return nullptr;
+  }
+  allocation_it->second.mapped = true;
 
   bool copy_ok = false;
   if (pixel_format != target_format) {
@@ -1997,12 +2078,11 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
           (BYTE *)gpu_ptr));
   }
   ti_unmap_memory(rt->runtime(), gpu_mem);
+  allocation_it->second.mapped = false;
 
   if (!copy_ok) {
-    {
-      std::lock_guard<std::mutex> lock(engine->mutex);
-      engine->buffers.erase(gpu_mem);
-    }
+    engine->allocations.erase(allocation_it);
+    allocation_lock.unlock();
     ti_free_memory(rt->runtime(), gpu_mem);
     frame->Release();
     decoder->Release();
@@ -2013,6 +2093,7 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
     return nullptr;
   }
 
+  allocation_lock.unlock();
   frame->Release();
   decoder->Release();
   return (void *)gpu_mem;
@@ -2048,10 +2129,35 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
       size64 > std::numeric_limits<UINT>::max())
     return false;
 
+  std::unique_lock<std::mutex> allocation_lock(engine->mutex);
+  if (!validate_gpu_allocation_locked(engine, (TiMemory)gpu_mem, size64,
+                                      "ti_imwrite_from_gpu"))
+    return false;
+
+  // Map the source before creating or truncating the destination file.  A
+  // failed map must be fail-closed without leaving an empty/partial output at
+  // the requested path.
+  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
+  if (!gpu_ptr)
+    return false;
+  auto allocation_it = engine->allocations.find((TiMemory)gpu_mem);
+  if (allocation_it == engine->allocations.end()) {
+    ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
+    return false;
+  }
+  allocation_it->second.mapped = true;
+
   IWICStream *stream = nullptr;
   IWICBitmapEncoder *encoder = nullptr;
   IWICBitmapFrameEncode *frame = nullptr;
   auto cleanup = [&]() {
+    if (gpu_ptr) {
+      ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
+      gpu_ptr = nullptr;
+      auto it = engine->allocations.find((TiMemory)gpu_mem);
+      if (it != engine->allocations.end())
+        it->second.mapped = false;
+    }
     if (frame) {
       frame->Release();
       frame = nullptr;
@@ -2065,8 +2171,10 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
       stream = nullptr;
     }
   };
-  if (FAILED(g_wic_factory->CreateStream(&stream)) || !stream)
+  if (FAILED(g_wic_factory->CreateStream(&stream)) || !stream) {
+    cleanup();
     return false;
+  }
 
   wchar_t w_path[MAX_PATH];
   if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH)) {
@@ -2119,16 +2227,14 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
     return false;
   }
 
-  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
-  if (!gpu_ptr) {
-    cleanup();
-    return false;
-  }
   HRESULT write_result = frame->WritePixels(
       static_cast<UINT>(height), static_cast<UINT>(stride64),
       static_cast<UINT>(size64), (BYTE *)gpu_ptr);
   ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
-  if (FAILED(write_result) || FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
+  gpu_ptr = nullptr;
+  allocation_it->second.mapped = false;
+  if (FAILED(write_result) || FAILED(frame->Commit()) ||
+      FAILED(encoder->Commit())) {
     cleanup();
     return false;
   }
