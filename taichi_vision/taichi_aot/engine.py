@@ -359,6 +359,19 @@ def get_vulkan_device_name(device_id):
                 ("ppEnabledExtensionNames", ctypes.c_void_p),
             ]
 
+        class VkPhysicalDevicePropertiesPrefix(ctypes.Structure):
+            # The fixed Vulkan prefix is ABI-stable: deviceName follows the
+            # five scalar properties at byte offset 20. Keep full output
+            # storage separately sized below for driver writes.
+            _fields_ = [
+                ("apiVersion", ctypes.c_uint32),
+                ("driverVersion", ctypes.c_uint32),
+                ("vendorID", ctypes.c_uint32),
+                ("deviceID", ctypes.c_uint32),
+                ("deviceType", ctypes.c_int32),
+                ("deviceName", ctypes.c_char * 256),
+            ]
+
         vk.vkCreateInstance.argtypes = [
             ctypes.POINTER(VkInstanceCreateInfo),
             ctypes.c_void_p,
@@ -442,9 +455,10 @@ def get_vulkan_device_name(device_id):
 
         dev = devices[index]
         buf = (ctypes.c_byte * 1024)()
-        vk.vkGetPhysicalDeviceProperties(dev, buf)
+        properties = ctypes.cast(buf, ctypes.POINTER(VkPhysicalDevicePropertiesPrefix))
+        vk.vkGetPhysicalDeviceProperties(dev, properties)
 
-        name_bytes = bytes(buf[20:276])
+        name_bytes = bytes(properties.contents.deviceName)
         null_idx = name_bytes.find(b"\x00")
         if null_idx != -1:
             name_bytes = name_bytes[:null_idx]

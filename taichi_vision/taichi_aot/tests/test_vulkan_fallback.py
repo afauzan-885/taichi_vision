@@ -56,8 +56,7 @@ class _FakeVulkan:
     def get_properties(self, device, buffer):
         names = {10: b"Adapter A", 11: b"Adapter B"}
         payload = names[int(getattr(device, "value", device))] + b"\0"
-        for offset, value in enumerate(payload, start=20):
-            buffer[offset] = value
+        ctypes.memmove(ctypes.addressof(buffer.contents) + 20, payload, len(payload))
 
     def destroy_instance(self, _instance, _allocator):
         self.destroyed = True
@@ -65,11 +64,18 @@ class _FakeVulkan:
 
 def test_fallback_uses_platform_loader_and_preserves_ordinal(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeVulkan()
+    loader_names = []
     monkeypatch.setattr(engine, "scan_vulkan_device_records", lambda: [])
-    monkeypatch.setattr(engine.ctypes, "CDLL", lambda name: fake)
+    monkeypatch.setattr(
+        engine.ctypes,
+        "CDLL",
+        lambda name: (loader_names.append(name), fake)[1],
+    )
 
     assert engine.get_vulkan_device_name(1) == "Adapter B", engine.get_vulkan_device_probe_diagnostic()
     assert engine.get_vulkan_device_probe_diagnostic() == ""
+    if engine.os.name == "nt":
+        assert loader_names == ["vulkan-1.dll"]
 
 
 def test_fallback_rejects_vulkan_result_errors_with_diagnostic(
@@ -89,4 +95,6 @@ def test_source_keeps_valid_vulkan_structure_types() -> None:
     fallback = source[start : source.index("# -------------------------------------------------------------------------", start)]
     assert "sType=0" in fallback
     assert "sType=1" in fallback
+    assert "VkPhysicalDevicePropertiesPrefix" in fallback
+    assert "properties.contents.deviceName" in fallback
     assert "vkEnumeratePhysicalDevices(count)" in fallback
