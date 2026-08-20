@@ -66,6 +66,8 @@ from .tcm_preflight import preflight_tcm
 _UNSET = object()
 _CPU_AOT_EXTRACTION_LOCK = threading.RLock()
 _OPENGL_VENDOR_INJECTED = None
+_BRIDGE_BACKEND = None
+_BRIDGE_TARGET_ID = None
 
 _MAX_NATIVE_BYTES = (1 << 64) - 1
 _MAX_DYNAMIC_RANK = 8
@@ -940,12 +942,12 @@ def ensure_cuda_context(device_id: int = 0):
             pass
 
 
-def _op_begin(name: str):
+def _op_begin(name: str, engine=None):
     """Mark the start of a blocking GPU/DLL operation."""
-    # Ensure CUDA thread-local primary context is bound for the calling thread
-    for inst in list(AOTEngine._instances.values()):
-        if getattr(inst, "arch", "").lower() == "cuda":
-            ensure_cuda_context(getattr(inst, "device_id", 0))
+    # Bind only the owning engine's CUDA context. A process-wide scan can
+    # leave device B current while an operation owned by device A dispatches.
+    if engine is not None and getattr(engine, "arch", "").lower() == "cuda":
+        ensure_cuda_context(getattr(engine, "device_id", 0))
 
     global _tracking_sequence, _last_activity_time, _vram_reclaimed
     if not _AUTO_DESTROY_ENABLED:
@@ -1105,7 +1107,11 @@ def _watchdog_run():
         # During interpreter finalization the main thread is intentionally no
         # longer alive.  Do not confuse that normal atexit transition with a
         # fatal runtime hang, especially because the fatal path is a hard exit.
-        if _WATCHDOG_STOP.is_set() or getattr(sys, "is_finalizing", lambda: False)():
+        if (
+            _WATCHDOG_STOP.is_set()
+            or getattr(sys, "_pixel_refine_aot_shutdown", False)
+            or getattr(sys, "is_finalizing", lambda: False)()
+        ):
             break
         # Eksperimen: Untuk backend CUDA, nonaktifkan Watchdog idle reclamation dan error circuit breaker
         # agar Primary CUDA Context tetap aktif 100% dan GC diatur murni per-algoritma.
@@ -1507,8 +1513,8 @@ def _select_cpu_bridge(default_bridge):
 
 
 def _init_aot_bridge(backend=None):
-    global _LIB, _RUNTIME
-    if _LIB is not None:
+    global _LIB, _RUNTIME, _BRIDGE_BACKEND, _BRIDGE_TARGET_ID
+    if _LIB is not None and backend is None:
         return
 
     # Suppress loader registry warnings on Windows before Vulkan DLL gets loaded
@@ -1542,6 +1548,14 @@ def _init_aot_bridge(backend=None):
         backend=backend,
         device=os.environ.get("TARGET_VENDOR", ""),
     )
+    if _LIB is not None:
+        if _BRIDGE_BACKEND != backend or _BRIDGE_TARGET_ID != target.target_id:
+            raise RuntimeError(
+                "AOT native bridge ownership conflict: process bridge is "
+                f"{_BRIDGE_BACKEND}/{_BRIDGE_TARGET_ID}, requested "
+                f"{backend}/{target.target_id}"
+            )
+        return
     # Prefer the isolated LLVM20 bundle when it is present.  The resolver is
     # target-qualified, so a CUDA bridge can never be selected for Vulkan or
     # OpenGL merely because a similarly named file exists.  The repository
@@ -1619,8 +1633,13 @@ def _init_aot_bridge(backend=None):
 
     try:
         _LIB = ctypes.CDLL(engine_dll_path)
+        _BRIDGE_BACKEND = backend
+        _BRIDGE_TARGET_ID = target.target_id
         print(f"[AOTEngine] Successfully loaded backend bridge: {engine_dll_path}")
     except Exception as e:
+        _LIB = None
+        _BRIDGE_BACKEND = None
+        _BRIDGE_TARGET_ID = None
         raise RuntimeError(
             f"Failed to load Generic AOT Engine DLL at {engine_dll_path}\nError: {e}"
         )
@@ -2517,7 +2536,7 @@ class TaichiGPUBuffer:
             with engine._lock:
                 _lock_wait_end()
                 if self.host_accessible:
-                    _op_begin("read_from_gpu_buffer")
+                    _op_begin("read_from_gpu_buffer", engine=self.engine)
                     try:
                         _LIB.read_from_gpu_buffer(
                             runtime, handle, out.ctypes.data, self.size_bytes
@@ -2530,7 +2549,7 @@ class TaichiGPUBuffer:
                 else:
                     staging = engine.acquire_staging_buffer(self.shape, self.dtype)
                     try:
-                        _op_begin("copy+read_gpu_buffer")
+                        _op_begin("copy+read_gpu_buffer", engine=self.engine)
                         try:
                             _LIB.copy_gpu_buffer(
                                 runtime, handle, staging.handle, self.size_bytes
@@ -2550,7 +2569,7 @@ class TaichiGPUBuffer:
                         engine.release_staging_buffer(staging)
         else:
             if self.host_accessible:
-                _op_begin("read_from_gpu_buffer")
+                _op_begin("read_from_gpu_buffer", engine=self.engine)
                 try:
                     _LIB.read_from_gpu_buffer(
                         runtime, handle, out.ctypes.data, self.size_bytes
@@ -2858,7 +2877,7 @@ class AOTModuleWrapper:
 
                 if engine.current_pipeline:
                     engine._auto_pipeline_capture_call(self, graph_name, kwargs)
-                    _op_begin(f"add_to_pipeline:{graph_name}")
+                    _op_begin(f"add_to_pipeline:{graph_name}", engine=self.engine)
                     try:
                         _LIB.add_to_pipeline(
                             self.module_ptr,
@@ -2873,7 +2892,7 @@ class AOTModuleWrapper:
                     finally:
                         _op_end()
                 else:
-                    _op_begin(f"run_aot_graph:{graph_name}")
+                    _op_begin(f"run_aot_graph:{graph_name}", engine=self.engine)
                     try:
                         _LIB.run_aot_graph(
                             engine.runtime,
@@ -2908,7 +2927,7 @@ class AOTModuleWrapper:
                     #     )
                     #     _record_error()
                     #     raise RuntimeError(msg)
-                    _op_begin(f"run_aot_graph:{graph_name}")
+                    _op_begin(f"run_aot_graph:{graph_name}", engine=self.engine)
                     try:
                         _LIB.run_aot_graph(
                             engine.runtime,
@@ -3079,10 +3098,17 @@ class AOTModuleWrapper:
 
 class AOTEngine:
     _instances = {}
+    _construction_lock = threading.RLock()
     _active_arch = "vulkan"
     _placeholder_id_counter = 0xFFFFFF00
 
     def __new__(cls, arch=None, device_id=None):
+        # Serialize check/create/register, including native initialization.
+        with cls._construction_lock:
+            return cls._new_unlocked(arch=arch, device_id=device_id)
+
+    @classmethod
+    def _new_unlocked(cls, arch=None, device_id=None):
         global _OPENGL_VENDOR_INJECTED
         config = resolve_backend_config(arch=arch, device_id=device_id)
         arch = config.backend
@@ -3167,7 +3193,7 @@ class AOTEngine:
             # Wrap init_aot_engine in a thread with timeout to detect hung Vulkan driver.
             # ctypes releases the GIL during C calls, so this timeout mechanism works
             # even if the C function hangs. The early watchdog is a secondary safety net.
-            _op_begin("init_aot_engine")
+            _op_begin("init_aot_engine", engine=instance)
             _init_result = [None]
             _init_error = [None]
 
@@ -3619,7 +3645,7 @@ class AOTEngine:
                 remaining = [item for item in self._retired_buffers if item[0] != key]
             sync_failed = False
             if wait and not already_synchronized:
-                _op_begin("sync_runtime:retired_buffers")
+                _op_begin("sync_runtime:retired_buffers", engine=self)
                 try:
                     if _LIB is not None and getattr(self, "runtime", None):
                         _LIB.sync_runtime(self.runtime)
@@ -4295,7 +4321,7 @@ class AOTEngine:
         _lock_wait_begin(f"use_pipeline:{name}")
         with self._lock:
             _lock_wait_end()
-            _op_begin(f"run_pipeline:{name}")
+            _op_begin(f"run_pipeline:{name}", engine=self)
             try:
                 _LIB.run_pipeline(self.runtime, name.encode("utf-8"), handles, args, n)
                 _raise_native_engine_error(self.runtime, f"Pipeline '{name}'")
@@ -4377,7 +4403,7 @@ class AOTEngine:
                 self._drain_retired(wait=True, key=pool_key)
                 handle = self.buffer_pool.acquire(pool_key)
             if not handle:
-                _op_begin("allocate_gpu_buffer")
+                _op_begin("allocate_gpu_buffer", engine=self)
                 try:
                     handle = _LIB.allocate_gpu_buffer(
                         self.runtime, size, 1 if host_accessible else 0
@@ -5590,7 +5616,7 @@ class AOTEngine:
             vram_target = self.allocate(
                 shape, dtype, is_vector=is_vector, vector_dim=vector_dim
             )
-            _op_begin("copy_gpu_buffer:fast_interop")
+            _op_begin("copy_gpu_buffer:fast_interop", engine=self)
             try:
                 _LIB.copy_gpu_buffer(
                     self.runtime, staging.handle, vram_target.handle, staging.nbytes
@@ -5640,7 +5666,7 @@ class AOTEngine:
             host_accessible=True,
             vector_dim=vector_dim,
         )
-        _op_begin("write_to_gpu_buffer")
+        _op_begin("write_to_gpu_buffer", engine=self)
         try:
             _LIB.write_to_gpu_buffer(
                 self.runtime, buf.handle, arr.ctypes.data, buf.nbytes
@@ -5870,7 +5896,7 @@ class AOTEngine:
         _lock_wait_begin("imread")
         with self._lock:
             _lock_wait_end()
-            _op_begin(f"imread:{os.path.basename(path)}")
+            _op_begin(f"imread:{os.path.basename(path)}", engine=self)
             try:
                 handle = _LIB.ti_imread_to_gpu(
                     self.runtime,
@@ -5948,7 +5974,7 @@ class AOTEngine:
         _lock_wait_begin("imwrite")
         with self._lock:
             _lock_wait_end()
-            _op_begin(f"imwrite:{os.path.basename(path)}")
+            _op_begin(f"imwrite:{os.path.basename(path)}", engine=self)
             try:
                 res = _LIB.ti_imwrite_from_gpu(
                     self.runtime, path.encode("utf-8"), buf.handle, w, h, c, d
@@ -5965,7 +5991,7 @@ class AOTEngine:
         _lock_wait_begin("sync")
         with self._lock:
             _lock_wait_end()
-            _op_begin("sync_runtime")
+            _op_begin("sync_runtime", engine=self)
             try:
                 _LIB.sync_runtime(self.runtime)
             except Exception:
@@ -6512,6 +6538,10 @@ def _force_global_cleanup(reason: str):
 
 # --- atexit: stop the daemon before interpreter finalization, then cleanup ---
 def _shutdown_cleanup():
+    # Multiple isolated engine imports can coexist in embedding/test hosts.
+    # Stop every module-local watchdog before atexit makes the main thread
+    # appear dead to the remaining modules.
+    setattr(sys, "_pixel_refine_aot_shutdown", True)
     _WATCHDOG_STOP.set()
     watchdog = globals().get("_watchdog")
     if watchdog is not None and watchdog is not threading.current_thread():
