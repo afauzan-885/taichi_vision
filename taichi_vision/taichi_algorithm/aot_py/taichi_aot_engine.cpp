@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -166,6 +167,8 @@ struct EngineContext {
   std::unordered_set<ModuleContext *> modules;
   std::unordered_map<std::string, Pipeline> pipelines;
   std::mutex mutex;
+  std::condition_variable lifecycle_cv;
+  uint32_t active_calls = 0;
   std::string last_error;
   bool destroying;
   uint64_t session_id;
@@ -249,9 +252,43 @@ static void set_last_init_error(const std::string &message) {
   last_init_error = message;
 }
 
-static EngineContext *as_engine(void *runtime) {
-  return (EngineContext *)runtime;
-}
+class EngineLease {
+public:
+  explicit EngineLease(void *runtime) {
+    // The registry lock is held while taking the context lock and incrementing
+    // active_calls.  Destruction uses the same order, so a pointer cannot pass
+    // validation and then be deleted before this operation is pinned.
+    std::unique_lock<std::mutex> registry_lock(engine_contexts_mutex);
+    auto it = engine_contexts.find((EngineContext *)runtime);
+    if (it == engine_contexts.end() || !*it)
+      return;
+    EngineContext *candidate = *it;
+    std::lock_guard<std::mutex> context_lock(candidate->mutex);
+    if (candidate->destroying)
+      return;
+    candidate->active_calls++;
+    ctx_ = candidate;
+  }
+
+  EngineLease(const EngineLease &) = delete;
+  EngineLease &operator=(const EngineLease &) = delete;
+
+  ~EngineLease() {
+    if (!ctx_)
+      return;
+    std::lock_guard<std::mutex> lock(ctx_->mutex);
+    if (ctx_->active_calls > 0)
+      ctx_->active_calls--;
+    if (ctx_->active_calls == 0)
+      ctx_->lifecycle_cv.notify_all();
+  }
+
+  EngineContext *get() const { return ctx_; }
+  explicit operator bool() const { return ctx_ != nullptr; }
+
+private:
+  EngineContext *ctx_ = nullptr;
+};
 
 static ti::Runtime *engine_runtime(EngineContext *ctx) {
   if (!ctx || ctx->destroying)
@@ -1280,7 +1317,8 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
 }
 
 EXPORT const char *get_runtime_device_name(void *runtime) {
-  EngineContext *ctx = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *ctx = lease.get();
   static thread_local std::string snapshot;
   if (!ctx)
     return snapshot.c_str();
@@ -1292,7 +1330,8 @@ EXPORT const char *get_runtime_device_name(void *runtime) {
 }
 
 EXPORT const char *get_runtime_context_backend(void *runtime) {
-  EngineContext *ctx = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *ctx = lease.get();
   static thread_local std::string backend;
   // GLES is a separate Taichi architecture (and has its own target-qualified
   // bridge/artifacts), but it still belongs to the native graphics family for
@@ -1325,7 +1364,8 @@ EXPORT const char *get_runtime_context_backend(void *runtime) {
 }
 
 EXPORT int get_runtime_arch_id(void *runtime) {
-  EngineContext *ctx = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *ctx = lease.get();
   if (!ctx)
     return -1;
   std::lock_guard<std::mutex> lock(ctx->mutex);
@@ -1343,7 +1383,8 @@ EXPORT int get_runtime_arch_id(void *runtime) {
 }
 
 EXPORT const char *get_last_engine_error(void *runtime) {
-  EngineContext *ctx = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *ctx = lease.get();
   static thread_local std::string snapshot;
   if (!ctx)
     return snapshot.c_str();
@@ -1355,12 +1396,14 @@ EXPORT const char *get_last_engine_error(void *runtime) {
 }
 
 EXPORT void clear_last_engine_error(void *runtime) {
-  clear_engine_error(as_engine(runtime));
+  EngineLease lease(runtime);
+  clear_engine_error(lease.get());
   consume_ti_last_error();
 }
 
 EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
@@ -1471,24 +1514,31 @@ EXPORT void destroy_aot_module(void *module_ctx) {
 }
 
 EXPORT void destroy_aot_engine(void *runtime) {
-  EngineContext *ctx = as_engine(runtime);
-  if (!ctx)
-    return;
-  ScopedOpenGLContext gl_scope(ctx);
-  if (!gl_scope.ready())
-    return;
-
+  EngineContext *ctx = nullptr;
   {
-    std::lock_guard<std::mutex> lock(engine_contexts_mutex);
-    if (engine_contexts.find(ctx) == engine_contexts.end())
+    // Close admission before touching any context-owned graphics/runtime
+    // state.  EngineLease takes these locks in the same order, making the
+    // registry check and lifetime pin atomic with respect to destruction.
+    std::unique_lock<std::mutex> registry_lock(engine_contexts_mutex);
+    auto it = engine_contexts.find((EngineContext *)runtime);
+    if (it == engine_contexts.end() || !*it)
       return;
-    engine_contexts.erase(ctx);
+    ctx = *it;
+    std::unique_lock<std::mutex> context_lock(ctx->mutex);
+    ctx->destroying = true;
+    engine_contexts.erase(it);
   }
 
   {
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    ctx->destroying = true;
+    std::unique_lock<std::mutex> lock(ctx->mutex);
+    ctx->lifecycle_cv.wait(lock, [ctx] { return ctx->active_calls == 0; });
   }
+
+  ScopedOpenGLContext gl_scope(ctx);
+  // The context is already closed to new callers and all leases have drained.
+  // Continue cleanup even if an optional graphics-context rebind is
+  // unavailable; returning here would leak the runtime after removing it
+  // from the live registry.
 
   try {
     if (ctx->runtime)
@@ -1545,7 +1595,8 @@ EXPORT void destroy_aot_engine(void *runtime) {
 // -----------------------------------------------------------------------
 EXPORT void *allocate_gpu_buffer(void *runtime, uint64_t size,
                                  int host_accessible) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
@@ -1571,7 +1622,8 @@ EXPORT void *allocate_gpu_buffer(void *runtime, uint64_t size,
 }
 
 EXPORT void free_gpu_buffer(void *runtime, void *memory) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1588,7 +1640,8 @@ EXPORT void free_gpu_buffer(void *runtime, void *memory) {
 
 EXPORT void write_to_gpu_buffer(void *runtime, void *memory, void *data,
                                 uint64_t size) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1604,7 +1657,8 @@ EXPORT void write_to_gpu_buffer(void *runtime, void *memory, void *data,
 
 EXPORT void read_from_gpu_buffer(void *runtime, void *memory, void *data,
                                  uint64_t size) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1620,7 +1674,8 @@ EXPORT void read_from_gpu_buffer(void *runtime, void *memory, void *data,
 }
 
 EXPORT void *map_gpu_buffer(void *runtime, void *memory) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
@@ -1636,7 +1691,8 @@ EXPORT void *map_gpu_buffer(void *runtime, void *memory) {
 }
 
 EXPORT void unmap_gpu_buffer(void *runtime, void *memory) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1650,7 +1706,8 @@ EXPORT void unmap_gpu_buffer(void *runtime, void *memory) {
 
 EXPORT void copy_gpu_buffer(void *runtime, void *src, void *dst,
                             uint64_t size) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1673,7 +1730,8 @@ EXPORT void copy_gpu_buffer(void *runtime, void *src, void *dst,
 }
 
 EXPORT void sync_runtime(void *runtime) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -1710,7 +1768,8 @@ static bool checked_image_geometry(int width, int height, int channels,
 EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
                               int *out_height, int *out_channels,
                               int *out_bit_depth) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
@@ -1888,7 +1947,8 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
 EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
                                 int width, int height, int channels,
                                 int bit_depth) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return false;
@@ -2549,7 +2609,8 @@ static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
 EXPORT void run_aot_graph(void *runtime, void *module_ctx,
                           const char *graph_name, DynamicArg *args_array,
                           int num_args) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -2702,7 +2763,8 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
 EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
                          uint64_t *old_handles, DynamicArg *new_args,
                          int num_overrides) {
-  EngineContext *engine = as_engine(runtime);
+  EngineLease lease(runtime);
+  EngineContext *engine = lease.get();
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
