@@ -12,6 +12,7 @@ CORE_FILES = (
     PROJECT_ROOT / "taichi_vision" / "taichi_algorithm" / "feature_matching" / "ofb.py",
     PROJECT_ROOT / "taichi_vision" / "taichi_algorithm" / "optical_flow" / "lucas_kanade.py",
     PROJECT_ROOT / "taichi_vision" / "taichi_algorithm" / "sfm" / "five_point_solver.py",
+    PROJECT_ROOT / "taichi_vision" / "taichi_algorithm" / "sfm" / "registration.py",
 )
 IMPORT_RE = re.compile(r"^\s*(?:from\s+cv2\s+import|import\s+cv2)\b", re.MULTILINE)
 
