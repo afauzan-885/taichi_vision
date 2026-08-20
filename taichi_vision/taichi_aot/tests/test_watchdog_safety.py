@@ -170,7 +170,10 @@ def test_fatal_watchdog_paths_reach_hard_exit_without_cleanup(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=4,
+        # Importing engine.py constructs the compatibility singleton and may
+        # load the native bridge. Keep this watchdog assertion independent of
+        # host CPU/loader startup latency while still bounding a real hang.
+        timeout=30,
         env=env,
     )
     assert result.returncode == expected_code, result.stderr

@@ -283,12 +283,22 @@ class IsolatedRuntime:
                         f"isolated AOT runtime operation '{opcode}' timed out after {timeout:.1f}s"
                     )
                 try:
-                    response = self._responses.get(timeout=remaining)
+                    # Do not wait for the full operation timeout when the
+                    # child has already exited without flushing a protocol
+                    # response.  The reader thread normally publishes EOF,
+                    # but process polling closes this race deterministically.
+                    response = self._responses.get(timeout=min(remaining, 0.05))
                 except queue.Empty:
-                    self.close(force=True)
-                    raise IsolatedRuntimeError(
-                        f"isolated AOT runtime operation '{opcode}' timed out after {timeout:.1f}s"
-                    )
+                    code = self.process.poll()
+                    if code is not None:
+                        self._dead = True
+                        raise IsolatedRuntimeError(
+                            f"isolated AOT runtime worker exited unexpectedly (code={code})"
+                        )
+                    # The child is still alive; keep polling until the
+                    # operation deadline rather than treating the 50 ms
+                    # responsiveness slice as the full timeout.
+                    continue
                 if response is None:
                     self._dead = True
                     code = self.process.poll()

@@ -6540,7 +6540,7 @@ def _cleanup_zombie_gpu_processes():
     """Clean up only helper processes created and tracked by this runtime.
 
     Process-name scans are intentionally forbidden here: importing the
-    runtime must never terminate another application's ``vulkaninfo`` or
+    runtime must never terminate another application's external helper or
     ``python`` process.  POSIX zombies are reaped by their owning parent in
     ``_kill_tracked_children``; untracked processes are outside our authority.
     """
