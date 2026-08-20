@@ -62,6 +62,12 @@ from taichi_vision.device_selection import (
 from .artifact_targets import detect_target
 from .gfx_capabilities import negotiate_graphics_capabilities, unknown_graphics_snapshot
 from .tcm_preflight import preflight_tcm
+from .isolated_runtime import (
+    BridgeRouter,
+    IsolatedRuntime,
+    RuntimeHandle,
+    install_bridge_router,
+)
 
 _UNSET = object()
 _CPU_AOT_EXTRACTION_LOCK = threading.RLock()
@@ -503,6 +509,7 @@ _ERROR_WINDOW_S = _env_float("ERROR_WINDOW", 30.0)
 _ERROR_THRESHOLD = _env_int("ERROR_THRESHOLD", 5)
 _AUTO_DESTROY_ENABLED = os.environ.get("AUTO_DESTROY", "1") != "0"
 _INIT_TIMEOUT_S = _env_float("INIT_TIMEOUT", 30.0)
+_ISOLATED_RUNTIME_ENABLED = os.environ.get("AOT_ISOLATED_RUNTIME", "1") != "0"
 _CLEAN_ZOMBIES = os.environ.get("CLEAN_ZOMBIES", "0") == "1"
 _EXPERIMENT_MODE = os.environ.get("AOT_EXPERIMENT", "0") == "1"
 _SUPPRESS_VULKAN_LOADER_WARNINGS = (
@@ -2672,13 +2679,23 @@ class TaichiGPUBuffer:
         if self.engine is not None:
             self.engine._assert_native_context_owner("map")
         runtime, handle = self._require_live("GPU buffer map")
+
+        def _map_native():
+            # An isolated runtime owns the native allocation in a child
+            # process, so mapping must copy through the IPC boundary.  The
+            # parent wrapper is the authority for the allocation size.
+            map_with_size = getattr(_LIB, "map_gpu_buffer_with_size", None)
+            if map_with_size is not None and isinstance(runtime, RuntimeHandle):
+                return map_with_size(runtime, handle, self.size_bytes)
+            return _LIB.map_gpu_buffer(runtime, handle)
+
         if self.engine and hasattr(self.engine, "_lock"):
             with self.engine._lock:
-                ptr = _LIB.map_gpu_buffer(runtime, handle)
+                ptr = _map_native()
                 if not ptr:
                     _raise_native_engine_error(runtime, "GPU buffer map")
                 return ptr
-        ptr = _LIB.map_gpu_buffer(runtime, handle)
+        ptr = _map_native()
         if not ptr:
             _raise_native_engine_error(runtime, "GPU buffer map")
         return ptr
@@ -3206,7 +3223,7 @@ class AOTEngine:
 
     @classmethod
     def _new_unlocked(cls, arch=None, device_id=None):
-        global _OPENGL_VENDOR_INJECTED
+        global _LIB, _OPENGL_VENDOR_INJECTED
         config = resolve_backend_config(arch=arch, device_id=device_id)
         arch = config.backend
         device_id = config.device_id
@@ -3289,12 +3306,14 @@ class AOTEngine:
             if arch.lower() in ("cpu", "opengl", "gles") and native_device_id != 0:
                 native_device_id = 0
 
-            # Wrap init_aot_engine in a thread with timeout to detect hung Vulkan driver.
-            # ctypes releases the GIL during C calls, so this timeout mechanism works
-            # even if the C function hangs. The early watchdog is a secondary safety net.
+            # Native Vulkan/CPU initialization is process-owned.  A Python
+            # daemon thread cannot be cancelled while it is inside a driver
+            # call; the isolated worker can be terminated at the IPC boundary
+            # without leaving a native pointer or worker in this process.
             _op_begin("init_aot_engine", engine=instance)
             _init_result = [None]
             _init_error = [None]
+            _isolated_runtime = None
 
             def _do_init():
                 try:
@@ -3307,20 +3326,43 @@ class AOTEngine:
                     _init_error[0] = e
 
             _init_thread = None
-            if arch.lower() in ("opengl", "gles", "cuda"):
-                # OpenGL contexts are thread-affine. CUDA's Taichi runtime
-                # likewise binds its primary context to the initializing
-                # thread; creating it in a short-lived timeout worker leaves
-                # the Python/main thread with CUDA_ERROR_INVALID_CONTEXT at
-                # module teardown. Both bridges therefore initialize on the
-                # caller thread. Vulkan keeps the timeout worker because its
-                # ICD initialization can hang on a broken driver.
-                _do_init()
-            else:
-                _init_thread = threading.Thread(target=_do_init, daemon=True)
-                _init_thread.start()
-                _init_thread.join(timeout=_INIT_TIMEOUT_S)
-            _op_end()
+            try:
+                if _ISOLATED_RUNTIME_ENABLED and arch.lower() in ("cpu", "vulkan"):
+                    native_bridge = (
+                        _LIB.native if isinstance(_LIB, BridgeRouter) else _LIB
+                    )
+                    bridge_path = getattr(native_bridge, "_name", None)
+                    if not bridge_path:
+                        raise RuntimeError(
+                            "isolated AOT runtime requires a concrete native bridge path"
+                        )
+                    _isolated_runtime = IsolatedRuntime.start(
+                        bridge_path,
+                        arch_id,
+                        native_device_id,
+                        backend=arch.lower(),
+                        timeout=_INIT_TIMEOUT_S,
+                    )
+                    _LIB = install_bridge_router(native_bridge, _isolated_runtime)
+                    _init_result[0] = _isolated_runtime.runtime
+                elif arch.lower() in ("opengl", "gles", "cuda"):
+                    # OpenGL contexts are thread-affine. CUDA's Taichi runtime
+                    # likewise binds its primary context to the initializing
+                    # thread; creating it in a short-lived timeout worker leaves
+                    # the Python/main thread with CUDA_ERROR_INVALID_CONTEXT at
+                    # module teardown. Both bridges therefore initialize on the
+                    # caller thread. Vulkan keeps the timeout worker because its
+                    # ICD initialization can hang on a broken driver.
+                    _do_init()
+                else:
+                    # Compatibility mode is explicitly opt-out and retains
+                    # the old bounded thread path only for legacy builds that
+                    # cannot start the process-owned worker.
+                    _init_thread = threading.Thread(target=_do_init, daemon=True)
+                    _init_thread.start()
+                    _init_thread.join(timeout=_INIT_TIMEOUT_S)
+            finally:
+                _op_end()
 
             if _init_thread is not None and _init_thread.is_alive():
                 # init_aot_engine hung beyond timeout — Vulkan driver is likely broken
@@ -3339,6 +3381,7 @@ class AOTEngine:
                 raise RuntimeError(f"init_aot_engine() failed: {_init_error[0]}")
 
             instance.runtime = _init_result[0]
+            instance._isolated_runtime = _isolated_runtime
             if not instance.runtime:
                 init_error = _get_last_init_error()
                 raise RuntimeError(
@@ -6146,6 +6189,7 @@ class AOTEngine:
         _clear_native_engine_error(self.runtime)
 
     def reinit(self, device_id=0):
+        global _LIB, _RUNTIME
         with self._lock:
             # Queued Python jobs retain their argument buffers until they
             # start.  Cancel those that have not acquired the native queue;
@@ -6257,24 +6301,49 @@ class AOTEngine:
                     destroy_engine(old_runtime)
                 except Exception:
                     pass
-            with _suppress_native_stderr(self.arch.lower() == "vulkan"):
-                self.runtime = _LIB.init_aot_engine(
+            self.runtime = None
+            new_isolated_runtime = None
+            if _ISOLATED_RUNTIME_ENABLED and active_arch in ("cpu", "vulkan"):
+                native_bridge = (
+                    _LIB.native if isinstance(_LIB, BridgeRouter) else _LIB
+                )
+                bridge_path = getattr(native_bridge, "_name", None)
+                if not bridge_path:
+                    raise RuntimeError(
+                        "isolated AOT runtime requires a concrete native bridge path"
+                    )
+                new_isolated_runtime = IsolatedRuntime.start(
+                    bridge_path,
                     {
                         "vulkan": 0,
-                        "cuda": 1,
                         "cpu": 2,
-                        "opengl": 3,
-                        "gles": 4,
-                    }.get(active_arch, 0),
+                    }[active_arch],
                     requested_device,
+                    backend=active_arch,
+                    timeout=_INIT_TIMEOUT_S,
                 )
+                _LIB = install_bridge_router(native_bridge, new_isolated_runtime)
+                self.runtime = new_isolated_runtime.runtime
+                self._isolated_runtime = new_isolated_runtime
+            else:
+                with _suppress_native_stderr(self.arch.lower() == "vulkan"):
+                    self.runtime = _LIB.init_aot_engine(
+                        {
+                            "vulkan": 0,
+                            "cuda": 1,
+                            "cpu": 2,
+                            "opengl": 3,
+                            "gles": 4,
+                        }.get(active_arch, 0),
+                        requested_device,
+                    )
+                self._isolated_runtime = None
             if not self.runtime:
                 raise RuntimeError(
                     f"Failed to reinitialize Taichi AOT runtime for {active_arch}"
                 )
             # Keep legacy buffer helpers that rely on the module-level runtime
             # synchronized with an explicit reinit().
-            global _RUNTIME
             _RUNTIME = self.runtime
             self.device_id = requested_device
             self._device_memory_provider = (
@@ -6415,6 +6484,7 @@ class AOTEngine:
                         "[AOTEngine] Intel native Vulkan safe teardown: native context destructor skipped"
                     )
                 self.runtime = None
+                self._isolated_runtime = None
                 global _RUNTIME
                 if _RUNTIME is runtime_to_destroy:
                     _RUNTIME = None
