@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 import threading
 
-from taichi_vision.taichi_aot.residency import DeviceResidencyCache
+
+_RESIDENCY_PATH = Path(__file__).resolve().parents[1] / "residency.py"
+_RESIDENCY_MODULE = "taichi_aot_residency_test_probe"
+_SPEC = importlib.util.spec_from_file_location(_RESIDENCY_MODULE, _RESIDENCY_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_RESIDENCY_MODULE] = _MODULE
+_SPEC.loader.exec_module(_MODULE)
+DeviceResidencyCache = _MODULE.DeviceResidencyCache
 
 
 def test_dispose_callback_runs_outside_residency_lock():
