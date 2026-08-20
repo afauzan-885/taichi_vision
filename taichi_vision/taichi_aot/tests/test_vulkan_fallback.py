@@ -78,6 +78,24 @@ def test_fallback_uses_platform_loader_and_preserves_ordinal(monkeypatch: pytest
         assert loader_names == ["vulkan-1.dll"]
 
 
+def test_fallback_uses_linux_loader_when_platform_is_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeVulkan()
+    loader_names = []
+    monkeypatch.setattr(engine, "scan_vulkan_device_records", lambda: [])
+    monkeypatch.setattr(engine.os, "name", "posix")
+    monkeypatch.setattr(engine.sys, "platform", "linux")
+    monkeypatch.setattr(
+        engine.ctypes,
+        "CDLL",
+        lambda name: (loader_names.append(name), fake)[1],
+    )
+
+    assert engine.get_vulkan_device_name(1) == "Adapter B"
+    assert loader_names == ["libvulkan.so.1"]
+
+
 def test_fallback_rejects_vulkan_result_errors_with_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
