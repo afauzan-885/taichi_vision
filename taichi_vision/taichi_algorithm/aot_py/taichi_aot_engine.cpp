@@ -2917,6 +2917,15 @@ EXPORT void clear_pipeline(void *module_ctx, const char *pipeline_name) {
   }
 }
 
+EXPORT void clear_pipeline_for_engine(void *runtime, const char *pipeline_name) {
+  EngineLease engine_lease(runtime);
+  EngineContext *ctx = engine_lease.get();
+  if (!ctx || !pipeline_name)
+    return;
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  ctx->pipelines.erase(pipeline_name);
+}
+
 EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
                             const char *graph_name, DynamicArg *args_array,
                             int num_args) {

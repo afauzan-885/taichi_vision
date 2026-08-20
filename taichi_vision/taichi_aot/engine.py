@@ -1783,6 +1783,12 @@ def _init_aot_bridge(backend=None):
     _LIB.clear_pipeline.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     _LIB.clear_pipeline.restype = None
 
+    try:
+        _LIB.clear_pipeline_for_engine.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        _LIB.clear_pipeline_for_engine.restype = None
+    except AttributeError:
+        pass
+
     _LIB.add_to_pipeline.argtypes = [
         ctypes.c_void_p,
         ctypes.c_char_p,
@@ -3833,9 +3839,8 @@ class AOTEngine:
                             f"AOT module key '{self.module_key}' is not loaded; "
                             "segmented recording remains direct"
                         )
-                    _LIB.clear_pipeline(
-                        module.module_ptr if module else None,
-                        self.name.encode("utf-8"),
+                    self.engine._clear_native_pipeline(
+                        self.name, module.module_ptr if module else None
                     )
                     # Clear previous intermediates for this pipeline only after
                     # the native graph has been invalidated.  Handles associated
@@ -4254,24 +4259,10 @@ class AOTEngine:
             return
         key = str(name)
         encoded_name = key.encode("utf-8")
-        # A recorded graph is owned by its module. Passing ``None`` to the
-        # native compatibility API broadcasts the clear to every live engine,
-        # so use it only when no owner module is available at all.
-        owner_count = 0
-        for module in tuple(getattr(self, "modules", {}).values()):
-            module_ptr = getattr(module, "module_ptr", None)
-            if not module_ptr:
-                continue
-            owner_count += 1
-            try:
-                _LIB.clear_pipeline(module_ptr, encoded_name)
-            except Exception:
-                pass
-        if owner_count == 0:
-            try:
-                _LIB.clear_pipeline(None, encoded_name)
-            except Exception:
-                pass
+        try:
+            self._clear_native_pipeline(key)
+        except Exception:
+            pass
         self.recorded_pipelines.discard(key)
         recordings = getattr(self, "_pipeline_recordings", None)
         if recordings is not None:
@@ -4521,15 +4512,7 @@ class AOTEngine:
             if name in self.recorded_pipelines:
                 self.recorded_pipelines.remove(name)
             encoded_name = name.encode("utf-8")
-            owner_count = 0
-            for module in tuple(getattr(self, "modules", {}).values()):
-                module_ptr = getattr(module, "module_ptr", None)
-                if not module_ptr:
-                    continue
-                owner_count += 1
-                _LIB.clear_pipeline(module_ptr, encoded_name)
-            if owner_count == 0:
-                _LIB.clear_pipeline(None, encoded_name)
+            self._clear_native_pipeline(name)
             recordings = getattr(self, "_pipeline_recordings", None)
             if recordings is not None:
                 recordings.pop(name, None)
@@ -4543,6 +4526,19 @@ class AOTEngine:
                     if not buf.associated_pipelines:
                         buf._force_destroy()
                 del self._pipeline_intermediates[name]
+
+    def _clear_native_pipeline(self, name, module_ptr=None):
+        encoded_name = str(name).encode("utf-8")
+        if module_ptr:
+            _LIB.clear_pipeline(module_ptr, encoded_name)
+            return
+        clear_for_engine = getattr(_LIB, "clear_pipeline_for_engine", None)
+        if clear_for_engine is not None and getattr(self, "runtime", None):
+            clear_for_engine(self.runtime, encoded_name)
+            return
+        # Compatibility with an older bridge; the current bridge always uses
+        # the engine-scoped symbol above to avoid process-global broadcasts.
+        _LIB.clear_pipeline(None, encoded_name)
 
     def clear_pipelines(self):
         """Clear all registered pipelines and destroy their intermediate buffers."""
