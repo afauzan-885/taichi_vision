@@ -6222,20 +6222,16 @@ class AOTEngine:
                     pass
 
                 # 2. Clear all pipelines and their intermediate GPU buffers
-                for name in list(getattr(self, "_pipeline_intermediates", {}).keys()):
-                    try:
-                        bufs = self._pipeline_intermediates.pop(name, [])
-                        for buf in bufs:
-                            buf.is_pipeline_intermediate = False
-                            buf.associated_pipelines.discard(name)
-                            if buf.handle is not None and buf.is_owner:
-                                _LIB.free_gpu_buffer(self.runtime, buf.handle)
-                                buf.handle = None
-                                buf.is_owner = False
-                    except Exception:
-                        pass
-                self.recorded_pipelines.clear()
-                getattr(self, "_pipeline_recordings", {}).clear()
+                # Route native pipeline removal through the owning modules
+                # before their ModuleContext handles are retired.  This keeps
+                # the Python teardown order aligned with the native lifetime
+                # lease contract and avoids leaving raw module references in
+                # a recorded pipeline during module destruction.
+                try:
+                    self.clear_pipelines()
+                except Exception:
+                    self.recorded_pipelines.clear()
+                    getattr(self, "_pipeline_recordings", {}).clear()
 
                 # 3. Free all staging pool buffers
                 for entries in list(getattr(self, "_staging_pool", {}).values()):

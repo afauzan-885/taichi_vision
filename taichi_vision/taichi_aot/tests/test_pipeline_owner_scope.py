@@ -22,3 +22,12 @@ def test_clear_pipeline_by_name_does_not_broadcast_when_modules_exist():
     block = SOURCE[start:end]
     assert "_LIB.clear_pipeline(module_ptr" in block
     assert "if owner_count == 0" in block
+
+
+def test_engine_destroy_clears_pipelines_before_unloading_modules():
+    start = SOURCE.index("def destroy(self):")
+    end = SOURCE.index("def _global_cleanup", start)
+    block = SOURCE[start:end]
+    assert block.index("self.clear_pipelines()") < block.index(
+        "# 5. Unload all AOT modules"
+    )
