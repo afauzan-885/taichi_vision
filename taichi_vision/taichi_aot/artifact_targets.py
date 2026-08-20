@@ -25,6 +25,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from .tcm_contract import TcmContractError, validate_archive_limits
+
 
 _ARCH_ALIASES = {
     "amd64": "x86_64",
@@ -67,6 +69,28 @@ _BACKEND_ALIASES = {
 }
 
 _VENDORS = {"unknown", "nvidia", "intel", "amd", "qualcomm", "arm", "apple"}
+_MAX_GRAPH_INDEX_BYTES = 4 * 1024 * 1024
+_MAX_TARGET_INSPECTION_BYTES = 32 * 1024 * 1024
+
+
+def _read_prefix(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    limit: int,
+) -> bytes:
+    """Read only the bounded prefix needed for target qualification."""
+
+    if int(info.file_size) > limit:
+        raise TcmContractError(
+            f"target inspection exceeds the limit: {info.filename}"
+        )
+    with archive.open(info, "r") as source:
+        payload = source.read(limit + 1)
+    if len(payload) > limit:
+        raise TcmContractError(
+            f"target inspection exceeds the limit: {info.filename}"
+        )
+    return payload
 
 
 def canonical_arch(value: Optional[str]) -> str:
@@ -286,7 +310,9 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
     """
     try:
         with zipfile.ZipFile(path, "r") as archive:
-            names = set(archive.namelist())
+            infos = validate_archive_limits(archive)
+            names = {info.filename for info in infos}
+            members = {info.filename: info for info in infos}
             if target.backend in {"vulkan", "opengl", "gles"}:
                 # Graphics artifacts are consumed as SPIR-V by the native
                 # Vulkan/OpenGL/GLES bridges.  A ``graphs.tcb``/LLVM payload
@@ -307,8 +333,19 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                 if "graphs.json" not in names:
                     return False
                 try:
-                    graph_index = json.loads(archive.read("graphs.json"))
-                except (UnicodeDecodeError, json.JSONDecodeError, KeyError):
+                    graph_index = json.loads(
+                        _read_prefix(
+                            archive,
+                            members["graphs.json"],
+                            _MAX_GRAPH_INDEX_BYTES,
+                        )
+                    )
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TcmContractError,
+                ):
                     return False
                 if not isinstance(graph_index, (list, dict)):
                     return False
@@ -321,7 +358,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                 # byte-level check independent of the host architecture.
                 spirv_magic = b"\x03\x02\x23\x07"
                 for name in shader_names:
-                    payload = archive.read(name)
+                    payload = _read_prefix(archive, members[name], 4)
                     if len(payload) < 4 or payload[:4] != spirv_magic:
                         return False
                 return True
@@ -329,7 +366,11 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
             if "graphs.tcb" not in names or not llvm_files:
                 return False
             samples = [
-                archive.read(name).decode("utf-8", errors="replace")
+                _read_prefix(
+                    archive,
+                    members[name],
+                    _MAX_TARGET_INSPECTION_BYTES,
+                ).decode("utf-8", errors="replace")
                 for name in llvm_files
             ]
             triples = [
@@ -361,7 +402,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
             if target.os == "android":
                 return "android" in triple
             return True
-    except (OSError, zipfile.BadZipFile, KeyError):
+    except (OSError, zipfile.BadZipFile, KeyError, TcmContractError):
         return False
 
 

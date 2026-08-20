@@ -46,6 +46,12 @@ _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_KERNELS = 65536
 _MAX_ARGS_PER_KERNEL = 4096
 _MAX_PAYLOADS = 65536
+_MAX_ARCHIVE_MEMBERS = 65536
+_MAX_MEMBER_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 1000
+_MIN_RATIO_CHECK_COMPRESSED_BYTES = 4096
+_MAX_LEGACY_INSPECTION_BYTES = 32 * 1024 * 1024
 
 _ARCH_ALIASES = {
     "amd64": "x86_64",
@@ -385,10 +391,73 @@ def _read_manifest(archive: zipfile.ZipFile) -> Optional[Mapping[str, Any]]:
     if info.file_size > _MAX_MANIFEST_BYTES:
         raise TcmContractError("TCM manifest exceeds the maximum allowed size")
     try:
-        decoded = json.loads(archive.read(TCM_MANIFEST_NAME).decode("utf-8"))
+        with archive.open(info, "r") as source:
+            encoded = source.read(_MAX_MANIFEST_BYTES + 1)
+        if len(encoded) > _MAX_MANIFEST_BYTES:
+            raise TcmContractError("TCM manifest exceeds the maximum allowed size")
+        decoded = json.loads(encoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TcmContractError("TCM manifest is not valid UTF-8 JSON") from exc
     return _require_mapping(decoded, "manifest")
+
+
+def _validate_archive_limits(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """Validate ZIP metadata before any untrusted member is fully read."""
+
+    infos = archive.infolist()
+    if len(infos) > _MAX_ARCHIVE_MEMBERS:
+        raise TcmContractError(
+            f"TCM archive contains too many members ({len(infos)} > {_MAX_ARCHIVE_MEMBERS})"
+        )
+    total_size = 0
+    for info in infos:
+        size = int(info.file_size)
+        compressed = int(info.compress_size)
+        if size < 0 or size > _MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise TcmContractError(f"TCM member is too large: {info.filename}")
+        total_size += size
+        if total_size > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise TcmContractError("TCM archive exceeds the total uncompressed size limit")
+        if (
+            compressed >= _MIN_RATIO_CHECK_COMPRESSED_BYTES
+            and size > compressed * _MAX_COMPRESSION_RATIO
+        ):
+            raise TcmContractError(
+                f"TCM member has an excessive compression ratio: {info.filename}"
+            )
+    return infos
+
+
+def validate_archive_limits(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """Validate ZIP resource limits for callers inspecting a TCM archive.
+
+    Target resolvers may need to inspect a small portion of a legacy archive
+    before the full manifest preflight runs.  They must share the same
+    archive-level limits so that this early admission path cannot bypass the
+    contract validator.
+    """
+
+    return _validate_archive_limits(archive)
+
+
+def _stream_sha256(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
+    digest = hashlib.sha256()
+    with archive.open(info, "r") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_legacy_member_text(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
+    """Read only a bounded prefix of legacy LLVM text for target inspection."""
+
+    with archive.open(info, "r") as source:
+        encoded = source.read(_MAX_LEGACY_INSPECTION_BYTES + 1)
+    if len(encoded) > _MAX_LEGACY_INSPECTION_BYTES:
+        raise TcmContractError(
+            f"legacy LLVM inspection exceeds the limit: {info.filename}"
+        )
+    return encoded.decode("utf-8", errors="replace")
 
 
 def _validate_legacy_payload_target(
@@ -412,10 +481,14 @@ def _validate_legacy_payload_target(
     backend = _canonical_backend(_target_value(requested_target, "backend", "cpu"), target_os)
     if backend not in {"cuda", "cpu"}:
         return
-    llvm_entries = [name for name in archive.namelist() if name.lower().endswith((".ll", ".tic"))]
-    for name in llvm_entries:
+    llvm_entries = [
+        info for info in archive.infolist()
+        if info.filename.lower().endswith((".ll", ".tic"))
+    ]
+    for info in llvm_entries:
+        name = info.filename
         try:
-            text = archive.read(name).decode("utf-8", errors="replace")
+            text = _read_legacy_member_text(archive, info)
         except (KeyError, OSError):
             continue
         triples = re.findall(r'target triple = "([^"]+)"', text)
@@ -471,7 +544,8 @@ def validate_tcm(
         raise TcmContractError(f"TCM archive does not exist: {artifact}")
     try:
         with zipfile.ZipFile(artifact, "r") as archive:
-            names = archive.namelist()
+            infos = _validate_archive_limits(archive)
+            names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise TcmContractError("TCM archive contains duplicate entry names")
             manifest = _read_manifest(archive)
@@ -503,7 +577,7 @@ def validate_tcm(
                         f"payload size mismatch for {payload_path}: manifest={payload['size']}, archive={info.file_size}"
                     )
                 if "sha256" in payload:
-                    digest = hashlib.sha256(archive.read(payload_path)).hexdigest()
+                    digest = _stream_sha256(archive, info)
                     if digest.lower() != payload["sha256"].lower():
                         raise TcmContractError(f"payload checksum mismatch for {payload_path}")
             return {
@@ -556,13 +630,13 @@ def build_manifest_from_archive(
             kind = next((candidate for suffix, candidate in suffix_kinds if name.lower().endswith(suffix)), None)
             if kind is None:
                 continue
-            data = archive.read(name)
+            info = archive.getinfo(name)
             entry: dict[str, Any] = {
                 "path": name,
                 "kind": kind,
                 "version": str(versions.get(kind, "unspecified")),
-                "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": info.file_size,
+                "sha256": _stream_sha256(archive, info),
             }
             payloads.append(entry)
     manifest = {
