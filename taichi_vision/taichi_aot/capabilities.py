@@ -72,6 +72,41 @@ def _device_metadata(device: Any) -> tuple[Mapping[str, Any], str, str]:
     return metadata, device_name, vendor
 
 
+def _device_ordinal(metadata: Mapping[str, Any]):
+    """Return the ordinal carried by the evaluated device record, if any.
+
+    Capability policy must never borrow ``AOT_DEVICE`` to identify a different
+    argument.  Device discovery records use ``ordinal`` today; the additional
+    aliases keep the helper tolerant of existing probe dictionaries without
+    making environment state part of identity.
+    """
+
+    for key in ("ordinal", "device_id", "index"):
+        value = metadata.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            ordinal = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ordinal if ordinal >= 0 else None
+    return None
+
+
+def _intel_vulkan_validated(metadata: Mapping[str, Any]) -> bool:
+    """Query qualification for exactly the Intel device being evaluated."""
+
+    ordinal = _device_ordinal(metadata)
+    if ordinal is None:
+        return False
+    try:
+        from taichi_vision.vulkan_probe import intel_vulkan_is_validated
+
+        return bool(intel_vulkan_is_validated(device_id=ordinal))
+    except Exception:
+        return False
+
+
 def classify_device(device: Any, backend: str, driver: str = "unknown"):
     metadata, device_name, vendor = _device_metadata(device)
     name = device_name.lower()
@@ -176,12 +211,7 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             reason="NVIDIA CUDA selected; compute capability will be validated by the native runtime",
         )
     if backend == "vulkan" and vendor == "intel":
-        try:
-            from taichi_vision.vulkan_probe import intel_vulkan_is_validated
-
-            validated = intel_vulkan_is_validated(int(os.environ.get("AOT_DEVICE", 0)))
-        except Exception:
-            validated = False
+        validated = _intel_vulkan_validated(metadata)
         if validated:
             return BackendCapabilities(
                 backend,
@@ -191,13 +221,19 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
                 safe=True,
                 reason="Intel Vulkan lifecycle, parity, and pipeline manifest validated",
             )
+        ordinal = _device_ordinal(metadata)
+        reason = (
+            "Intel Vulkan AOT is quarantined after ABI/pipeline failures"
+            if ordinal is not None
+            else "Intel Vulkan qualification requires the exact evaluated device identity"
+        )
         return BackendCapabilities(
             backend,
             vendor,
             device_name,
             driver,
             safe=False,
-            reason="Intel Vulkan AOT is quarantined after ABI/pipeline failures",
+            reason=reason,
         )
     if backend == "opengl":
         return BackendCapabilities(
@@ -230,7 +266,7 @@ def requested_backend():
 
 def backend_candidates(device: Any = "unknown"):
     """Return deterministic preference order for automatic dispatch."""
-    _, device_name, vendor = _device_metadata(device)
+    metadata, device_name, vendor = _device_metadata(device)
     auto_fallback = (
         os.environ.get("PIXEL_REFINE_AOT_AUTO_FALLBACK", "0") == "1"
     )
@@ -240,13 +276,8 @@ def backend_candidates(device: Any = "unknown"):
         # list explicit so auto mode never attempts a desktop OpenGL bridge.
         return ["vulkan", "gles", "cpu"]
     if vendor == "intel":
-        try:
-            from taichi_vision.vulkan_probe import intel_vulkan_is_validated
-
-            if intel_vulkan_is_validated(int(os.environ.get("AOT_DEVICE", 0))):
-                return ["vulkan", "opengl", "cpu"]
-        except Exception:
-            pass
+        if _intel_vulkan_validated(metadata):
+            return ["vulkan", "opengl", "cpu"]
         return ["opengl", "cpu"]
     # Auto-fallback order requested by the user: CUDA -> Vulkan -> OpenGL -> CPU.
     if vendor == "nvidia":

@@ -48,9 +48,46 @@ _ALIASES = {
     "default": "auto",
 }
 
+_POLICY_TRUE = frozenset(("1", "true", "yes", "on"))
+_POLICY_FALSE = frozenset(("0", "false", "no", "off"))
+
 
 def _token(value) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def parse_policy_bool(value, default: Optional[bool] = None) -> Optional[bool]:
+    """Parse a safety/configuration boolean without Python truthiness traps.
+
+    This helper is deliberately strict because many callers consume JSON,
+    persisted selectors, probe metadata, or graph-policy mappings where a
+    non-empty string such as ``"false"`` must never become ``True`` merely by
+    passing through ``bool(value)``.
+
+    Only real booleans, integer 0/1, and explicit common serialized spellings
+    are accepted.  Ambiguous values return ``default`` so safety-sensitive
+    callers can fail closed by using ``default=False`` (or retain ``None`` to
+    distinguish missing/invalid evidence).
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return default
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _POLICY_TRUE:
+            return True
+        if token in _POLICY_FALSE:
+            return False
+        return default
+    if value is None:
+        return default
+    return default
 
 
 def normalize_backend(value, *, allow_auto: bool = True, strict: bool = False) -> str:
@@ -217,5 +254,6 @@ __all__ = [
     "normalize_backend",
     "normalize_vendor",
     "parse_device_id",
+    "parse_policy_bool",
     "requested_backend",
 ]
