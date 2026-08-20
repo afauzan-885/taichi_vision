@@ -161,3 +161,43 @@ for target in ("cpu", "cuda", "opengl", "vulkan"):
         timeout=60,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="compiled bridge smoke is Windows-specific")
+@pytest.mark.skipif(not BRIDGE.exists(), reason="publish CPU bridge is not built")
+@pytest.mark.skipif(
+    not (LLVM_BIN / "taichi_c_api.dll").exists(),
+    reason="LLVM20 C API runtime is unavailable",
+)
+def test_forced_gpu_init_failure_reports_explicit_cpu_fallback_identity():
+    code = r'''
+import ctypes, os
+from pathlib import Path
+os.environ["PIXEL_REFINE_AOT_TEST_FAIL_INIT"] = "1"
+os.environ["PIXEL_REFINE_AOT_ALLOW_CPU_FALLBACK"] = "1"
+os.add_dll_directory(r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin")
+os.environ["TI_LIB_DIR"] = r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\runtime"
+d = ctypes.WinDLL(str(Path(r"taichi_vision/taichi_algorithm/aot_py/taichi_aot_engine.dll").resolve()))
+d.init_aot_engine.argtypes = [ctypes.c_int, ctypes.c_int]
+d.init_aot_engine.restype = ctypes.c_void_p
+d.get_runtime_arch_id.argtypes = [ctypes.c_void_p]
+d.get_runtime_arch_id.restype = ctypes.c_int
+d.get_runtime_device_name.argtypes = [ctypes.c_void_p]
+d.get_runtime_device_name.restype = ctypes.c_char_p
+d.get_last_engine_error.argtypes = [ctypes.c_void_p]
+d.get_last_engine_error.restype = ctypes.c_char_p
+runtime = d.init_aot_engine(1, 0)
+assert runtime
+assert d.get_runtime_arch_id(runtime) == 2
+assert b"CPU" in (d.get_runtime_device_name(runtime) or b"")
+assert b"CPU fallback" in (d.get_last_engine_error(runtime) or b"")
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout

@@ -1364,6 +1364,20 @@ EXPORT const char *scan_vulkan_devices() {
   return device_list.c_str();
 }
 
+static bool forced_init_failure_for_tests() {
+#ifdef _WIN32
+  char configured[32] = {};
+  const DWORD length = GetEnvironmentVariableA(
+      "PIXEL_REFINE_AOT_TEST_FAIL_INIT", configured,
+      static_cast<DWORD>(sizeof(configured)));
+  return length > 0 && length < sizeof(configured) &&
+         std::strcmp(configured, "1") == 0;
+#else
+  const char *configured = std::getenv("PIXEL_REFINE_AOT_TEST_FAIL_INIT");
+  return configured && std::strcmp(configured, "1") == 0;
+#endif
+}
+
 EXPORT void *init_aot_engine(int arch_id, int device_id) {
   set_last_init_error("");
   TiArch arch = TI_ARCH_VULKAN;
@@ -1379,6 +1393,8 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
     // Use specified device_id
     auto ctx = std::make_unique<EngineContext>();
     ctx->arch = arch;
+    if (forced_init_failure_for_tests())
+      throw std::runtime_error("injected native backend initialization failure");
     if (arch == TI_ARCH_OPENGL) {
 #ifdef _WIN32
       const char *egl_only = std::getenv("PIXEL_REFINE_OPENGL_EGL_ONLY");
