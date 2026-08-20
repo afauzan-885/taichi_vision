@@ -8,10 +8,19 @@ from ctypes import wintypes
 import gc
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+
+# Running this file directly makes Python place ``tools/`` rather than the
+# checkout root on sys.path.  Keep the benchmark self-contained so the exact
+# venv command used in release qualification does not depend on PYTHONPATH.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _synthetic_bayer(height: int, width: int) -> np.ndarray:
