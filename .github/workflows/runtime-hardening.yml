@@ -53,23 +53,29 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
+          import re
           from pathlib import Path
-          import subprocess
-          import sys
 
           # The repository currently ships Windows and ARM Linux bridges, but
           # no x86_64 Linux bridge.  Keep this Linux job portable: native AOT
           # tests run in the target-runtime matrix, while this job verifies
           # the dependency boundary without importing the native package.
-          tests = []
-          core_boundary = Path(
-              "taichi_vision/taichi_algorithm/aot_py/tests/"
-              "test_core_dependency_boundary.py"
+          root = Path("taichi_vision") / "taichi_algorithm"
+          files = (
+              root / "aot_api" / "__init__.py",
+              root / "alignment" / "mtb.py",
+              root / "alignment" / "ransac.py",
+              root / "feature_matching" / "ofb.py",
+              root / "optical_flow" / "lucas_kanade.py",
+              root / "sfm" / "five_point_solver.py",
           )
-          if core_boundary.is_file():
-              tests.append(str(core_boundary))
-          if not tests:
-              print("No portable dependency-boundary tests are present on this ref yet.")
-              raise SystemExit(0)
-          subprocess.check_call([sys.executable, "-m", "pytest", "-q", *tests])
+          import_re = re.compile(r"^\\s*(?:from\\s+cv2\\s+import|import\\s+cv2)\\b", re.MULTILINE)
+          for path in files:
+              source = path.read_text(encoding="utf-8")
+              if import_re.search(source):
+                  raise SystemExit(f"OpenCV import leaked into core: {path}")
+          facade = (root / "aot_api" / "__init__.py").read_text(encoding="utf-8")
+          if "cv2." in facade:
+              raise SystemExit("OpenCV call site leaked into the AOT facade")
+          print(f"Checked {len(files)} core source files without importing native AOT")
           PY
