@@ -1306,7 +1306,42 @@ _dtype_code_by_dtype = {np.dtype(key): value for key, value in dtype_map.items()
 # -------------------------------------------------------------------------
 # Dynamic Argument Population Helper
 # -------------------------------------------------------------------------
-def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unknown"):
+def _validate_gpu_buffer_owner(value, expected_engine, context_name="Unknown"):
+    """Reject a live GPU wrapper that is not owned by the executing engine."""
+
+    if not isinstance(value, (TaichiGPUBuffer, TaichiPlaceholder)):
+        return
+    owner = getattr(value, "engine", None)
+    if expected_engine is not None and owner is not expected_engine:
+        raise RuntimeError(
+            f"{context_name}: GPU buffer belongs to a different AOT runtime"
+        )
+    if owner is None:
+        raise RuntimeError(
+            f"{context_name}: GPU buffer has no owning AOT runtime"
+        )
+    resolved_handle = (
+        value._resolve_handle()
+        if hasattr(value, "_resolve_handle")
+        else getattr(value, "handle", None)
+    )
+    if resolved_handle is None:
+        raise RuntimeError(
+            f"{context_name}: GPU buffer is no longer valid"
+        )
+    if getattr(value, "engine_generation", 0) != getattr(owner, "_generation", 0):
+        raise RuntimeError(
+            f"{context_name}: GPU buffer belongs to an old AOT runtime generation"
+        )
+
+
+def _populate_dynamic_arg(
+    arg: DynamicArg,
+    name_bytes,
+    value,
+    context_name="Unknown",
+    expected_engine=None,
+):
     """Internal helper to fill DynamicArg metadata consistently."""
     arg.name = name_bytes
 
@@ -1330,6 +1365,8 @@ def _populate_dynamic_arg(arg: DynamicArg, name_bytes, value, context_name="Unkn
         arg.val_u64 = struct.unpack("<I", struct.pack("<f", float(value)))[0]
     elif isinstance(value, (TaichiGPUBuffer, TaichiPlaceholder)):
         arg.arg_type = 0
+
+        _validate_gpu_buffer_owner(value, expected_engine, context_name)
 
         # A wrapper can outlive ``reinit()``/shutdown.  The runtime teardown
         # deliberately clears its handle; reject the stale object here rather
@@ -2768,7 +2805,11 @@ class AOTModuleWrapper:
         for i, (k, v) in enumerate(kwargs.items()):
             try:
                 _populate_dynamic_arg(
-                    args_array[i], arg_names[i], v, context_name=graph_name
+                    args_array[i],
+                    arg_names[i],
+                    v,
+                    context_name=graph_name,
+                    expected_engine=engine,
                 )
             except Exception as e:
                 # Wrap error with clearer context
@@ -3684,6 +3725,11 @@ class AOTEngine:
         p = TaichiPlaceholder(
             self._placeholder_id_counter, shape, dtype, is_vector, vector_dim
         )
+        # Placeholders participate in pipeline ownership just like concrete
+        # buffers.  They carry an ID rather than a native allocation, but
+        # must still be rejected when passed to another engine.
+        p.engine = self
+        p.engine_generation = self._generation
         self._placeholder_id_counter += 1
         return p
 
@@ -4318,8 +4364,12 @@ class AOTEngine:
         # Keep names alive
         arg_names = [b"override"] * n
         for i, (p, b) in enumerate(ovr.items()):
+            _validate_gpu_buffer_owner(p, self, f"Pipeline '{name}' override key")
+            _validate_gpu_buffer_owner(b, self, f"Pipeline '{name}' override value")
             handles[i] = ctypes.c_uint64(p.handle)
-            _populate_dynamic_arg(args[i], arg_names[i], b)
+            _populate_dynamic_arg(
+                args[i], arg_names[i], b, expected_engine=self
+            )
         _lock_wait_begin(f"use_pipeline:{name}")
         with self._lock:
             _lock_wait_end()
@@ -5647,6 +5697,7 @@ class AOTEngine:
 
         # Short-circuit: if already a TaichiGPUBuffer, return as-is (zero-copy passthrough)
         if isinstance(data, TaichiGPUBuffer):
+            _validate_gpu_buffer_owner(data, self, "upload")
             return data
 
         ext_type = self._is_external_gpu_obj(data)
@@ -5962,6 +6013,7 @@ class AOTEngine:
     def imwrite(self, path, buf):
         _heartbeat()
         _init_aot_bridge()
+        _validate_gpu_buffer_owner(buf, self, "imwrite")
         shape = tuple(buf.shape)
         if len(shape) not in (2, 3):
             raise ValueError("Native image writer supports only 2D or 3D images")
