@@ -15,6 +15,8 @@ from math import isfinite
 from threading import RLock
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from taichi_vision.backend_config import parse_policy_bool
+
 
 class EWMA:
     """Small thread-safe exponentially weighted moving average.
@@ -438,13 +440,26 @@ class ConservativeAutoTuner:
             if isinstance(contract, Mapping):
                 shape = str(contract.get("shape_transform", "unknown")).lower()
                 reduction = str(contract.get("reduction", "unknown")).lower()
+                automatic_safe = parse_policy_bool(
+                    contract.get("automatic_safe", False), default=None
+                )
+                parity_qualified = parse_policy_bool(
+                    contract.get("parity_qualified", False), default=None
+                )
+                variable_cardinality = parse_policy_bool(
+                    contract.get("variable_cardinality", False), default=None
+                )
+                side_effect = parse_policy_bool(
+                    contract.get("side_effect", contract.get("side_effects", False)),
+                    default=None,
+                )
                 return bool(
-                    contract.get("automatic_safe", False)
-                    and contract.get("parity_qualified", False)
+                    automatic_safe is True
+                    and parity_qualified is True
                     and shape in {"same", "same_shape"}
                     and reduction in {"none", "local"}
-                    and not contract.get("variable_cardinality", False)
-                    and not contract.get("side_effect", contract.get("side_effects", False))
+                    and variable_cardinality is False
+                    and side_effect is False
                 )
         except Exception:
             return False
@@ -584,6 +599,11 @@ class GraphSpec:
         if int(self.resident_bytes) < 0:
             raise ValueError("resident_bytes must be non-negative")
         object.__setattr__(self, "resident_bytes", int(self.resident_bytes))
+        backend_safe = parse_policy_bool(self.backend_safe, default=None)
+        force_boundary = parse_policy_bool(self.force_boundary, default=None)
+        object.__setattr__(self, "backend_safe", backend_safe is True)
+        # Unknown boundary metadata is unsafe and must split the recording.
+        object.__setattr__(self, "force_boundary", force_boundary is not False)
         object.__setattr__(self, "reads", tuple(str(item) for item in self.reads))
         object.__setattr__(self, "writes", tuple(str(item) for item in self.writes))
         object.__setattr__(self, "operation", None if self.operation is None else str(self.operation))
@@ -739,7 +759,7 @@ class AutoPipelinePlanner:
         self.minimum_recorded_graphs = max(2, int(minimum_recorded_graphs))
         self.unsafe_backends = {str(item).lower() for item in unsafe_backends}
         self.telemetry = telemetry if telemetry is not None else PlannerTelemetry()
-        self.autotune_enabled = bool(autotune)
+        self.autotune_enabled = parse_policy_bool(autotune, default=False) is True
         self.autotuner = autotuner if autotuner is not None else ConservativeAutoTuner(
             autotune_config,
             self.telemetry,
@@ -980,9 +1000,10 @@ class AutoPipelinePlanner:
         metadata = getattr(spec, "metadata", {}) or {}
         for key in ("requires_barrier", "force_boundary", "external_side_effect"):
             value = metadata.get(key)
-            if isinstance(value, str):
-                value = value.strip().lower() in {"1", "true", "yes", "required", "global"}
-            if bool(value):
+            parsed = parse_policy_bool(value, default=None)
+            if value is not None and parsed is None:
+                return True
+            if parsed is True:
                 return True
         hazards = metadata.get("hazards", metadata.get("hazard"))
         if hazards is None:
@@ -990,7 +1011,12 @@ class AutoPipelinePlanner:
         if isinstance(hazards, bool):
             return hazards
         if isinstance(hazards, Mapping):
-            hazards = [key for key, value in hazards.items() if value]
+            hazard_keys = []
+            for key, value in hazards.items():
+                parsed = parse_policy_bool(value, default=None)
+                if parsed is True or (value is not None and parsed is None):
+                    hazard_keys.append(key)
+            hazards = hazard_keys
         elif isinstance(hazards, str):
             hazards = hazards.replace(",", " ").split()
         try:
@@ -1056,7 +1082,8 @@ class AutoPipelinePlanner:
         previous_metadata = getattr(previous, "metadata", {}) or {}
         current_metadata = getattr(current, "metadata", {}) or {}
         if any(
-            bool(metadata.get("allow_resource_hazards"))
+            parse_policy_bool(metadata.get("allow_resource_hazards"), default=False)
+            is True
             or str(metadata.get("hazard_policy", "") or "").strip().lower()
             in {"ordered", "serial", "intra_pipeline", "safe"}
             for metadata in (previous_metadata, current_metadata)
@@ -1147,14 +1174,22 @@ class AutoPipelinePlanner:
                 try:
                     allows = getattr(contract, "allows_pipeline", None)
                     if allows is None and isinstance(contract, Mapping):
+                        known = parse_policy_bool(contract.get("known", True), default=None)
+                        variable_cardinality = parse_policy_bool(
+                            contract.get("variable_cardinality", False), default=None
+                        )
+                        side_effect = parse_policy_bool(
+                            contract.get("side_effect", contract.get("side_effects", False)),
+                            default=None,
+                        )
                         allows = bool(
-                            contract.get("known", True)
+                            known is True
                             and str(contract.get("shape_transform", "unknown")).lower()
                             in {"same", "same_shape"}
                             and str(contract.get("reduction", "unknown")).lower()
                             in {"none", "local"}
-                            and not contract.get("variable_cardinality", False)
-                            and not contract.get("side_effect", contract.get("side_effects", False))
+                            and variable_cardinality is False
+                            and side_effect is False
                         )
                     if not bool(allows):
                         return False

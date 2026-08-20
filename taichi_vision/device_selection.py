@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from taichi_vision.cuda_arch_matrix import architecture_name, normalize_compute_capability
+from taichi_vision.backend_config import parse_policy_bool
 
 
 def normalize_device_name(value: str) -> str:
@@ -668,13 +669,27 @@ def resolve_device_selector(selector, devices, cached_id=None):
 
     wanted_fingerprint = str(selector.get("fingerprint") or "")
     if wanted_fingerprint:
-        for idx, _name, record in candidates:
-            if device_fingerprint(record) == wanted_fingerprint:
-                return idx
+        fingerprint_matches = [
+            idx
+            for idx, _name, record in candidates
+            if device_fingerprint(record) == wanted_fingerprint
+        ]
+        if len(fingerprint_matches) == 1:
+            return fingerprint_matches[0]
+        if len(fingerprint_matches) > 1:
+            # Identical records without UUID/device-specific evidence are not
+            # stable identities.  Enumeration order and cached ordinals must
+            # never choose one silently.
+            return None
 
     wanted_vendor_id = _parse_int(selector.get("vendor_id"))
     wanted_device_id = _parse_int(selector.get("device_id"))
-    wanted_native = selector.get("native")
+    native_value = selector.get("native")
+    wanted_native = parse_policy_bool(native_value, default=None)
+    if native_value is not None and wanted_native is None:
+        # A malformed persisted selector must not silently become ``True``
+        # through Python truthiness or select an arbitrary adapter.
+        return None
     if wanted_vendor_id is not None and wanted_device_id is not None:
         hardware_matches = []
         for idx, _name, record in candidates:
@@ -683,23 +698,29 @@ def resolve_device_selector(selector, devices, cached_id=None):
                 and _parse_int(record.get("device_id")) == wanted_device_id
                 and (
                     wanted_native is None
-                    or bool(wanted_native) == (not is_translation_device(record))
+                    or wanted_native == (not is_translation_device(record))
                 )
             ):
                 hardware_matches.append((idx, record))
         if len(hardware_matches) == 1:
             return hardware_matches[0][0]
+        if len(hardware_matches) > 1:
+            return None
 
     if wanted_name:
-        for idx, name, record in candidates:
-            if (
-                normalize_device_name(name) == wanted_name
-                and (
-                    wanted_native is None
-                    or bool(wanted_native) == (not is_translation_device(record))
-                )
-            ):
-                return idx
+        name_matches = [
+            idx
+            for idx, name, record in candidates
+            if normalize_device_name(name) == wanted_name
+            and (
+                wanted_native is None
+                or wanted_native == (not is_translation_device(record))
+            )
+        ]
+        if len(name_matches) == 1:
+            return name_matches[0]
+        if len(name_matches) > 1:
+            return None
 
     if wanted_vendor and wanted_vendor != "unknown":
         vendor_matches = [
@@ -708,17 +729,12 @@ def resolve_device_selector(selector, devices, cached_id=None):
             if device_vendor(name) == wanted_vendor
             and (
                 wanted_native is None
-                or bool(wanted_native) == (not is_translation_device(record))
+                or wanted_native == (not is_translation_device(record))
             )
         ]
         if len(vendor_matches) == 1:
             return vendor_matches[0][0]
-        # Keep a cached ordinal only when it still identifies the same vendor.
-        try:
-            cached_id = int(cached_id)
-        except (TypeError, ValueError):
-            cached_id = None
-        for idx, _name, _record in vendor_matches:
-            if idx == cached_id:
-                return idx
+        # A vendor-only selector is ambiguous as soon as more than one
+        # matching adapter exists.  The cached ordinal is not physical
+        # identity and must not become a hidden tie-breaker.
     return None
