@@ -3018,8 +3018,20 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
   ti::Runtime *rt = engine_runtime(engine);
   ModuleLease module_lease(module_ctx);
   ModuleContext *ctx = module_lease.get();
-  if (!rt || !ctx || !ctx->module || !args_array)
+  if (!rt)
     return;
+  if (!ctx) {
+    set_engine_error(engine, "run_aot_graph: module handle is stale");
+    return;
+  }
+  if (!ctx->module) {
+    set_engine_error(engine, "run_aot_graph: module is not live");
+    return;
+  }
+  if (!args_array) {
+    set_engine_error(engine, "run_aot_graph: argument array is null");
+    return;
+  }
   if (ctx->owner != engine) {
     set_engine_error(engine,
                      "run_aot_graph: module belongs to a different runtime");

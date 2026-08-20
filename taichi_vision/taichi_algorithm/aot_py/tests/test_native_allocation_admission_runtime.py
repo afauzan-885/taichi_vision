@@ -78,6 +78,44 @@ os._exit(0)
     not (LLVM_BIN / "taichi_c_api.dll").exists(),
     reason="LLVM20 C API runtime is unavailable",
 )
+def test_compiled_graph_rejects_stale_module_handle_cleanly():
+    code = r'''
+import ctypes, importlib.util, os, sys
+from pathlib import Path
+os.environ["TI_LIB_DIR"] = r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\runtime"
+os.add_dll_directory(r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin")
+source = Path(r"taichi_vision/taichi_aot/engine.py").resolve()
+spec = importlib.util.spec_from_file_location("taichi_vision.taichi_aot.stale_module_probe", source)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module._WATCHDOG_STOP.set()
+if getattr(module, "_watchdog", None) is not None:
+    module._watchdog.join(timeout=2)
+tcm = next(Path(r"taichi_vision/taichi_algorithm/aot_tcm/cpu_x86_64_windows").glob("bilinear_demosaice*.tcm"))
+module_ptr = module._LIB.load_aot_module(module.engine.runtime, str(tcm).encode())
+assert module_ptr
+module._LIB.destroy_aot_module(module_ptr)
+module._LIB.run_aot_graph(module.engine.runtime, module_ptr, b"pure_bilinear_demosaice", None, 0)
+assert "stale" in (module._get_native_engine_error(module.engine.runtime) or "")
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="compiled bridge smoke is Windows-specific")
+@pytest.mark.skipif(not BRIDGE.exists(), reason="publish CPU bridge is not built")
+@pytest.mark.skipif(
+    not (LLVM_BIN / "taichi_c_api.dll").exists(),
+    reason="LLVM20 C API runtime is unavailable",
+)
 def test_compiled_graph_rejects_foreign_runtime_dynamic_arg_before_launch():
     code = r'''
 import ctypes, importlib.util, os, sys

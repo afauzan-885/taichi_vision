@@ -36,6 +36,8 @@ def test_native_pipeline_module_handles_are_leased():
 
 
 def test_graph_and_pipeline_replay_reject_cross_runtime_or_stale_modules():
+    assert '"run_aot_graph: module handle is stale"' in SOURCE
+    assert '"run_aot_graph: module is not live"' in SOURCE
     assert '"run_aot_graph: module belongs to a different runtime"' in SOURCE
     assert '"run_pipeline: module belongs to a different runtime"' in SOURCE
     assert '"run_pipeline: module handle is stale"' in SOURCE
