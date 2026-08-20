@@ -435,3 +435,82 @@ os._exit(0)
         timeout=90,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="compiled bridge smoke is Windows-specific")
+@pytest.mark.skipif(not BRIDGE.exists(), reason="publish CPU bridge is not built")
+@pytest.mark.skipif(
+    not (LLVM_BIN / "taichi_c_api.dll").exists(),
+    reason="LLVM20 C API runtime is unavailable",
+)
+def test_compiled_concurrent_graph_replay_and_module_destroy_is_safe():
+    code = r'''
+import ctypes, os, threading
+from pathlib import Path
+os.add_dll_directory(r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin")
+os.environ["TI_LIB_DIR"] = r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\runtime"
+d = ctypes.WinDLL(str(Path(r"taichi_vision/taichi_algorithm/aot_py/taichi_aot_engine.dll").resolve()))
+class DynamicArg(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("arg_type", ctypes.c_int), ("dtype", ctypes.c_int), ("dim_count", ctypes.c_int), ("shape", ctypes.c_int * 8), ("elem_dim_count", ctypes.c_int), ("elem_shape", ctypes.c_int * 8), ("is_vector", ctypes.c_int), ("vector_dim", ctypes.c_int), ("val_u64", ctypes.c_uint64)]
+d.init_aot_engine.argtypes = [ctypes.c_int, ctypes.c_int]
+d.init_aot_engine.restype = ctypes.c_void_p
+d.load_aot_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+d.load_aot_module.restype = ctypes.c_void_p
+d.destroy_aot_module.argtypes = [ctypes.c_void_p]
+d.allocate_gpu_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+d.allocate_gpu_buffer.restype = ctypes.c_void_p
+d.run_aot_graph.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(DynamicArg), ctypes.c_int]
+d.get_last_engine_error.argtypes = [ctypes.c_void_p]
+d.get_last_engine_error.restype = ctypes.c_char_p
+runtime = d.init_aot_engine(2, 0)
+assert runtime
+tcm = next(Path(r"taichi_vision/taichi_algorithm/aot_tcm/cpu_x86_64_windows").glob("bilinear_demosaice*.tcm"))
+def make_args():
+    h = w = 256
+    bayer = d.allocate_gpu_buffer(runtime, h * w * 4, 1)
+    dst = d.allocate_gpu_buffer(runtime, h * w * 3 * 4, 1)
+    assert bayer and dst
+    specs = [(b"bayer", 0, 0, 2, bayer), (b"dst", 0, 0, 3, dst), (b"black", 1, 0, 0, 0), (b"white", 1, 0, 0, 65535), (b"h", 1, 1, 0, h), (b"w", 1, 1, 0, w), (b"c00", 1, 1, 0, 0), (b"c01", 1, 1, 0, 1), (b"c10", 1, 1, 0, 3), (b"c11", 1, 1, 0, 2)]
+    args = (DynamicArg * len(specs))()
+    for i, (name, arg_type, dtype, dim_count, value) in enumerate(specs):
+        args[i].name = name
+        args[i].arg_type = arg_type
+        args[i].dtype = dtype
+        args[i].dim_count = dim_count
+        if arg_type == 0:
+            args[i].shape[0] = h
+            args[i].shape[1] = w
+            if dim_count == 3:
+                args[i].shape[2] = 3
+        args[i].val_u64 = value
+    return args
+for _ in range(8):
+    module_ptr = d.load_aot_module(runtime, str(tcm).encode())
+    assert module_ptr
+    args = make_args()
+    started = threading.Event()
+    errors = []
+    def replay():
+        try:
+            started.set()
+            for _ in range(96):
+                d.run_aot_graph(runtime, module_ptr, b"pure_bilinear_demosaice", args, 10)
+        except BaseException as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=replay)
+    worker.start()
+    assert started.wait(2)
+    d.destroy_aot_module(module_ptr)
+    worker.join(30)
+    assert not worker.is_alive()
+    assert not errors
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
