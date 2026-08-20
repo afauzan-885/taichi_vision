@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 import sys
 import types
 
-from taichi_vision.taichi_aot import capabilities
+
+_CAPABILITIES_PATH = Path(__file__).resolve().parents[1] / "capabilities.py"
+_CAPABILITIES_NAME = "taichi_aot_capabilities_test_probe"
+_SPEC = importlib.util.spec_from_file_location(_CAPABILITIES_NAME, _CAPABILITIES_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+capabilities = importlib.util.module_from_spec(_SPEC)
+sys.modules[_CAPABILITIES_NAME] = capabilities
+_SPEC.loader.exec_module(capabilities)
 
 
 def _install_probe(monkeypatch, callback):
