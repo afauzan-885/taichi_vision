@@ -33,3 +33,10 @@ def test_native_pipeline_module_handles_are_leased():
     assert "ModuleLease module_lease(step.module_ctx)" in SOURCE
     assert "begin_module_destroy" in SOURCE
     assert "finish_module_destroy" in SOURCE
+
+
+def test_graph_and_pipeline_replay_reject_cross_runtime_or_stale_modules():
+    assert '"run_aot_graph: module belongs to a different runtime"' in SOURCE
+    assert '"run_pipeline: module belongs to a different runtime"' in SOURCE
+    assert '"run_pipeline: module handle is stale"' in SOURCE
+    assert "ctx->owner != engine" in SOURCE

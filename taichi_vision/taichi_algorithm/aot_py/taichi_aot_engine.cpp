@@ -2804,6 +2804,11 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
   ModuleContext *ctx = module_lease.get();
   if (!rt || !ctx || !ctx->module || !args_array)
     return;
+  if (ctx->owner != engine) {
+    set_engine_error(engine,
+                     "run_aot_graph: module belongs to a different runtime");
+    return;
+  }
 
   try {
     FILE *entry_log = is_debug_logging_enabled() ? fopen("engine_debug.log", "a") : nullptr;
@@ -2997,8 +3002,15 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
     for (auto &step : pipe.steps) {
       ModuleLease module_lease(step.module_ctx);
       ModuleContext *ctx = module_lease.get();
-      if (!ctx)
-        continue;
+      if (!ctx) {
+        set_engine_error(engine, "run_pipeline: module handle is stale");
+        return;
+      }
+      if (ctx->owner != engine) {
+        set_engine_error(engine,
+                         "run_pipeline: module belongs to a different runtime");
+        return;
+      }
 
       std::lock_guard<std::mutex> lock(ctx->cache_mutex);
       auto it_g = ctx->graph_cache.find(step.graph_name);
