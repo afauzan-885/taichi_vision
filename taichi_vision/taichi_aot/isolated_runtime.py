@@ -148,8 +148,10 @@ class IsolatedRuntime:
         self._request_id = 0
         self._responses: queue.Queue = queue.Queue()
         self._write_lock = threading.Lock()
+        self._cleanup_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._dead = False
+        self._closed = False
         self._reader = threading.Thread(
             target=self._read_responses,
             name=f"AOT-IsolatedRuntime-{process.pid}",
@@ -189,7 +191,11 @@ class IsolatedRuntime:
             [sys.executable, os.fspath(Path(__file__).resolve()), "--worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            # Worker diagnostics are returned through the bounded IPC error
+            # field. Never inherit the parent's stderr handle: if the parent
+            # takes a fatal hard-exit path, a blocked native worker must not
+            # keep the caller's captured stderr pipe open indefinitely.
+            stderr=subprocess.DEVNULL,
             env=env,
             cwd=os.getcwd(),
             bufsize=1,
@@ -218,7 +224,7 @@ class IsolatedRuntime:
 
     @property
     def alive(self) -> bool:
-        return not self._dead and self.process.poll() is None
+        return not self._dead and not self._closed and self.process.poll() is None
 
     def _read_responses(self) -> None:
         stream = self.process.stdout
@@ -248,13 +254,70 @@ class IsolatedRuntime:
             self._dead = True
         raise IsolatedRuntimeError(_bounded_text(reason))
 
+    def _reap_child(self) -> None:
+        """Terminate, kill if needed, and reap the worker process.
+
+        This is deliberately independent of the IPC request path.  A native
+        call may be stuck forever, so graceful ``destroy`` cannot be the only
+        cleanup mechanism after a timeout or an abnormal child exit.
+        """
+
+        process = self.process
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except (OSError, ValueError):
+                pass
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    # The caller still gets a bounded runtime error.  Keep
+                    # the process handle available for a later poll rather
+                    # than claiming that reaping succeeded.
+                    pass
+
+    def _abort(self) -> None:
+        """Make the session unusable and synchronously clean its child."""
+
+        with self._cleanup_lock:
+            with self._state_lock:
+                self._dead = True
+                self._closed = True
+            stdin = self.process.stdin
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except (OSError, ValueError):
+                    pass
+            self._reap_child()
+            if self._reader is not threading.current_thread() and self._reader.is_alive():
+                self._reader.join(timeout=0.5)
+            stdout = self.process.stdout
+            if stdout is not None:
+                try:
+                    stdout.close()
+                except (OSError, ValueError):
+                    pass
+            if self._reader is not threading.current_thread() and self._reader.is_alive():
+                self._reader.join(timeout=1.0)
+            self.runtime = None
+
     def _request(self, opcode: str, payload: dict[str, Any], *, timeout=None) -> dict[str, Any]:
         timeout = self.timeout if timeout is None else max(0.1, float(timeout))
         with self._write_lock:
             with self._state_lock:
-                if self._dead or self.process.poll() is not None:
+                if self._dead or self._closed or self.process.poll() is not None:
                     self._dead = True
-                    raise IsolatedRuntimeError("isolated AOT runtime worker is not alive")
+                    reason = "isolated AOT runtime worker is not alive"
+                    self._abort()
+                    raise IsolatedRuntimeError(reason)
                 self._request_id += 1
                 request_id = self._request_id
                 request = {
@@ -271,14 +334,14 @@ class IsolatedRuntime:
                     self.process.stdin.write(encoded + "\n")
                     self.process.stdin.flush()
                 except (BrokenPipeError, OSError) as exc:
-                    self._dead = True
+                    self._abort()
                     raise IsolatedRuntimeError(f"isolated runtime IPC write failed: {exc}") from exc
 
             deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.close(force=True)
+                    self._abort()
                     raise IsolatedRuntimeError(
                         f"isolated AOT runtime operation '{opcode}' timed out after {timeout:.1f}s"
                     )
@@ -291,7 +354,7 @@ class IsolatedRuntime:
                 except queue.Empty:
                     code = self.process.poll()
                     if code is not None:
-                        self._dead = True
+                        self._abort()
                         raise IsolatedRuntimeError(
                             f"isolated AOT runtime worker exited unexpectedly (code={code})"
                         )
@@ -300,13 +363,13 @@ class IsolatedRuntime:
                     # responsiveness slice as the full timeout.
                     continue
                 if response is None:
-                    self._dead = True
                     code = self.process.poll()
+                    self._abort()
                     raise IsolatedRuntimeError(
                         f"isolated AOT runtime worker exited unexpectedly (code={code})"
                     )
                 if isinstance(response, Exception):
-                    self._dead = True
+                    self._abort()
                     raise response
                 if int(response.get("request_id", -1)) != request_id:
                     continue
@@ -505,25 +568,15 @@ class IsolatedRuntime:
 
     def destroy(self, *, force=False) -> None:
         with self._state_lock:
-            if self._dead:
-                return
-        if not force:
-            try:
-                self._request("destroy", {}, timeout=min(self.timeout, 5.0))
-            except Exception:
-                pass
-        with self._state_lock:
-            self._dead = True
-        if self.process.poll() is None:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-        self.runtime = None
+            already_closed = self._closed
+        if already_closed or force:
+            self._abort()
+            return
+        try:
+            self._request("destroy", {}, timeout=min(self.timeout, 5.0))
+        except Exception:
+            pass
+        self._abort()
 
     close = destroy
 
@@ -652,7 +705,15 @@ class BridgeRouter:
 
     def clear_pipeline_for_engine(self, runtime, name):
         session = self._session(runtime)
-        return session.clear_pipeline_for_runtime(runtime, name) if session else self.native.clear_pipeline_for_engine(runtime, name)
+        if session:
+            return session.clear_pipeline_for_runtime(runtime, name)
+        clear_for_engine = getattr(self.native, "clear_pipeline_for_engine", None)
+        if clear_for_engine is None:
+            raise IsolatedRuntimeError(
+                "native bridge does not provide engine-scoped pipeline clearing; "
+                "refusing unsafe process-global pipeline deletion"
+            )
+        return clear_for_engine(runtime, name)
 
     def sync_runtime(self, runtime):
         session = self._session(runtime)
@@ -918,8 +979,12 @@ class _Worker:
             lib.run_pipeline(self.runtime, str(payload["pipeline"]).encode(), handles, args, len(args)); self._capture_error(); return {}
         if opcode == "clear_pipeline_module": lib.clear_pipeline(self._ptr(payload["module"], self.modules), str(payload["name"]).encode()); self._capture_error(); return {}
         if opcode == "clear_pipeline_runtime":
-            if hasattr(lib, "clear_pipeline_for_engine"): lib.clear_pipeline_for_engine(self.runtime, str(payload["name"]).encode())
-            else: lib.clear_pipeline(None, str(payload["name"]).encode())
+            if not hasattr(lib, "clear_pipeline_for_engine"):
+                raise IsolatedRuntimeError(
+                    "native bridge does not provide engine-scoped pipeline clearing; "
+                    "refusing unsafe process-global pipeline deletion"
+                )
+            lib.clear_pipeline_for_engine(self.runtime, str(payload["name"]).encode())
             self._capture_error(); return {}
         if opcode == "sync": lib.sync_runtime(self.runtime); self._capture_error(); return {}
         if opcode == "imread":

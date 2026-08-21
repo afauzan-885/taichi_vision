@@ -4604,10 +4604,13 @@ class AOTEngine:
         """Safely erases a pipeline from C++ and forces destruction of its intermediate buffers."""
         name = str(name)
         with self._lock:
+            # Native pipeline names are scoped to an EngineContext.  Do not
+            # fall back to the legacy nullptr owner: that compatibility API
+            # broadcasts a clear to every live engine and can delete an
+            # unrelated same-named pipeline.
+            self._clear_native_pipeline(name)
             if name in self.recorded_pipelines:
                 self.recorded_pipelines.remove(name)
-            encoded_name = name.encode("utf-8")
-            self._clear_native_pipeline(name)
             recordings = getattr(self, "_pipeline_recordings", None)
             if recordings is not None:
                 recordings.pop(name, None)
@@ -4631,9 +4634,10 @@ class AOTEngine:
         if clear_for_engine is not None and getattr(self, "runtime", None):
             clear_for_engine(self.runtime, encoded_name)
             return
-        # Compatibility with an older bridge; the current bridge always uses
-        # the engine-scoped symbol above to avoid process-global broadcasts.
-        _LIB.clear_pipeline(None, encoded_name)
+        raise RuntimeError(
+            "native bridge does not provide engine-scoped pipeline clearing; "
+            "refusing unsafe process-global pipeline deletion"
+        )
 
     def clear_pipelines(self):
         """Clear all registered pipelines and destroy their intermediate buffers."""

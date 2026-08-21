@@ -30,6 +30,7 @@ def test_native_engine_scoped_clear_is_exposed_and_used():
     end = SOURCE.index("def clear_pipelines", start)
     block = SOURCE[start:end]
     assert "clear_for_engine(self.runtime" in block
+    assert "_LIB.clear_pipeline(None" not in block
 
 
 def test_engine_destroy_clears_pipelines_before_unloading_modules():

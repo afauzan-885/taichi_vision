@@ -56,3 +56,12 @@ def test_module_retirement_invalidates_owner_pipeline_steps_before_delete():
     invalidate_source = SOURCE[invalidate_start:invalidate_end]
     assert "step.module_ctx == ctx" in invalidate_source
     assert "owner->pipelines.erase" in invalidate_source
+
+
+def test_legacy_null_pipeline_clear_cannot_broadcast_across_engines():
+    start = SOURCE.index("EXPORT void clear_pipeline(")
+    end = SOURCE.index("EXPORT void clear_pipeline_for_engine", start)
+    body = SOURCE[start:end]
+    assert "if (!mod || !mod->owner || !pipeline_name)" in body
+    assert "for (auto *ctx : engine_contexts)" not in body
+    assert "global_pipelines.erase" not in body

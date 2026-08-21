@@ -11,9 +11,17 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[4]
-BRIDGE = ROOT / "taichi_vision" / "taichi_algorithm" / "aot_py" / "taichi_aot_engine.dll"
+BRIDGE = Path(
+    os.environ.get(
+        "PIXEL_REFINE_TEST_BRIDGE",
+        str(ROOT / "taichi_vision" / "taichi_algorithm" / "aot_py" / "taichi_aot_engine.dll"),
+    )
+)
 LLVM_BIN = Path(
-    r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin"
+    os.environ.get(
+        "PIXEL_REFINE_TAICHI_C_API_DIR",
+        r"D:\development_build\taichi_runtime_llvm20\release-runtime\taichi\_lib\c_api\bin",
+    )
 )
 
 

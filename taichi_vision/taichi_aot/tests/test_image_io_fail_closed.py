@@ -58,6 +58,12 @@ def test_writer_records_bounded_native_failure_diagnostics():
         assert operation in body
 
 
+def test_writer_rejects_wic_format_substitution_instead_of_reinterpreting_bytes():
+    body = _function_body("bool ti_imwrite_from_gpu")
+    assert "expected_format" in body
+    assert "unsupported WIC pixel-format conversion" in body
+
+
 def test_reader_exposes_handle_only_after_checked_pixel_copy():
     body = _function_body("void *ti_imread_to_gpu")
     return_pos = body.rindex("return (void *)gpu_mem")
@@ -65,3 +71,19 @@ def test_reader_exposes_handle_only_after_checked_pixel_copy():
 
     assert copy_check_pos < return_pos
     assert "ti_free_memory" in body[copy_check_pos:return_pos]
+
+
+def test_reader_records_bounded_diagnostics_before_every_early_failure():
+    body = _function_body("void *ti_imread_to_gpu")
+    for diagnostic in (
+        "native graphics context is not ready",
+        "invalid runtime, path, or output pointers",
+        "WIC factory initialization failed",
+        "WIC decoder creation failed",
+        "WIC frame acquisition failed",
+        "WIC frame dimensions are invalid",
+        "WIC pixel format query failed",
+        "decoded image geometry is unsupported or overflows",
+        "GPU allocation failed",
+    ):
+        assert diagnostic in body
