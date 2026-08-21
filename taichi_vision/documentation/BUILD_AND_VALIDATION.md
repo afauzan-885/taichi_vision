@@ -2,6 +2,10 @@
 
 ## Build
 
+Run commands from the maintained `taichi_vision` package namespace. The
+retired `taichi_library` namespace and the `taichi_vision copy` snapshot must
+not be used for compilation, tests, or wheel assembly.
+
 Family compiler scripts live beside their kernels. Shared orchestration lives
 in `taichi_algorithm/aot_py/`; target artifacts live in
 `taichi_algorithm/aot_tcm/<target>/`.

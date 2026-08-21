@@ -2,6 +2,11 @@
 
 This folder is the developer reference hub for `taichi_vision`.
 
+`taichi_vision` is the single maintained package boundary. Do not import or
+build through the retired `taichi_library` namespace, and do not use the
+obsolete `taichi_vision copy` snapshot. Existing archives or historical Git
+records with those names are migration history only.
+
 ## Documentation map
 
 | Document | Contents |
