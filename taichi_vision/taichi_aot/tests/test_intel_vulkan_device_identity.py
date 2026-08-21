@@ -43,6 +43,9 @@ def test_intel_policy_uses_evaluated_ordinal_not_aot_device(monkeypatch):
         "name": "Intel Arc Test Adapter",
         "vendor": "intel",
         "ordinal": 1,
+        "api_version": "1.3",
+        "features": {"compute": True, "ssbo": True},
+        "capability_source": "vulkan-probe",
     }
 
     result = capabilities.classify_device(device, "vulkan")
@@ -66,6 +69,9 @@ def test_changing_global_aot_device_cannot_change_explicit_device_result(monkeyp
         "name": "Intel UHD Test Adapter",
         "vendor": "intel",
         "ordinal": 2,
+        "api_version": "1.3",
+        "features": {"compute": True, "ssbo": True},
+        "capability_source": "vulkan-probe",
     }
 
     monkeypatch.setenv("AOT_DEVICE", "0")
@@ -87,7 +93,15 @@ def test_intel_device_without_exact_ordinal_fails_closed(monkeypatch):
 
     _install_probe(monkeypatch, should_not_be_called)
 
-    result = capabilities.classify_device("Intel Arc Test Adapter", "vulkan")
+    result = capabilities.classify_device(
+        {
+            "name": "Intel Arc Test Adapter",
+            "api_version": "1.3",
+            "features": {"compute": True, "ssbo": True},
+            "capability_source": "vulkan-probe",
+        },
+        "vulkan",
+    )
     candidates = capabilities.backend_candidates("Intel Arc Test Adapter")
 
     assert result.safe is False

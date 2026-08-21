@@ -269,6 +269,7 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
     result = {"device_ordinal": ordinal}
     workgroup_values = []
     collect_workgroup = False
+    queue_compute_seen = False
     started = time.monotonic()
     try:
         assert process.stdout is not None
@@ -284,6 +285,9 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
                     break
                 continue
             if current != ordinal:
+                continue
+            if stripped.startswith("queueFlags"):
+                queue_compute_seen = queue_compute_seen or "COMPUTE" in stripped.upper()
                 continue
             if collect_workgroup:
                 if stripped.isdigit():
@@ -318,7 +322,47 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
             f"Incomplete Vulkan limits for ordinal {ordinal}: "
             + ", ".join(sorted(missing))
         )
+    if queue_compute_seen:
+        result["features"] = {
+            "compute": True,
+            "ssbo": (
+                int(result.get("maxPerStageDescriptorStorageBuffers", 0)) > 0
+                or int(result.get("maxDescriptorSetStorageBuffers", 0)) > 0
+            ),
+        }
+        result["capability_source"] = "vulkaninfo-probe"
     return result
+
+
+def query_vulkan_capability_snapshot(device_id: int, timeout=30.0) -> dict:
+    """Return one physical-device capability record for backend admission.
+
+    The API/version identity comes from the same ``vulkaninfo`` inventory as
+    device selection, while queue/storage evidence comes from the selected
+    device's limits.  Missing evidence is an error rather than an optimistic
+    ``COMPUTE``/``SSBO`` default.
+    """
+
+    ordinal = int(device_id)
+    records = scan_vulkan_device_records(timeout=timeout)
+    record = next(
+        (item for item in records if int(item.get("ordinal", -1)) == ordinal),
+        None,
+    )
+    if record is None:
+        raise LookupError(f"Vulkan device ordinal {ordinal} was not enumerated")
+    limits = query_vulkan_device_limits(ordinal, timeout=timeout)
+    features = limits.get("features")
+    if not isinstance(features, dict):
+        raise RuntimeError(
+            f"Vulkan capability evidence is incomplete for ordinal {ordinal}"
+        )
+    return {
+        **record,
+        **limits,
+        "features": features,
+        "capability_source": "vulkaninfo-probe",
+    }
 
 
 def query_vulkan_memory_budget(device_id: int) -> dict:

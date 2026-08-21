@@ -50,3 +50,22 @@ def test_invalidation_defers_detach_and_blocks_new_leases():
 
     assert cache.size_bytes == 0
     assert len(cache) == 0
+
+
+def test_collect_subtracts_owner_bytes_once():
+    cache = BlockCache(max_entries=4, max_bytes=64)
+    for block_id in ("first", "second"):
+        cache.put(
+            BlockRecord(
+                block_id,
+                state=BlockState.READY,
+                data=bytearray(b"12345678"),
+                owner="test",
+            )
+        )
+
+    cache.max_bytes = 8
+    cache.collect()
+
+    assert cache.size_bytes == 8
+    assert cache.owner_bytes == {"test": 8}
