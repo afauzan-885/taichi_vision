@@ -142,7 +142,7 @@ def _write_prefix_code(writer: BitWriter, lengths: list[int]) -> dict[int, tuple
         only = int(np.flatnonzero(code_length_frequencies)[0])
         companion = 0 if only != 0 else 1
         code_length_frequencies[companion] = 1
-    code_length_lengths = _bounded_huffman_lengths(code_length_frequencies, max_bits=7)
+    code_length_lengths = _bounded_huffman_lengths(code_length_frequencies)
     active_code_lengths = [symbol for symbol, length in enumerate(code_length_lengths) if length > 0]
     positions = {symbol: index for index, symbol in enumerate(_CODE_LENGTH_ORDER)}
     if any(symbol not in positions for symbol in active_code_lengths):

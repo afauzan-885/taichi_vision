@@ -422,7 +422,7 @@ def reconstruct_pair(
         # must be observable instead of looking like native AOT execution.
         report.add_warning(
             "backend_boundary=host-reference: auto pairwise SfM uses the "
-            "maintained NumPy pose selector; use backend='numpy' "
+            "maintained NumPy/OpenCV pose selector; use backend='numpy' "
             "to make that choice explicit"
         )
         report.metrics["backend_fallback_count"] = 1.0

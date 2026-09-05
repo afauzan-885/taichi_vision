@@ -269,14 +269,6 @@ _TRI_TABLE = [
 # PYTHON API
 # =============================================================================
 
-def _ensure_taichi_runtime():
-    """Initialize the lightweight JIT runtime when this family is used alone."""
-    if not TAICHI_AVAILABLE:
-        return
-    runtime = ti.lang.impl.get_runtime()
-    if getattr(runtime, "prog", None) is None:
-        ti.init(arch=ti.cpu, offline_cache=False)
-
 def poisson_reconstruct(
     points,
     normals=None,
@@ -317,21 +309,13 @@ def poisson_reconstruct(
     norms = np.maximum(norms, 1e-10)
     normals = normals / norms
 
-    # The module can be imported while AOT_MODE=0 and called after another
-    # test/application changes the process environment.  In AOT mode this
-    # family has no native Taichi artifact, so keep the reference path active
-    # instead of invoking an uninitialized JIT runtime.
-    if not TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") != "0":
+    if not TAICHI_AVAILABLE:
         return _poisson_numpy(
             points, normals, grid_resolution, solver_iterations,
             iso_threshold, dilate_radius, omega
         )
 
-    # JIT path can be imported without the application bootstrap.  Initialize
-    # Taichi lazily so direct callers do not hit ``Please call init() first``.
-    _ensure_taichi_runtime()
-
-    # GPU/JIT path
+    # GPU path
     # 1. Compute grid bounds
     bbox_min = points.min(axis=0) - 1e-3
     bbox_max = points.max(axis=0) + 1e-3

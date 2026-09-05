@@ -169,14 +169,18 @@ def _codec_matrix() -> dict[str, dict[str, Any]]:
         dng = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
     return {
         "jpeg": {
-            "status": "production_qualified",
+            "status": "development_qualification",
             "general_pixel_encoder": True,
             "gpu_numeric_stages": True,
             "gpu_full_codec": False,
             "subsampling": ["444", "422", "420"],
             "optimized_huffman": True,
             "restart_markers": True,
-            "production_blockers": [],
+            "production_blockers": [
+                "12MP target is not met",
+                "strict NumPy-free native ABI is not complete",
+                "GLES runtime qualification is pending",
+            ],
         },
         "heif_heic": {
             "status": "development_bounded_profile",
@@ -271,20 +275,26 @@ def _codec_matrix() -> dict[str, dict[str, Any]]:
             ],
         },
         "png": {
-            "status": "production_qualified",
+            "status": "development_qualification",
             "general_pixel_encoder": True,
             "gpu_numeric_stages": True,
             "gpu_full_codec": False,
             "lossless": True,
-            "production_blockers": [],
+            "production_blockers": [
+                "full-format corpus, metadata, and device matrix are pending",
+                "strict NumPy-free host ABI is not complete",
+            ],
         },
         "webp": {
-            "status": "production_qualified",
+            "status": "development_qualification",
             "general_pixel_encoder": True,
             "gpu_numeric_stages": True,
             "gpu_full_codec": False,
             "lossless": True,
-            "production_blockers": [],
+            "production_blockers": [
+                "full decoder corpus and device matrix are pending",
+                "strict NumPy-free host ABI is not complete",
+            ],
         },
         "dng": {
             "status": "strong_limited_profile",

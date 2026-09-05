@@ -220,41 +220,43 @@ def align_mtb(ref_img: np.ndarray, target_img: np.ndarray, max_levels: int = 6, 
 
 
 def align_mtb_complex(ref_img: np.ndarray, target_img: np.ndarray, max_kps: int = 1000, ransac_thresh: float = 3.0):
-    """Feature-based refinement using OFB and the canonical AOT graphs.
+    """Feature-based refinement using OFB detector + GPU descriptors/matcher + RANSAC homography.
 
     Returns:
         dict with keys: 'homography'(3x3 or None), 'matches' (list), 'kps_ref', 'kps_tgt', 'inliers' (mask)
     """
+    import cv2
+
     # 1. Optionally compute coarse translation via MTB to quickly align
     try:
         dx, dy = align_mtb(ref_img, target_img)
     except Exception:
         dx, dy = 0, 0
 
-    from ..aot_api import find_homography, warp_perspective
-
-    # Apply coarse translation through the canonical warp TCM graph.
+    # Apply coarse translation to target for better matching (use cv2.warpAffine)
     h, w = ref_img.shape[:2]
-    M = np.array(
-        [[1, 0, dx], [0, 1, dy], [0, 0, 1]], dtype=np.float32
-    )
-    tgt_warp = warp_perspective(target_img, M, (w, h), return_gpu=False)
+    M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+    tgt_warp = cv2.warpAffine(target_img, M, (w, h), flags=cv2.INTER_LINEAR)
 
     # 2. Detect keypoints using OFB detector (GPU)
     try:
-        from ..feature_matching.ofb import detect_ofb_keypoints
-    except Exception as exc:
-        raise RuntimeError("OFB TCM detector is required for MTB refinement") from exc
+        from ..features.ofb import detect_ofb_keypoints
+    except Exception:
+        detect_ofb_keypoints = None
 
-    ref_gray = np.mean(ref_img, axis=2) if ref_img.ndim == 3 else ref_img
-    tgt_gray = np.mean(tgt_warp, axis=2) if tgt_warp.ndim == 3 else tgt_warp
-    kps_ref = detect_ofb_keypoints(ref_gray, max_kps=max_kps)
-    kps_tgt = detect_ofb_keypoints(tgt_gray, max_kps=max_kps)
+    if detect_ofb_keypoints is None:
+        # fallback to ORB if OFB not available
+        orb = cv2.ORB_create(nfeatures=max_kps)
+        kps_ref = orb.detect(cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY), None)
+        kps_tgt = orb.detect(cv2.cvtColor(tgt_warp, cv2.COLOR_BGR2GRAY), None)
+    else:
+        kps_ref = detect_ofb_keypoints(cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY), max_kps=max_kps)
+        kps_tgt = detect_ofb_keypoints(cv2.cvtColor(tgt_warp, cv2.COLOR_BGR2GRAY), max_kps=max_kps)
 
     # 3. Compute descriptors on GPU via wrappers
     try:
-        desc_ref = compute_descriptors_gpu(ref_gray, kps_ref, max_kps=max_kps)
-        desc_tgt = compute_descriptors_gpu(tgt_gray, kps_tgt, max_kps=max_kps)
+        desc_ref = compute_descriptors_gpu(cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY), kps_ref, max_kps=max_kps)
+        desc_tgt = compute_descriptors_gpu(cv2.cvtColor(tgt_warp, cv2.COLOR_BGR2GRAY), kps_tgt, max_kps=max_kps)
     except Exception:
         desc_ref = None
         desc_tgt = None
@@ -276,13 +278,8 @@ def align_mtb_complex(ref_img: np.ndarray, target_img: np.ndarray, max_kps: int 
         if len(pts_ref) >= 4:
             pts_ref_np = np.array(pts_ref, dtype=np.float32)
             pts_tgt_np = np.array(pts_tgt, dtype=np.float32)
-            H, mask = find_homography(
-                pts_tgt_np,
-                pts_ref_np,
-                method="RANSAC",
-                ransacReprojThreshold=ransac_thresh,
-            )
-            inliers = mask.reshape(-1).tolist() if mask is not None else None
+            H, mask = cv2.findHomography(pts_tgt_np, pts_ref_np, cv2.RANSAC, ransac_thresh)
+            inliers = mask.ravel().tolist() if mask is not None else None
         else:
             H = None
             inliers = None
@@ -335,7 +332,9 @@ def compute_descriptors_gpu(img_gray: np.ndarray, keypoints: list, max_kps: int 
     if ofb is None:
         raise ImportError("OFB module not available for GPU descriptors")
 
-    # Convert the dependency-free keypoint list to numpy (y, x).
+    # Convert keypoints list (cv2.KeyPoint) to numpy (y,x)
+    import cv2
+
     h, w = img_gray.shape[:2]
     kps_np = np.zeros((max_kps, 2), dtype=np.float32)
     for i, kp in enumerate(keypoints[:max_kps]):

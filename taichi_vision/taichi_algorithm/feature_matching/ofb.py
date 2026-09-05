@@ -3,16 +3,13 @@ import math
 import numpy as np
 
 
-class KeyPoint:
-    """Small dependency-free keypoint value used by the AOT feature path."""
+class TaichiKeyPoint:
+    """Small OpenCV-compatible point record without importing OpenCV."""
 
-    def __init__(self, x, y, size=1.0, angle=-1, response=0, octave=0, class_id=-1):
+    def __init__(self, x, y, size=15.0, response=0.0):
         self.pt = (float(x), float(y))
         self.size = float(size)
-        self.angle = float(angle)
         self.response = float(response)
-        self.octave = int(octave)
-        self.class_id = int(class_id)
 
 @ti.func
 def get_circle_offset(i: ti.template()):
@@ -318,7 +315,7 @@ except ImportError:
 def detect_ofb_keypoints(img_gray: np.ndarray, max_kps: int = 1000, grid_size: int = 30, threshold: float = 0.05) -> list:
     """
     Ekstrak keypoint menggunakan algoritma Optical Flow Based (OFB) FAST + ANMS Grid.
-    Mengembalikan list berisi objek :class:`KeyPoint` tanpa OpenCV.
+    Mengembalikan list berisi objek TaichiKeyPoint dengan atribut ``pt``.
     """
     if len(img_gray.shape) == 3:
         img_gray = common.cvtColor(img_gray, common.COLOR_BGR2GRAY)
@@ -352,5 +349,5 @@ def detect_ofb_keypoints(img_gray: np.ndarray, max_kps: int = 1000, grid_size: i
     common.release_temp_buffer(keypoints_gpu)
     common.release_temp_buffer(counter_gpu)
     
-    # kps_np berisi (y, x), sedangkan API keypoint publik menggunakan (x, y).
-    return [KeyPoint(float(x), float(y), 15) for y, x in kps_np]
+    # kps_np berisi (y, x); the public point record uses (x, y).
+    return [TaichiKeyPoint(float(x), float(y), 15.0) for y, x in kps_np]

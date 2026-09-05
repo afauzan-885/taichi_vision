@@ -43,7 +43,9 @@ class GlobalReductionContractTests(unittest.TestCase):
         self.assertEqual(
             record["adapter_registered"], "histogram" in before
         )
-        self.assertFalse(record["semantic_cpu_partition"])
+        self.assertEqual(
+            record["semantic_cpu_partition"], "histogram" in before
+        )
         self.assertFalse(record["native_partition_evidence"])
         self.assertFalse(record["native_runtime"])
         self.assertTrue(record["preserves_default_full_frame"])

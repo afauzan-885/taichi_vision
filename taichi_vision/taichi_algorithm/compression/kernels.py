@@ -223,159 +223,17 @@ def quantize_dct_chroma_blocks_kernel(src: ti.types.ndarray(), dst: ti.types.nda
         dst[by, bx, v, u] = ti.round(0.25 * cu * cv * total / q)
 
 
-@ti.func
-def _jpeg_aan_scale_1d(k: ti.i32) -> ti.f32:
-    val = 0.3535533905932738
-    if k == 1:
-        val = 0.25489703495209
-    elif k == 2:
-        val = 0.2705980500730985
-    elif k == 3:
-        val = 0.30067244346752264
-    elif k == 4:
-        val = 0.3535533905932738
-    elif k == 5:
-        val = 0.4499881115682078
-    elif k == 6:
-        val = 0.6532814824381883
-    elif k == 7:
-        val = 1.281457723870753
-    return val
-
-
 @ti.kernel
 def jpeg_quantize_dct_zigzag_flat2d_kernel(src: ti.types.ndarray(dtype=ti.f32, ndim=2), dst: ti.types.ndarray(dtype=ti.f32, ndim=2), quant_table: ti.types.ndarray(dtype=ti.f32, ndim=1), basis: ti.types.ndarray(dtype=ti.f32, ndim=2), order: ti.types.ndarray(dtype=ti.i32, ndim=1), h_blocks: ti.i32, w_blocks: ti.i32):
-    """Fast AAN 1D Separable Forward DCT with in-register quantization and zig-zag."""
-    for by, bx in ti.ndrange(h_blocks, w_blocks):
-        blk = ti.Matrix.zero(ti.f32, 8, 8)
-        for r, c in ti.ndrange(8, 8):
-            blk[r, c] = src[by * 8 + r, bx * 8 + c] - 128.0
-
-        # Pass 1: 1D Fast AAN DCT on 8 Rows
-        for r in range(8):
-            s0 = blk[r, 0]
-            s1 = blk[r, 1]
-            s2 = blk[r, 2]
-            s3 = blk[r, 3]
-            s4 = blk[r, 4]
-            s5 = blk[r, 5]
-            s6 = blk[r, 6]
-            s7 = blk[r, 7]
-
-            tmp0 = s0 + s7
-            tmp7 = s0 - s7
-            tmp1 = s1 + s6
-            tmp6 = s1 - s6
-            tmp2 = s2 + s5
-            tmp5 = s2 - s5
-            tmp3 = s3 + s4
-            tmp4 = s3 - s4
-
-            tmp10 = tmp0 + tmp3
-            tmp13 = tmp0 - tmp3
-            tmp11 = tmp1 + tmp2
-            tmp12 = tmp1 - tmp2
-
-            out0 = tmp10 + tmp11
-            out4 = tmp10 - tmp11
-
-            z1 = (tmp12 + tmp13) * 0.7071067811865475
-            out2 = tmp13 + z1
-            out6 = tmp13 - z1
-
-            tmp10_odd = tmp4 + tmp5
-            tmp11_odd = tmp5 + tmp6
-            tmp12_odd = tmp6 + tmp7
-
-            z5 = (tmp10_odd - tmp12_odd) * 0.3826834323650898
-            z2 = 0.5411961001461970 * tmp10_odd + z5
-            z4 = 1.3065629648763765 * tmp12_odd + z5
-            z3 = tmp11_odd * 0.7071067811865475
-
-            z11 = tmp7 + z3
-            z13 = tmp7 - z3
-
-            out5 = z13 + z2
-            out3 = z13 - z2
-            out1 = z11 + z4
-            out7 = z11 - z4
-
-            blk[r, 0] = out0
-            blk[r, 1] = out1
-            blk[r, 2] = out2
-            blk[r, 3] = out3
-            blk[r, 4] = out4
-            blk[r, 5] = out5
-            blk[r, 6] = out6
-            blk[r, 7] = out7
-
-        # Pass 2: 1D Fast AAN DCT on 8 Columns
-        for c in range(8):
-            s0 = blk[0, c]
-            s1 = blk[1, c]
-            s2 = blk[2, c]
-            s3 = blk[3, c]
-            s4 = blk[4, c]
-            s5 = blk[5, c]
-            s6 = blk[6, c]
-            s7 = blk[7, c]
-
-            tmp0 = s0 + s7
-            tmp7 = s0 - s7
-            tmp1 = s1 + s6
-            tmp6 = s1 - s6
-            tmp2 = s2 + s5
-            tmp5 = s2 - s5
-            tmp3 = s3 + s4
-            tmp4 = s3 - s4
-
-            tmp10 = tmp0 + tmp3
-            tmp13 = tmp0 - tmp3
-            tmp11 = tmp1 + tmp2
-            tmp12 = tmp1 - tmp2
-
-            out0 = tmp10 + tmp11
-            out4 = tmp10 - tmp11
-
-            z1 = (tmp12 + tmp13) * 0.7071067811865475
-            out2 = tmp13 + z1
-            out6 = tmp13 - z1
-
-            tmp10_odd = tmp4 + tmp5
-            tmp11_odd = tmp5 + tmp6
-            tmp12_odd = tmp6 + tmp7
-
-            z5 = (tmp10_odd - tmp12_odd) * 0.3826834323650898
-            z2 = 0.5411961001461970 * tmp10_odd + z5
-            z4 = 1.3065629648763765 * tmp12_odd + z5
-            z3 = tmp11_odd * 0.7071067811865475
-
-            z11 = tmp7 + z3
-            z13 = tmp7 - z3
-
-            out5 = z13 + z2
-            out3 = z13 - z2
-            out1 = z11 + z4
-            out7 = z11 - z4
-
-            blk[0, c] = out0
-            blk[1, c] = out1
-            blk[2, c] = out2
-            blk[3, c] = out3
-            blk[4, c] = out4
-            blk[5, c] = out5
-            blk[6, c] = out6
-            blk[7, c] = out7
-
-        # In-register Quantization and Zig-zag Output
-        for k in range(64):
-            idx = order[k]
-            v = idx // 8
-            u = idx % 8
-            scale_2d = _jpeg_aan_scale_1d(v) * _jpeg_aan_scale_1d(u)
-            q = ti.max(quant_table[idx], 1.0)
-            val = blk[v, u] * (scale_2d / q)
-            dst[by, bx * 64 + k] = ti.round(val)
+    """Fuse JPEG DCT/quantization and natural-to-zig-zag reordering."""
+    for by, bx, k in ti.ndrange(h_blocks, w_blocks, 64):
+        natural = order[k]
+        total = 0.0
+        for y, x in ti.ndrange(8, 8):
+            sample = src[by * 8 + y, bx * 8 + x] - 128.0
+            total += sample * basis[natural, y * 8 + x]
+        q = ti.max(quant_table[natural], 1.0)
+        dst[by, bx * 64 + k] = ti.round(total / q)
 
 
 @ti.kernel
@@ -450,31 +308,12 @@ def ac_rle_kernel(zigzag: ti.types.ndarray(), runs: ti.types.ndarray(), values: 
 
 @ti.func
 def jpeg_category(value: ti.i32) -> ti.i32:
-    m = ti.abs(value)
-    cat = 0
-    if m >= 64:
-        if m >= 512:
-            if m >= 1024:
-                cat = 12 if m >= 2048 else 11
-            else:
-                cat = 10
-        else:
-            if m >= 256:
-                cat = 9
-            else:
-                cat = 8 if m >= 128 else 7
-    elif m > 0:
-        if m >= 8:
-            if m >= 32:
-                cat = 6
-            else:
-                cat = 5 if m >= 16 else 4
-        else:
-            if m >= 4:
-                cat = 3
-            else:
-                cat = 2 if m >= 2 else 1
-    return cat
+    magnitude = ti.abs(value)
+    category = 0
+    for bit in ti.static(range(12)):
+        if magnitude >= (1 << bit):
+            category = bit + 1
+    return category
 
 
 @ti.func
@@ -509,7 +348,7 @@ def ac_symbol_kernel(runs: ti.types.ndarray(), values: ti.types.ndarray(), symbo
 
 @ti.kernel
 def jpeg_prepare_tokens_flat2d_kernel(ordered: ti.types.ndarray(dtype=ti.f32, ndim=2), dc_diff: ti.types.ndarray(dtype=ti.f32, ndim=1), symbols: ti.types.ndarray(dtype=ti.i32, ndim=2), categories: ti.types.ndarray(dtype=ti.i32, ndim=2), amplitudes: ti.types.ndarray(dtype=ti.i32, ndim=2), token_count: ti.types.ndarray(dtype=ti.i32, ndim=2), h_blocks: ti.i32, w_blocks: ti.i32):
-    """Fuse DC differences, AC RLE, and AC symbol preparation with fast category ALU."""
+    """Fuse DC differences, AC RLE, and AC symbol preparation."""
     for by, bx in ti.ndrange(h_blocks, w_blocks):
         linear = by * w_blocks + bx
         current_dc = ordered[by, bx * 64]
@@ -527,12 +366,13 @@ def jpeg_prepare_tokens_flat2d_kernel(ordered: ti.types.ndarray(dtype=ti.f32, nd
             if value == 0:
                 run += 1
             else:
-                while run >= 16:
-                    symbols[by, bx * 64 + count] = 0xF0
-                    categories[by, bx * 64 + count] = 0
-                    amplitudes[by, bx * 64 + count] = 0
-                    count += 1
-                    run -= 16
+                for _ in range(4):
+                    if run >= 16:
+                        symbols[by, bx * 64 + count] = 0xF0
+                        categories[by, bx * 64 + count] = 0
+                        amplitudes[by, bx * 64 + count] = 0
+                        count += 1
+                        run -= 16
                 size = jpeg_category(value)
                 symbols[by, bx * 64 + count] = run * 16 + size
                 categories[by, bx * 64 + count] = size
@@ -640,159 +480,71 @@ def jpeg_pack_block_bytes_flat2d_kernel(dc_diff: ti.types.ndarray(dtype=ti.f32, 
         byte_count = 0
         position = 0
 
-        # DC token
-        dc_val = ti.cast(dc_diff[linear], ti.i32)
-        dc_cat = jpeg_category(dc_val)
-        dc_code = dc_codes[dc_cat]
-        dc_len = dc_lengths[dc_cat]
-        dc_amp = jpeg_amplitude(dc_val, dc_cat)
+        dc_category = jpeg_category(ti.cast(dc_diff[linear], ti.i32))
+        dc_code = dc_codes[dc_category]
+        dc_length = dc_lengths[dc_category]
+        dc_amplitude = jpeg_amplitude(ti.cast(dc_diff[linear], ti.i32), dc_category)
+        for bit_index in range(16):
+            if bit_index < dc_length:
+                shift = dc_length - bit_index - 1
+                accumulator = (accumulator << 1) | ((dc_code >> shift) & 1)
+                accumulator_bits += 1
+                position += 1
+                if accumulator_bits == 8:
+                    if byte_count < max_output_bytes:
+                        output[by, base + byte_count] = accumulator
+                    byte_count += 1
+                    accumulator = 0
+                    accumulator_bits = 0
+        for bit_index in range(12):
+            if bit_index < dc_category:
+                shift = dc_category - bit_index - 1
+                accumulator = (accumulator << 1) | ((dc_amplitude >> shift) & 1)
+                accumulator_bits += 1
+                position += 1
+                if accumulator_bits == 8:
+                    if byte_count < max_output_bytes:
+                        output[by, base + byte_count] = accumulator
+                    byte_count += 1
+                    accumulator = 0
+                    accumulator_bits = 0
 
-        if dc_len > 0:
-            accumulator = (accumulator << dc_len) | dc_code
-            accumulator_bits += dc_len
-            position += dc_len
-            while accumulator_bits >= 8:
-                shift = accumulator_bits - 8
-                if byte_count < max_output_bytes:
-                    output[by, base + byte_count] = (accumulator >> shift) & 0xFF
-                byte_count += 1
-                accumulator &= ((1 << shift) - 1) if shift > 0 else 0
-                accumulator_bits = shift
-
-        if dc_cat > 0:
-            accumulator = (accumulator << dc_cat) | dc_amp
-            accumulator_bits += dc_cat
-            position += dc_cat
-            while accumulator_bits >= 8:
-                shift = accumulator_bits - 8
-                if byte_count < max_output_bytes:
-                    output[by, base + byte_count] = (accumulator >> shift) & 0xFF
-                byte_count += 1
-                accumulator &= ((1 << shift) - 1) if shift > 0 else 0
-                accumulator_bits = shift
-
-        ac_n = ac_counts[by, bx]
         for token in range(64):
-            if token < ac_n:
-                sym = ac_symbols[by, bx * 64 + token]
-                ac_len = ac_lengths[sym]
-                ac_code = ac_codes[sym]
-                if ac_len > 0:
-                    accumulator = (accumulator << ac_len) | ac_code
-                    accumulator_bits += ac_len
-                    position += ac_len
-                    while accumulator_bits >= 8:
-                        shift = accumulator_bits - 8
-                        if byte_count < max_output_bytes:
-                            output[by, base + byte_count] = (accumulator >> shift) & 0xFF
-                        byte_count += 1
-                        accumulator &= ((1 << shift) - 1) if shift > 0 else 0
-                        accumulator_bits = shift
-
+            if token < ac_counts[by, bx]:
+                symbol = ac_symbols[by, bx * 64 + token]
+                length = ac_lengths[symbol]
+                code = ac_codes[symbol]
+                for bit_index in range(16):
+                    if bit_index < length:
+                        shift = length - bit_index - 1
+                        accumulator = (accumulator << 1) | ((code >> shift) & 1)
+                        accumulator_bits += 1
+                        position += 1
+                        if accumulator_bits == 8:
+                            if byte_count < max_output_bytes:
+                                output[by, base + byte_count] = accumulator
+                            byte_count += 1
+                            accumulator = 0
+                            accumulator_bits = 0
                 size = ac_categories[by, bx * 64 + token]
-                amp = ac_amplitudes[by, bx * 64 + token]
-                if size > 0:
-                    accumulator = (accumulator << size) | amp
-                    accumulator_bits += size
-                    position += size
-                    while accumulator_bits >= 8:
-                        shift = accumulator_bits - 8
-                        if byte_count < max_output_bytes:
-                            output[by, base + byte_count] = (accumulator >> shift) & 0xFF
-                        byte_count += 1
-                        accumulator &= ((1 << shift) - 1) if shift > 0 else 0
-                        accumulator_bits = shift
-
+                amplitude = ac_amplitudes[by, bx * 64 + token]
+                for bit_index in range(12):
+                    if bit_index < size:
+                        shift = size - bit_index - 1
+                        accumulator = (accumulator << 1) | ((amplitude >> shift) & 1)
+                        accumulator_bits += 1
+                        position += 1
+                        if accumulator_bits == 8:
+                            if byte_count < max_output_bytes:
+                                output[by, base + byte_count] = accumulator
+                            byte_count += 1
+                            accumulator = 0
+                            accumulator_bits = 0
         if accumulator_bits > 0:
             if byte_count < max_output_bytes:
-                output[by, base + byte_count] = (accumulator << (8 - accumulator_bits)) & 0xFF
+                output[by, base + byte_count] = accumulator << (8 - accumulator_bits)
             byte_count += 1
         output_count[by, bx] = position
-
-
-@ti.kernel
-def jpeg_pack_scan_stream_kernel(
-    block_bytes: ti.types.ndarray(dtype=ti.i32, ndim=2),
-    block_counts: ti.types.ndarray(dtype=ti.i32, ndim=1),
-    out_bytes: ti.types.ndarray(dtype=ti.i32, ndim=1),
-    out_length: ti.types.ndarray(dtype=ti.i32, ndim=1),
-    num_blocks: ti.i32,
-    max_output_bytes: ti.i32,
-    restart_interval: ti.i32,
-):
-    """1-Pass Native Taichi Scan Bitstream Packer with 0xFF byte stuffing.
-    
-    Compiled 100% inside Taichi AOT (.tcm) without any external DLLs.
-    """
-    accum = 0
-    accum_bits = 0
-    out_pos = 0
-
-    for b in range(num_blocks):
-        count = block_counts[b]
-        if count > 0:
-            full_bytes = count // 8
-            rem = count % 8
-            for i in range(full_bytes):
-                accum = (accum << 8) | (block_bytes[b, i] & 0xFF)
-                accum_bits += 8
-                while accum_bits >= 8:
-                    shift = accum_bits - 8
-                    byte_val = (accum >> shift) & 0xFF
-                    accum &= ((1 << shift) - 1) if shift > 0 else 0
-                    accum_bits = shift
-                    
-                    out_bytes[out_pos] = byte_val
-                    out_pos += 1
-                    if byte_val == 0xFF:
-                        out_bytes[out_pos] = 0x00
-                        out_pos += 1
-
-            if rem > 0:
-                val = (block_bytes[b, full_bytes] & 0xFF) >> (8 - rem)
-                accum = (accum << rem) | val
-                accum_bits += rem
-                while accum_bits >= 8:
-                    shift = accum_bits - 8
-                    byte_val = (accum >> shift) & 0xFF
-                    accum &= ((1 << shift) - 1) if shift > 0 else 0
-                    accum_bits = shift
-                    
-                    out_bytes[out_pos] = byte_val
-                    out_pos += 1
-                    if byte_val == 0xFF:
-                        out_bytes[out_pos] = 0x00
-                        out_pos += 1
-
-        if restart_interval > 0 and (b + 1) < num_blocks and (b + 1) % restart_interval == 0:
-            if accum_bits > 0:
-                pad = 8 - accum_bits
-                accum = (accum << pad) | ((1 << pad) - 1)
-                byte_val = accum & 0xFF
-                accum = 0
-                accum_bits = 0
-                out_bytes[out_pos] = byte_val
-                out_pos += 1
-                if byte_val == 0xFF:
-                    out_bytes[out_pos] = 0x00
-                    out_pos += 1
-            restart_num = (((b + 1) // restart_interval) - 1) % 8
-            out_bytes[out_pos] = 0xFF
-            out_pos += 1
-            out_bytes[out_pos] = 0xD0 + restart_num
-            out_pos += 1
-
-    if accum_bits > 0:
-        pad = 8 - accum_bits
-        accum = (accum << pad) | ((1 << pad) - 1)
-        byte_val = accum & 0xFF
-        out_bytes[out_pos] = byte_val
-        out_pos += 1
-        if byte_val == 0xFF:
-            out_bytes[out_pos] = 0x00
-            out_pos += 1
-
-    out_length[0] = out_pos
 
 
 @ti.kernel
@@ -961,6 +713,91 @@ def hevc_dc_level_kernel(
             levels[index] = (numerator + denominator // 2) // denominator
         else:
             levels[index] = -((-numerator + denominator // 2) // denominator)
+
+
+@ti.kernel
+def jpeg_fused_transform_tokens_histogram_2d(
+    src: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    quant_table: ti.types.ndarray(dtype=ti.f32, ndim=1),
+    basis: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    order: ti.types.ndarray(dtype=ti.i32, ndim=1),
+    dc_values: ti.types.ndarray(dtype=ti.f32, ndim=1),
+    symbols: ti.types.ndarray(dtype=ti.i32, ndim=2),
+    categories: ti.types.ndarray(dtype=ti.i32, ndim=2),
+    amplitudes: ti.types.ndarray(dtype=ti.i32, ndim=2),
+    token_count: ti.types.ndarray(dtype=ti.i32, ndim=2),
+    dc_histogram: ti.types.ndarray(dtype=ti.i32, ndim=1),
+    ac_histogram: ti.types.ndarray(dtype=ti.i32, ndim=1),
+    h_blocks: ti.i32,
+    w_blocks: ti.i32,
+):
+    """Fully fused JPEG pipeline: DCT+quant+zigzag → tokens → histogram.
+
+    This kernel combines all JPEG transform stages into a single GPU dispatch,
+    eliminating intermediate GPU↔CPU round-trips.  Each block processes:
+    1. Forward 8×8 DCT with quantization and zigzag reordering
+    2. Store DC value for host-side differential coding
+    3. AC run-length encoding with symbol generation
+    4. Histogram accumulation for Huffman coding
+
+    The outputs are ready for host-side DC differential coding, Huffman tree
+    construction, and bitstream assembly.  DC differential coding is done on
+    host because it requires sequential processing (each block's DC depends
+    on the previous block's DC).
+    """
+    for by, bx in ti.ndrange(h_blocks, w_blocks):
+        # Stage 1: DCT + quantization + zigzag (fused)
+        # Store zigzag-ordered coefficients in a local array
+        zigzag_block = ti.Vector([0.0] * 64, ti.f32)
+        for k in range(64):
+            natural = order[k]
+            total = 0.0
+            for y, x in ti.ndrange(8, 8):
+                sample = src[by * 8 + y, bx * 8 + x] - 128.0
+                total += sample * basis[natural, y * 8 + x]
+            q = ti.max(quant_table[natural], 1.0)
+            zigzag_block[k] = ti.round(total / q)
+
+        # Stage 2: Store DC value for host-side differential coding
+        linear = by * w_blocks + bx
+        dc_values[linear] = zigzag_block[0]
+
+        # Stage 3: AC RLE + symbol generation
+        run = 0
+        count = 0
+        for k in range(1, 64):
+            value = ti.cast(zigzag_block[k], ti.i32)
+            if value == 0:
+                run += 1
+            else:
+                # Handle ZRL (zero run length >= 16)
+                for _ in range(4):
+                    if run >= 16:
+                        symbols[by, bx * 64 + count] = 0xF0
+                        categories[by, bx * 64 + count] = 0
+                        amplitudes[by, bx * 64 + count] = 0
+                        count += 1
+                        run -= 16
+                # Emit AC coefficient
+                size = jpeg_category(value)
+                symbols[by, bx * 64 + count] = run * 16 + size
+                categories[by, bx * 64 + count] = size
+                amplitudes[by, bx * 64 + count] = jpeg_amplitude(value, size)
+                count += 1
+                run = 0
+        # EOB (End of Block)
+        if run > 0 or count == 0:
+            symbols[by, bx * 64 + count] = 0
+            categories[by, bx * 64 + count] = 0
+            amplitudes[by, bx * 64 + count] = 0
+            count += 1
+        token_count[by, bx] = count
+
+        # Stage 4: Histogram accumulation (AC only, DC histogram done on host)
+        for i in range(64):
+            if i < count:
+                symbol = symbols[by, bx * 64 + i]
+                ti.atomic_add(ac_histogram[symbol], 1)
 
 
 def jpeg_prepare_blocks(src, dst, quality: int):

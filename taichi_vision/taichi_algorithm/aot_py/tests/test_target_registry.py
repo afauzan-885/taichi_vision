@@ -126,22 +126,22 @@ class TargetRegistryTests(unittest.TestCase):
 
     def test_runtime_report_marks_targets_without_qualification_fail_closed(self):
         report = MODULE.target_runtime_report()
-        self.assertEqual(report["target_count"], 4)
-        self.assertEqual(report["unverified_count"], 4)
+        self.assertEqual(report["target_count"], 16)
+        self.assertEqual(report["unverified_count"], 8)
         self.assertEqual(report["native_runtime_count"], 0)
-        self.assertEqual(report["compile_only_count"], 0)
+        self.assertEqual(report["compile_only_count"], 8)
         self.assertEqual(report["native_runtime_percent"], 0.0)
-        self.assertEqual(report["non_native_count"], 4)
+        self.assertEqual(report["non_native_count"], 16)
         self.assertTrue(report["fail_closed"])
-        self.assertEqual(report["backend_summary"]["cuda"]["target_count"], 1)
+        self.assertEqual(report["backend_summary"]["cuda"]["target_count"], 2)
         self.assertEqual(report["backend_summary"]["cuda"]["native_runtime_percent"], 0.0)
         self.assertTrue(report["backend_summary"]["cuda"]["fail_closed"])
         records = {record["target_id"]: record for record in report["records"]}
-        self.assertEqual(records["opengl_x86_64_windows"]["status"], "unverified")
-        self.assertTrue(records["opengl_x86_64_windows"]["fail_closed"])
-        self.assertIn("runtime_requirements", records["opengl_x86_64_windows"]["missing"])
-        self.assertEqual(records["vulkan_x86_64_windows"]["status"], "unverified")
-        self.assertTrue(records["vulkan_x86_64_windows"]["fail_closed"])
+        self.assertEqual(records["opengl_x86_64_windows_nvidia"]["status"], "unverified")
+        self.assertTrue(records["opengl_x86_64_windows_nvidia"]["fail_closed"])
+        self.assertIn("runtime_requirements", records["opengl_x86_64_windows_nvidia"]["missing"])
+        self.assertEqual(records["cpu_arm64_android"]["status"], "compile_only")
+        self.assertTrue(records["cpu_arm64_android"]["fail_closed"])
 
     def test_runtime_report_flags_orphan_requirement_identity(self):
         manifest = {

@@ -1015,12 +1015,12 @@ def register_probe_result(
 
 
 _OBSERVED_PROBE_COMMAND_CPU = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend cpu --device 0 --block-size 7"
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_NVIDIA = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend vulkan --device 0 --block-size 7"
 )
@@ -1048,13 +1048,13 @@ _OBSERVED_OPTIONAL_PROBE_ARGUMENTS = (
     "laplacian,highlight_recovery,smooth_flow_gpu"
 )
 _OBSERVED_PROBE_COMMAND_CPU_OPTIONAL = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend cpu --device 0 --block-size 7 "
     + _OBSERVED_OPTIONAL_PROBE_ARGUMENTS
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_NVIDIA_OPTIONAL = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend vulkan --device 0 --block-size 7 "
     + _OBSERVED_OPTIONAL_PROBE_ARGUMENTS
@@ -1098,19 +1098,19 @@ _OBSERVED_EXTENDED_PROBE_ARGUMENTS = (
     "guided_filter,non_local_means"
 )
 _OBSERVED_PROBE_COMMAND_CPU_EXTENDED = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend cpu --device 0 --block-size 7 "
     + _OBSERVED_EXTENDED_PROBE_ARGUMENTS
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_NVIDIA_EXTENDED = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
     "probe_native_partition.py --backend vulkan --device 0 --block-size 7 "
     + _OBSERVED_EXTENDED_PROBE_ARGUMENTS
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_INTEL_EXTENDED = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='vulkan'; $env:AOT_ARCH='vulkan'; "
     "$env:PIXEL_REFINE_BACKEND='vulkan'; $env:AOT_DEVICE='0'; "
     "$env:PIXEL_REFINE_AOT_DEVICE='0'; $env:TARGET_VENDOR='intel'; "
@@ -1119,7 +1119,7 @@ _OBSERVED_PROBE_COMMAND_VULKAN_INTEL_EXTENDED = (
     + _OBSERVED_EXTENDED_PROBE_ARGUMENTS
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_NVIDIA_RESIZE = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='vulkan'; $env:AOT_ARCH='vulkan'; "
     "$env:BACKEND='vulkan'; $env:PIXEL_REFINE_BACKEND='vulkan'; "
     "$env:AOT_DEVICE='0'; $env:PIXEL_REFINE_AOT_DEVICE='0'; "
@@ -1129,7 +1129,7 @@ _OBSERVED_PROBE_COMMAND_VULKAN_NVIDIA_RESIZE = (
     "--expected-vendor nvidia --expected-device \"NVIDIA GeForce MX150\""
 )
 _OBSERVED_PROBE_COMMAND_VULKAN_INTEL_RESIZE = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='vulkan'; $env:AOT_ARCH='vulkan'; "
     "$env:BACKEND='vulkan'; $env:PIXEL_REFINE_BACKEND='vulkan'; "
     "$env:AOT_DEVICE='0'; $env:PIXEL_REFINE_AOT_DEVICE='0'; "
@@ -1139,7 +1139,7 @@ _OBSERVED_PROBE_COMMAND_VULKAN_INTEL_RESIZE = (
     "--expected-vendor intel --expected-device \"Intel(R) UHD Graphics 620\""
 )
 _OBSERVED_PROBE_COMMAND_CUDA_BASE = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='cuda'; $env:AOT_ARCH='cuda'; "
     "$env:PIXEL_REFINE_BACKEND='cuda'; $env:AOT_DEVICE='0'; "
     "$env:PIXEL_REFINE_AOT_DEVICE='0'; $env:CUDA_DEVICE='0'; "
@@ -1149,7 +1149,7 @@ _OBSERVED_PROBE_COMMAND_CUDA_BASE = (
     "--operations base"
 )
 _OBSERVED_PROBE_COMMAND_CUDA_EXTENDED = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='cuda'; $env:AOT_ARCH='cuda'; "
     "$env:PIXEL_REFINE_BACKEND='cuda'; $env:AOT_DEVICE='0'; "
     "$env:PIXEL_REFINE_AOT_DEVICE='0'; $env:CUDA_DEVICE='0'; "
@@ -1159,7 +1159,7 @@ _OBSERVED_PROBE_COMMAND_CUDA_EXTENDED = (
     + _OBSERVED_EXTENDED_PROBE_ARGUMENTS
 )
 _OBSERVED_PROBE_COMMAND_CUDA_RESIZE = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:PIXEL_REFINE_AOT_ARCH='cuda'; $env:AOT_ARCH='cuda'; "
     "$env:BACKEND='cuda'; $env:PIXEL_REFINE_BACKEND='cuda'; "
     "$env:AOT_DEVICE='0'; $env:PIXEL_REFINE_AOT_DEVICE='0'; "
@@ -1170,7 +1170,7 @@ _OBSERVED_PROBE_COMMAND_CUDA_RESIZE = (
     "--expected-vendor nvidia --expected-device \"NVIDIA GeForce MX150\""
 )
 _OBSERVED_PROBE_COMMAND_OPENGL_NVIDIA_EXTENDED = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
     "$env:BACKEND='opengl'; "
     "$env:TARGET_VENDOR='nvidia'; "
     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
@@ -1450,7 +1450,7 @@ def register_verified_native_vulkan_intel_base_evidence(
         "cvtColor": ["float32"],
     }
     command = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+        "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
         "$env:PIXEL_REFINE_AOT_ARCH='vulkan'; $env:AOT_ARCH='vulkan'; "
         "$env:BACKEND='vulkan'; $env:PIXEL_REFINE_BACKEND='vulkan'; "
         "$env:AOT_DEVICE='0'; $env:PIXEL_REFINE_AOT_DEVICE='0'; "
@@ -1628,7 +1628,7 @@ def register_verified_native_cuda_partition_evidence(
     canonical_alias = {"smooth_flow_gpu": "smooth_flow"}
     probe_operations = ",".join(operations + ("otsu_threshold",))
     command = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+        "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
         "$env:AOT_ARCH='cuda'; $env:BACKEND='cuda'; $env:AOT_DEVICE='0'; "
         "$env:TARGET_VENDOR='nvidia'; venv\\Scripts\\python.exe -u -m "
         "taichi_vision.taichi_algorithm.aot_py.tools.probe_native_partition "
@@ -1721,7 +1721,7 @@ def register_verified_native_opengl_partition_evidence(
                 device="NVIDIA Corporation - NVIDIA GeForce MX150/PCIe/SSE2",
                 device_id=0,
                 command=(
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+                    "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
                     "$env:BACKEND='opengl'; "
                     "$env:TARGET_VENDOR='nvidia'; "
                     "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
@@ -1780,13 +1780,13 @@ def register_verified_native_opengl_intel_evidence(
     )
     device = "Intel(R) UHD Graphics 620"
     base_command = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+        "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
         "$env:BACKEND='opengl'; $env:TARGET_VENDOR='intel'; "
         "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
         "probe_native_partition.py --backend opengl --device 0 --block-size 7 --operations base"
     )
     extended_command = (
-    "$env:AOT_MODE='1'; $env:PYTHONPATH='.'; "
+        "$env:AOT_MODE='1'; $env:PYTHONPATH='E:\\APP Developer\\Pixel Refine'; "
         "$env:BACKEND='opengl'; $env:TARGET_VENDOR='intel'; "
         "python -u taichi_vision\\taichi_algorithm\\aot_py\\tools\\"
         "probe_native_partition.py --backend opengl --device 0 --block-size 7 "

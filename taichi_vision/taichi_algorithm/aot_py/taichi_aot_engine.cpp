@@ -1,13 +1,10 @@
 #include <cstring>
-#include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cwchar>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,7 +13,6 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
-#include <condition_variable>
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -26,9 +22,6 @@
 
 
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #define EXPORT __declspec(dllexport)
 #include <wincodec.h>
 #include <windows.h>
@@ -132,10 +125,6 @@ struct DynamicArg {
   uint64_t val_u64;
 };
 
-// The exported ABI receives counts from ctypes callers.  Keep malformed graph
-// descriptors from turning a signed count into an unbounded vector allocation.
-static constexpr int kMaxDynamicArgs = 4096;
-
 struct EngineContext;
 
 // -----------------------------------------------------------------------
@@ -164,31 +153,18 @@ struct ModuleContext {
   ti::AotModule *module;
   std::unordered_map<std::string, ti::ComputeGraph> graph_cache;
   std::mutex cache_mutex;
-  std::mutex lifetime_mutex;
-  std::condition_variable lifetime_cv;
-  uint32_t active_calls = 0;
-  bool destroying = false;
 };
 
 struct RawIcdContextTag;
 
-struct GpuAllocationRecord {
-  uint64_t size = 0;
-  bool mapped = false;
-};
-
 struct EngineContext {
   TiArch arch;
   ti::Runtime *runtime;
-  // Allocation handles are session-local.  Keeping the byte capacity and
-  // mapped state beside the handle lets every memory entry point reject a
-  // foreign handle or an out-of-range transfer before it reaches Taichi.
-  std::unordered_map<TiMemory, GpuAllocationRecord> allocations;
+  std::unordered_set<TiMemory> buffers;
+  std::unordered_set<TiMemory> mapped_buffers;
   std::unordered_set<ModuleContext *> modules;
   std::unordered_map<std::string, Pipeline> pipelines;
   std::mutex mutex;
-  std::condition_variable lifecycle_cv;
-  uint32_t active_calls = 0;
   std::string last_error;
   bool destroying;
   uint64_t session_id;
@@ -245,25 +221,6 @@ struct EngineContext {
 #endif
 };
 
-static void invalidate_pipelines_for_module(ModuleContext *ctx) {
-  if (!ctx || !ctx->owner)
-    return;
-  std::lock_guard<std::mutex> engine_lock(ctx->owner->mutex);
-  for (auto pipeline_it = ctx->owner->pipelines.begin();
-       pipeline_it != ctx->owner->pipelines.end();) {
-    auto &steps = pipeline_it->second.steps;
-    steps.erase(std::remove_if(steps.begin(), steps.end(),
-                               [ctx](const GraphDispatch &step) {
-                                 return step.module_ctx == ctx;
-                               }),
-                steps.end());
-    if (steps.empty())
-      pipeline_it = ctx->owner->pipelines.erase(pipeline_it);
-    else
-      ++pipeline_it;
-  }
-}
-
 #ifdef _WIN32
 // The public Windows ICD ABI uses a 336-entry GL 1.1 dispatch table followed
 // by the vendor's modern entry points returned by DrvGetProcAddress.
@@ -282,120 +239,17 @@ static void APIENTRY raw_icd_set_proc_table(const RawIcdGlcltProcTable *) {}
 
 static std::unordered_set<EngineContext *> engine_contexts;
 static std::mutex engine_contexts_mutex;
-static std::unordered_set<ModuleContext *> module_contexts;
-static std::mutex module_contexts_mutex;
 static uint64_t next_session_id = 1;
 static std::mutex init_error_mutex;
 static std::string last_init_error;
-
-static void invalidate_pipelines_for_module(ModuleContext *ctx);
 
 static void set_last_init_error(const std::string &message) {
   std::lock_guard<std::mutex> lock(init_error_mutex);
   last_init_error = message;
 }
 
-class EngineLease {
-public:
-  explicit EngineLease(void *runtime) {
-    // The registry lock is held while taking the context lock and incrementing
-    // active_calls.  Destruction uses the same order, so a pointer cannot pass
-    // validation and then be deleted before this operation is pinned.
-    std::unique_lock<std::mutex> registry_lock(engine_contexts_mutex);
-    auto it = engine_contexts.find((EngineContext *)runtime);
-    if (it == engine_contexts.end() || !*it)
-      return;
-    EngineContext *candidate = *it;
-    std::lock_guard<std::mutex> context_lock(candidate->mutex);
-    if (candidate->destroying)
-      return;
-    candidate->active_calls++;
-    ctx_ = candidate;
-  }
-
-  EngineLease(const EngineLease &) = delete;
-  EngineLease &operator=(const EngineLease &) = delete;
-
-  ~EngineLease() {
-    if (!ctx_)
-      return;
-    std::lock_guard<std::mutex> lock(ctx_->mutex);
-    if (ctx_->active_calls > 0)
-      ctx_->active_calls--;
-    if (ctx_->active_calls == 0)
-      ctx_->lifecycle_cv.notify_all();
-  }
-
-  EngineContext *get() const { return ctx_; }
-  explicit operator bool() const { return ctx_ != nullptr; }
-
-private:
-  EngineContext *ctx_ = nullptr;
-};
-
-class ModuleLease {
-public:
-  explicit ModuleLease(void *module_ctx) {
-    // As with EngineLease, validate and pin while holding the registry lock.
-    // A concurrent destroy therefore either waits for this lease or removes
-    // the pointer before this operation can dereference it.
-    std::unique_lock<std::mutex> registry_lock(module_contexts_mutex);
-    auto it = module_contexts.find((ModuleContext *)module_ctx);
-    if (it == module_contexts.end() || !*it)
-      return;
-    ModuleContext *candidate = *it;
-    std::lock_guard<std::mutex> lifetime_lock(candidate->lifetime_mutex);
-    if (candidate->destroying)
-      return;
-    candidate->active_calls++;
-    ctx_ = candidate;
-  }
-
-  ModuleLease(const ModuleLease &) = delete;
-  ModuleLease &operator=(const ModuleLease &) = delete;
-
-  ~ModuleLease() {
-    if (!ctx_)
-      return;
-    std::lock_guard<std::mutex> lock(ctx_->lifetime_mutex);
-    if (ctx_->active_calls > 0)
-      ctx_->active_calls--;
-    if (ctx_->active_calls == 0)
-      ctx_->lifetime_cv.notify_all();
-  }
-
-  ModuleContext *get() const { return ctx_; }
-  explicit operator bool() const { return ctx_ != nullptr; }
-
-private:
-  ModuleContext *ctx_ = nullptr;
-};
-
-static ModuleContext *begin_module_destroy(void *module_ctx) {
-  std::unique_lock<std::mutex> registry_lock(module_contexts_mutex);
-  auto it = module_contexts.find((ModuleContext *)module_ctx);
-  if (it == module_contexts.end() || !*it)
-    return nullptr;
-  ModuleContext *ctx = *it;
-  std::lock_guard<std::mutex> lifetime_lock(ctx->lifetime_mutex);
-  if (ctx->destroying)
-    return nullptr;
-  ctx->destroying = true;
-  module_contexts.erase(it);
-  invalidate_pipelines_for_module(ctx);
-  return ctx;
-}
-
-static void finish_module_destroy(ModuleContext *ctx) {
-  if (!ctx)
-    return;
-  {
-    std::unique_lock<std::mutex> lock(ctx->lifetime_mutex);
-    ctx->lifetime_cv.wait(lock, [ctx] { return ctx->active_calls == 0; });
-  }
-  if (ctx->module)
-    delete ctx->module;
-  delete ctx;
+static EngineContext *as_engine(void *runtime) {
+  return (EngineContext *)runtime;
 }
 
 static ti::Runtime *engine_runtime(EngineContext *ctx) {
@@ -416,111 +270,6 @@ static void clear_engine_error(EngineContext *ctx) {
     return;
   std::lock_guard<std::mutex> lock(ctx->mutex);
   ctx->last_error.clear();
-}
-
-static bool engine_has_error(EngineContext *ctx) {
-  if (!ctx)
-    return false;
-  std::lock_guard<std::mutex> lock(ctx->mutex);
-  return !ctx->last_error.empty();
-}
-
-static bool validate_gpu_allocation_locked(
-    EngineContext *ctx, TiMemory memory, uint64_t requested_size,
-    const char *operation, bool reject_mapped = true) {
-  if (!ctx || !memory) {
-    if (ctx)
-      ctx->last_error = std::string(operation) +
-                        ": null GPU allocation handle";
-    return false;
-  }
-  auto it = ctx->allocations.find(memory);
-  if (it == ctx->allocations.end()) {
-    ctx->last_error = std::string(operation) +
-                      ": GPU allocation does not belong to this runtime";
-    return false;
-  }
-  if (requested_size > it->second.size) {
-    ctx->last_error = std::string(operation) +
-                      ": transfer exceeds GPU allocation capacity (requested=" +
-                      std::to_string(requested_size) +
-                      ", capacity=" + std::to_string(it->second.size) + ")";
-    return false;
-  }
-  if (reject_mapped && it->second.mapped) {
-    ctx->last_error = std::string(operation) +
-                      ": GPU allocation is already mapped";
-    return false;
-  }
-  return true;
-}
-
-static bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t *out) {
-  if (!out || (right != 0 && left > std::numeric_limits<uint64_t>::max() / right))
-    return false;
-  *out = left * right;
-  return true;
-}
-
-static size_t dynamic_arg_dtype_size(int dtype) {
-  switch (dtype) {
-  case 0:
-    return sizeof(float);
-  case 1:
-    return sizeof(int32_t);
-  case 2:
-    return sizeof(uint8_t);
-  case 3:
-    return sizeof(uint16_t);
-  case 4:
-    return sizeof(int16_t);
-  case 5:
-    return sizeof(uint16_t); // f16 storage
-  default:
-    return 0;
-  }
-}
-
-static bool validate_dynamic_arg_allocation(EngineContext *engine,
-                                            const DynamicArg &dyn_arg,
-                                            const char *operation) {
-  if (!engine || dyn_arg.arg_type != 0)
-    return true;
-  auto reject = [&](const char *reason) {
-    set_engine_error(engine, std::string(operation) + ": " + reason);
-    return false;
-  };
-  if (dyn_arg.dim_count < 1 || dyn_arg.dim_count > 8 ||
-      dyn_arg.elem_dim_count < 0 || dyn_arg.elem_dim_count > 8)
-    return reject("invalid ndarray rank");
-  uint64_t elements = 1;
-  for (int d = 0; d < dyn_arg.dim_count; ++d) {
-    if (dyn_arg.shape[d] <= 0)
-      return reject("ndarray shape must contain positive dimensions");
-    if (!checked_mul_u64(elements, static_cast<uint64_t>(dyn_arg.shape[d]),
-                         &elements))
-      return reject("ndarray element-count overflow");
-  }
-  for (int d = 0; d < dyn_arg.elem_dim_count; ++d) {
-    if (dyn_arg.elem_shape[d] <= 0)
-      return reject("ndarray element shape must contain positive dimensions");
-    if (!checked_mul_u64(elements,
-                         static_cast<uint64_t>(dyn_arg.elem_shape[d]),
-                         &elements))
-      return reject("ndarray element-count overflow");
-  }
-  const size_t element_size = dynamic_arg_dtype_size(dyn_arg.dtype);
-  uint64_t required_bytes = 0;
-  if (!element_size ||
-      !checked_mul_u64(elements, static_cast<uint64_t>(element_size),
-                       &required_bytes))
-    return reject("invalid dtype or byte-size overflow");
-
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)dyn_arg.val_u64,
-                                      required_bytes, operation))
-    return false;
-  return true;
 }
 
 static std::string consume_ti_last_error() {
@@ -1346,14 +1095,12 @@ class ScopedOpenGLContext {
 extern "C" {
 
 EXPORT const char *get_last_init_error() {
-  static thread_local std::string snapshot;
   std::lock_guard<std::mutex> lock(init_error_mutex);
-  snapshot = last_init_error;
-  return snapshot.c_str();
+  return last_init_error.c_str();
 }
 
 EXPORT const char *scan_vulkan_devices() {
-  static thread_local std::string device_list;
+  static std::string device_list;
   device_list = "";
 #ifdef _WIN32
   FILE *pipe = _popen("vulkaninfo --summary", "r");
@@ -1386,20 +1133,6 @@ EXPORT const char *scan_vulkan_devices() {
   return device_list.c_str();
 }
 
-static bool forced_init_failure_for_tests() {
-#ifdef _WIN32
-  char configured[32] = {};
-  const DWORD length = GetEnvironmentVariableA(
-      "PIXEL_REFINE_AOT_TEST_FAIL_INIT", configured,
-      static_cast<DWORD>(sizeof(configured)));
-  return length > 0 && length < sizeof(configured) &&
-         std::strcmp(configured, "1") == 0;
-#else
-  const char *configured = std::getenv("PIXEL_REFINE_AOT_TEST_FAIL_INIT");
-  return configured && std::strcmp(configured, "1") == 0;
-#endif
-}
-
 EXPORT void *init_aot_engine(int arch_id, int device_id) {
   set_last_init_error("");
   TiArch arch = TI_ARCH_VULKAN;
@@ -1415,8 +1148,6 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
     // Use specified device_id
     auto ctx = std::make_unique<EngineContext>();
     ctx->arch = arch;
-    if (forced_init_failure_for_tests())
-      throw std::runtime_error("injected native backend initialization failure");
     if (arch == TI_ARCH_OPENGL) {
 #ifdef _WIN32
       const char *egl_only = std::getenv("PIXEL_REFINE_OPENGL_EGL_ONLY");
@@ -1524,14 +1255,7 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
       return nullptr;
     try {
       auto ctx = std::make_unique<EngineContext>();
-      // The compatibility path is a negotiated CPU runtime, never the
-      // originally requested GPU identity.  Populate every identity field so
-      // diagnostics and the Python-side arch probe cannot masquerade it as
-      // the failed backend.
-      ctx->arch = TI_ARCH_X64;
       ctx->runtime = new ti::Runtime(TI_ARCH_X64, 0);
-      ctx->device_name = "CPU (legacy fallback)";
-      ctx->last_error = "requested backend failed; explicit CPU fallback was enabled";
       ctx->destroying = false;
       ctx->session_id = next_session_id++;
       {
@@ -1546,32 +1270,21 @@ EXPORT void *init_aot_engine(int arch_id, int device_id) {
 }
 
 EXPORT const char *get_runtime_device_name(void *runtime) {
-  EngineLease lease(runtime);
-  EngineContext *ctx = lease.get();
-  static thread_local std::string snapshot;
+  EngineContext *ctx = as_engine(runtime);
   if (!ctx)
-    return snapshot.c_str();
-  {
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    snapshot = ctx->device_name;
-  }
-  return snapshot.c_str();
+    return "";
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  return ctx->device_name.c_str();
 }
 
 EXPORT const char *get_runtime_context_backend(void *runtime) {
-  EngineLease lease(runtime);
-  EngineContext *ctx = lease.get();
+  EngineContext *ctx = as_engine(runtime);
   static thread_local std::string backend;
   // GLES is a separate Taichi architecture (and has its own target-qualified
   // bridge/artifacts), but it still belongs to the native graphics family for
   // diagnostics.  Returning an empty string here made mobile diagnostics look
   // like an uninitialised runtime even when the GLES bridge was loaded.
-  if (!ctx) {
-    backend.clear();
-    return backend.c_str();
-  }
-  std::lock_guard<std::mutex> lock(ctx->mutex);
-  if (ctx->arch != TI_ARCH_OPENGL && ctx->arch != TI_ARCH_GLES) {
+  if (!ctx || (ctx->arch != TI_ARCH_OPENGL && ctx->arch != TI_ARCH_GLES)) {
     backend.clear();
     return backend.c_str();
   }
@@ -1592,47 +1305,21 @@ EXPORT const char *get_runtime_context_backend(void *runtime) {
   return backend.c_str();
 }
 
-EXPORT int get_runtime_arch_id(void *runtime) {
-  EngineLease lease(runtime);
-  EngineContext *ctx = lease.get();
-  if (!ctx)
-    return -1;
-  std::lock_guard<std::mutex> lock(ctx->mutex);
-  if (ctx->arch == TI_ARCH_CUDA)
-    return 1;
-  if (ctx->arch == TI_ARCH_X64)
-    return 2;
-  if (ctx->arch == TI_ARCH_OPENGL)
-    return 3;
-  if (ctx->arch == TI_ARCH_GLES)
-    return 4;
-  if (ctx->arch == TI_ARCH_VULKAN)
-    return 0;
-  return -1;
-}
-
 EXPORT const char *get_last_engine_error(void *runtime) {
-  EngineLease lease(runtime);
-  EngineContext *ctx = lease.get();
-  static thread_local std::string snapshot;
+  EngineContext *ctx = as_engine(runtime);
   if (!ctx)
-    return snapshot.c_str();
-  {
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    snapshot = ctx->last_error;
-  }
-  return snapshot.c_str();
+    return "";
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  return ctx->last_error.c_str();
 }
 
 EXPORT void clear_last_engine_error(void *runtime) {
-  EngineLease lease(runtime);
-  clear_engine_error(lease.get());
+  clear_engine_error(as_engine(runtime));
   consume_ti_last_error();
 }
 
 EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
@@ -1712,10 +1399,6 @@ EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
       return nullptr;
     }
     {
-      std::lock_guard<std::mutex> lock(module_contexts_mutex);
-      module_contexts.insert(ctx);
-    }
-    {
       std::lock_guard<std::mutex> lock(engine->mutex);
       engine->modules.insert(ctx);
     }
@@ -1730,51 +1413,41 @@ EXPORT void *load_aot_module(void *runtime, const char *tcm_path) {
 }
 
 EXPORT void destroy_aot_module(void *module_ctx) {
-  ModuleContext *ctx = begin_module_destroy(module_ctx);
-  if (!ctx)
-    return;
-  EngineContext *owner = ctx->owner;
-  EngineLease owner_lease(owner);
-  if (owner_lease) {
-    std::lock_guard<std::mutex> lock(owner_lease.get()->mutex);
-    owner_lease.get()->modules.erase(ctx);
+  ModuleContext *ctx = (ModuleContext *)module_ctx;
+  if (ctx) {
+    EngineContext *owner = ctx->owner;
+    ScopedOpenGLContext gl_scope(owner);
+    if (!gl_scope.ready())
+      return;
+    if (owner) {
+      std::lock_guard<std::mutex> lock(owner->mutex);
+      owner->modules.erase(ctx);
+    }
+    if (ctx->module)
+      delete ctx->module;
+    delete ctx;
   }
-  if (owner_lease) {
-    ScopedOpenGLContext gl_scope(owner_lease.get());
-    // Module admission is closed and active module leases are drained by the
-    // finalizer even if an optional graphics rebind is unavailable.
-    finish_module_destroy(ctx);
-    return;
-  }
-  finish_module_destroy(ctx);
 }
 
 EXPORT void destroy_aot_engine(void *runtime) {
-  EngineContext *ctx = nullptr;
-  {
-    // Close admission before touching any context-owned graphics/runtime
-    // state.  EngineLease takes these locks in the same order, making the
-    // registry check and lifetime pin atomic with respect to destruction.
-    std::unique_lock<std::mutex> registry_lock(engine_contexts_mutex);
-    auto it = engine_contexts.find((EngineContext *)runtime);
-    if (it == engine_contexts.end() || !*it)
-      return;
-    ctx = *it;
-    std::unique_lock<std::mutex> context_lock(ctx->mutex);
-    ctx->destroying = true;
-    engine_contexts.erase(it);
-  }
-
-  {
-    std::unique_lock<std::mutex> lock(ctx->mutex);
-    ctx->lifecycle_cv.wait(lock, [ctx] { return ctx->active_calls == 0; });
-  }
-
+  EngineContext *ctx = as_engine(runtime);
+  if (!ctx)
+    return;
   ScopedOpenGLContext gl_scope(ctx);
-  // The context is already closed to new callers and all leases have drained.
-  // Continue cleanup even if an optional graphics-context rebind is
-  // unavailable; returning here would leak the runtime after removing it
-  // from the live registry.
+  if (!gl_scope.ready())
+    return;
+
+  {
+    std::lock_guard<std::mutex> lock(engine_contexts_mutex);
+    if (engine_contexts.find(ctx) == engine_contexts.end())
+      return;
+    engine_contexts.erase(ctx);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ctx->destroying = true;
+  }
 
   try {
     if (ctx->runtime)
@@ -1783,27 +1456,29 @@ EXPORT void destroy_aot_engine(void *runtime) {
   }
 
   std::vector<ModuleContext *> modules;
-  std::vector<TiMemory> allocations;
+  std::vector<TiMemory> buffers;
   {
     std::lock_guard<std::mutex> lock(ctx->mutex);
     for (auto *mod : ctx->modules)
       modules.push_back(mod);
-    for (const auto &entry : ctx->allocations)
-      allocations.push_back(entry.first);
+    for (auto mem : ctx->buffers)
+      buffers.push_back(mem);
     ctx->modules.clear();
-    ctx->allocations.clear();
+    ctx->buffers.clear();
+    ctx->mapped_buffers.clear();
     ctx->pipelines.clear();
   }
 
   for (auto *mod : modules) {
     try {
-      ModuleContext *retired = begin_module_destroy(mod);
-      finish_module_destroy(retired);
+      if (mod && mod->module)
+        delete mod->module;
+      delete mod;
     } catch (...) {
     }
   }
 
-  for (auto mem : allocations) {
+  for (auto mem : buffers) {
     try {
       if (ctx->runtime && mem)
         ti_free_memory(ctx->runtime->runtime(), mem);
@@ -1829,19 +1504,13 @@ EXPORT void destroy_aot_engine(void *runtime) {
 // -----------------------------------------------------------------------
 EXPORT void *allocate_gpu_buffer(void *runtime, uint64_t size,
                                  int host_accessible) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt)
     return nullptr;
-  if (size == 0) {
-    set_engine_error(engine, "allocate_gpu_buffer: allocation size must be positive");
-    return nullptr;
-  }
   TiMemoryAllocateInfo allocate_info = {};
   allocate_info.size = size;
   allocate_info.usage = TI_MEMORY_USAGE_STORAGE_BIT;
@@ -1854,203 +1523,98 @@ EXPORT void *allocate_gpu_buffer(void *runtime, uint64_t size,
   }
   TiMemory mem = ti_allocate_memory(rt->runtime(), &allocate_info);
   if (mem) {
-    bool registered = false;
-    try {
-      std::lock_guard<std::mutex> lock(engine->mutex);
-      registered = engine->allocations.emplace(
-                       mem, GpuAllocationRecord{size, false})
-                       .second;
-    } catch (...) {
-      registered = false;
-    }
-    if (!registered) {
-      // Never expose an allocation that the ownership table could not admit.
-      ti_free_memory(rt->runtime(), mem);
-      set_engine_error(
-          engine,
-          "allocate_gpu_buffer: failed to register native allocation");
-      return nullptr;
-    }
+    std::lock_guard<std::mutex> lock(engine->mutex);
+    engine->buffers.insert(mem);
   }
   return (void *)mem;
 }
 
 EXPORT void free_gpu_buffer(void *runtime, void *memory) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "free_gpu_buffer: runtime is not live");
-    return;
-  }
-  if (!memory) {
-    set_engine_error(engine, "free_gpu_buffer: null GPU allocation handle");
-    return;
-  }
-  {
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
-                                        "free_gpu_buffer"))
-      return;
-    // Reject freeing a mapped allocation.  The caller must make the map/unmap
-    // transition explicit so a later owner cannot observe a stale mapped state
-    // or an already-freed native handle.
-    engine->allocations.erase((TiMemory)memory);
-  }
-  try {
+  if (rt && memory) {
+    {
+      std::lock_guard<std::mutex> lock(engine->mutex);
+      engine->mapped_buffers.erase((TiMemory)memory);
+      engine->buffers.erase((TiMemory)memory);
+    }
     ti_free_memory(rt->runtime(), (TiMemory)memory);
-  } catch (...) {
-    // The handle is intentionally already retired from the admission table;
-    // a later duplicate free must never reach the Taichi runtime.
-    set_engine_error(engine, "free_gpu_buffer: native free failed");
   }
 }
 
 EXPORT void write_to_gpu_buffer(void *runtime, void *memory, void *data,
                                 uint64_t size) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "write_to_gpu_buffer: runtime is not live");
-    return;
-  }
-  if (!memory || !data) {
-    set_engine_error(engine, "write_to_gpu_buffer: null memory or host pointer");
-    return;
-  }
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, size,
-                                      "write_to_gpu_buffer"))
+  if (!rt || !memory || !data)
     return;
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
     memcpy(ptr, data, size);
     ti_unmap_memory(rt->runtime(), (TiMemory)memory);
-  } else
-    engine->last_error = "write_to_gpu_buffer: GPU map failed";
+  }
 }
 
 EXPORT void read_from_gpu_buffer(void *runtime, void *memory, void *data,
                                  uint64_t size) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "read_from_gpu_buffer: runtime is not live");
-    return;
-  }
-  if (!memory || !data) {
-    set_engine_error(engine, "read_from_gpu_buffer: null memory or host pointer");
-    return;
-  }
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, size,
-                                      "read_from_gpu_buffer"))
+  if (!rt || !memory || !data)
     return;
   rt->wait(); // Ensure all kernels are done before reading
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
     memcpy(data, ptr, size);
     ti_unmap_memory(rt->runtime(), (TiMemory)memory);
-  } else
-    engine->last_error = "read_from_gpu_buffer: GPU map failed";
+  }
 }
 
 EXPORT void *map_gpu_buffer(void *runtime, void *memory) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return nullptr;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "map_gpu_buffer: runtime is not live");
-    return nullptr;
-  }
-  if (!memory) {
-    set_engine_error(engine, "map_gpu_buffer: null GPU allocation handle");
-    return nullptr;
-  }
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
-                                      "map_gpu_buffer"))
+  if (!rt || !memory)
     return nullptr;
   void *ptr = ti_map_memory(rt->runtime(), (TiMemory)memory);
   if (ptr) {
-    auto it = engine->allocations.find((TiMemory)memory);
-    if (it != engine->allocations.end())
-      it->second.mapped = true;
+    std::lock_guard<std::mutex> lock(engine->mutex);
+    engine->mapped_buffers.insert((TiMemory)memory);
   }
   return ptr;
 }
 
 EXPORT void unmap_gpu_buffer(void *runtime, void *memory) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "unmap_gpu_buffer: runtime is not live");
-    return;
+  if (rt && memory) {
+    ti_unmap_memory(rt->runtime(), (TiMemory)memory);
+    std::lock_guard<std::mutex> lock(engine->mutex);
+    engine->mapped_buffers.erase((TiMemory)memory);
   }
-  if (!memory) {
-    set_engine_error(engine, "unmap_gpu_buffer: null GPU allocation handle");
-    return;
-  }
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)memory, 0,
-                                      "unmap_gpu_buffer", false))
-    return;
-  auto it = engine->allocations.find((TiMemory)memory);
-  if (!it->second.mapped) {
-    engine->last_error =
-        "unmap_gpu_buffer: GPU allocation is not currently mapped";
-    return;
-  }
-  ti_unmap_memory(rt->runtime(), (TiMemory)memory);
-  it->second.mapped = false;
 }
 
 EXPORT void copy_gpu_buffer(void *runtime, void *src, void *dst,
                             uint64_t size) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt) {
-    set_engine_error(engine, "copy_gpu_buffer: runtime is not live");
-    return;
-  }
-  if (!src || !dst) {
-    set_engine_error(engine, "copy_gpu_buffer: null source or destination handle");
-    return;
-  }
-
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)src, size,
-                                      "copy_gpu_buffer") ||
-      !validate_gpu_allocation_locked(engine, (TiMemory)dst, size,
-                                      "copy_gpu_buffer"))
+  if (!rt || !src || !dst)
     return;
 
   TiMemorySlice src_slice = {};
@@ -2068,8 +1632,7 @@ EXPORT void copy_gpu_buffer(void *runtime, void *src, void *dst,
 }
 
 EXPORT void sync_runtime(void *runtime) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
@@ -2081,111 +1644,42 @@ EXPORT void sync_runtime(void *runtime) {
 // -----------------------------------------------------------------------
 // High-Performance Image IO (Smart Loader)
 // -----------------------------------------------------------------------
-static bool checked_image_geometry(int width, int height, int channels,
-                                   int bit_depth, uint64_t *stride_out,
-                                   uint64_t *size_out) {
-  if (width <= 0 || height <= 0 || (channels != 1 && channels != 3) ||
-      (bit_depth != 8 && bit_depth != 16) || !stride_out || !size_out)
-    return false;
-  const uint64_t max_value = std::numeric_limits<uint64_t>::max();
-  const uint64_t bytes_per_channel = static_cast<uint64_t>(bit_depth / 8);
-  uint64_t stride = static_cast<uint64_t>(width);
-  if (stride > max_value / static_cast<uint64_t>(channels))
-    return false;
-  stride *= static_cast<uint64_t>(channels);
-  if (stride > max_value / bytes_per_channel)
-    return false;
-  stride *= bytes_per_channel;
-  if (stride > max_value / static_cast<uint64_t>(height))
-    return false;
-  *stride_out = stride;
-  *size_out = stride * static_cast<uint64_t>(height);
-  return true;
-}
-
-static bool image_io_test_failure(const char *stage) {
-#ifdef _WIN32
-  char configured[128] = {};
-  const DWORD length = GetEnvironmentVariableA(
-      "PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO", configured,
-      static_cast<DWORD>(sizeof(configured)));
-  return length > 0 && length < sizeof(configured) && stage &&
-         std::strcmp(configured, stage) == 0;
-#else
-  const char *configured = std::getenv("PIXEL_REFINE_AOT_TEST_FAIL_IMAGE_IO");
-  return configured && stage && std::strcmp(configured, stage) == 0;
-#endif
-}
-
 EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
                               int *out_height, int *out_channels,
                               int *out_bit_depth) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
-  if (!gl_scope.ready()) {
-    set_engine_error(engine, "ti_imread_to_gpu: native graphics context is not ready");
+  if (!gl_scope.ready())
     return nullptr;
-  }
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt || !path || !out_width || !out_height || !out_channels ||
-      !out_bit_depth) {
-    set_engine_error(engine, "ti_imread_to_gpu: invalid runtime, path, or output pointers");
+  if (!rt || !path)
     return nullptr;
-  }
-  *out_width = 0;
-  *out_height = 0;
-  *out_channels = 0;
-  *out_bit_depth = 0;
 
 #ifdef _WIN32
   init_wic();
-  if (!g_wic_factory) {
-    set_engine_error(engine, "ti_imread_to_gpu: WIC factory initialization failed");
+  if (!g_wic_factory)
     return nullptr;
-  }
 
   IWICBitmapDecoder *decoder = nullptr;
   wchar_t w_path[MAX_PATH];
-  if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH)) {
-    set_engine_error(engine, "ti_imread_to_gpu: UTF-8 path conversion failed or path exceeds MAX_PATH");
-    return nullptr;
-  }
+  MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
 
-  const HRESULT decoder_result = g_wic_factory->CreateDecoderFromFilename(
-      w_path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder);
-  if (FAILED(decoder_result) || !decoder) {
-    set_engine_error(engine, "ti_imread_to_gpu: WIC decoder creation failed");
+  if (FAILED(g_wic_factory->CreateDecoderFromFilename(
+          w_path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+          &decoder))) {
     return nullptr;
   }
 
   IWICBitmapFrameDecode *frame = nullptr;
-  if (FAILED(decoder->GetFrame(0, &frame)) || !frame) {
-    set_engine_error(engine, "ti_imread_to_gpu: WIC frame acquisition failed");
-    decoder->Release();
-    return nullptr;
-  }
+  decoder->GetFrame(0, &frame);
 
-  UINT w = 0, h = 0;
-  if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0 ||
-      w > static_cast<UINT>(std::numeric_limits<int>::max()) ||
-      h > static_cast<UINT>(std::numeric_limits<int>::max())) {
-    set_engine_error(engine, "ti_imread_to_gpu: WIC frame dimensions are invalid");
-    frame->Release();
-    decoder->Release();
-    return nullptr;
-  }
+  UINT w, h;
+  frame->GetSize(&w, &h);
   *out_width = (int)w;
   *out_height = (int)h;
 
   WICPixelFormatGUID pixel_format;
-  if (FAILED(frame->GetPixelFormat(&pixel_format))) {
-    set_engine_error(engine, "ti_imread_to_gpu: WIC pixel format query failed");
-    frame->Release();
-    decoder->Release();
-    return nullptr;
-  }
+  frame->GetPixelFormat(&pixel_format);
 
   // Determine channels and bit depth
   int channels = 1;
@@ -2211,9 +1705,7 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
     bit_depth = 16;
     target_format = GUID_WICPixelFormat48bppBGR;
   } else {
-    // WIC conversion is allowed for formats with a supported target, but all
-    // conversion results below are checked.  Never expose an uninitialized
-    // allocation when a codec/format operation fails.
+    // Default fallback to 8-bit BGR
     channels = 3;
     bit_depth = 8;
     target_format = GUID_WICPixelFormat24bppBGR;
@@ -2223,15 +1715,7 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
   *out_bit_depth = bit_depth;
 
   // Allocate GPU memory
-  uint64_t row_bytes = 0;
-  uint64_t size_bytes = 0;
-  if (!checked_image_geometry((int)w, (int)h, channels, bit_depth, &row_bytes,
-                              &size_bytes)) {
-    set_engine_error(engine, "ti_imread_to_gpu: decoded image geometry is unsupported or overflows");
-    frame->Release();
-    decoder->Release();
-    return nullptr;
-  }
+  uint64_t size_bytes = (uint64_t)w * h * channels * (bit_depth / 8);
   TiMemoryAllocateInfo allocate_info = {};
   allocate_info.size = size_bytes;
   allocate_info.usage = TI_MEMORY_USAGE_STORAGE_BIT;
@@ -2239,95 +1723,41 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
 
   TiMemory gpu_mem = ti_allocate_memory(rt->runtime(), &allocate_info);
   if (!gpu_mem) {
-    set_engine_error(engine, "ti_imread_to_gpu: GPU allocation failed");
     frame->Release();
     decoder->Release();
     return nullptr;
   }
   {
     std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->allocations.emplace(gpu_mem,
-                                GpuAllocationRecord{size_bytes, false});
+    engine->buffers.insert(gpu_mem);
   }
 
   // Copy pixels directly to GPU (using mapped memory if possible, or
   // intermediate buffer)
-  std::unique_lock<std::mutex> allocation_lock(engine->mutex);
-  auto allocation_it = engine->allocations.find(gpu_mem);
-  if (allocation_it == engine->allocations.end()) {
-    engine->last_error =
-        "ti_imread_to_gpu: allocation was not registered with this runtime";
-    allocation_lock.unlock();
-    ti_free_memory(rt->runtime(), gpu_mem);
-    frame->Release();
-    decoder->Release();
-    return nullptr;
-  }
   void *gpu_ptr = ti_map_memory(rt->runtime(), gpu_mem);
-  if (!gpu_ptr || image_io_test_failure("read_map")) {
-    engine->last_error = gpu_ptr
-                              ? "ti_imread_to_gpu: injected GPU map failure"
-                              : "ti_imread_to_gpu: GPU map failed";
-    if (gpu_ptr)
-      ti_unmap_memory(rt->runtime(), gpu_mem);
-    engine->allocations.erase(allocation_it);
-    allocation_lock.unlock();
-    ti_free_memory(rt->runtime(), gpu_mem);
-    frame->Release();
-    decoder->Release();
-    return nullptr;
-  }
-  allocation_it->second.mapped = true;
-
-  bool copy_ok = false;
-  if (image_io_test_failure("read_copy")) {
-    engine->last_error = "ti_imread_to_gpu: injected pixel copy failure";
-  } else if (pixel_format != target_format) {
+  if (gpu_ptr) {
+    if (pixel_format != target_format) {
       // Need conversion
       IWICFormatConverter *converter = nullptr;
-      if (SUCCEEDED(g_wic_factory->CreateFormatConverter(&converter)) &&
-          converter &&
-          SUCCEEDED(converter->Initialize(
-              frame, target_format, WICBitmapDitherTypeNone, NULL, 0.0,
-              WICBitmapPaletteTypeCustom)) &&
-          size_bytes <= std::numeric_limits<UINT>::max()) {
-        copy_ok = SUCCEEDED(converter->CopyPixels(
-            NULL, static_cast<UINT>(row_bytes), static_cast<UINT>(size_bytes),
-            (BYTE *)gpu_ptr));
-      }
-      if (converter)
-        converter->Release();
-  } else if (size_bytes <= std::numeric_limits<UINT>::max()) {
-      copy_ok = SUCCEEDED(frame->CopyPixels(
-          NULL, static_cast<UINT>(row_bytes), static_cast<UINT>(size_bytes),
-          (BYTE *)gpu_ptr));
-  }
-  ti_unmap_memory(rt->runtime(), gpu_mem);
-  allocation_it->second.mapped = false;
-
-  if (!copy_ok) {
-    if (engine->last_error.empty())
-      engine->last_error = "ti_imread_to_gpu: WIC pixel copy/conversion failed";
-    engine->allocations.erase(allocation_it);
-    allocation_lock.unlock();
-    ti_free_memory(rt->runtime(), gpu_mem);
-    frame->Release();
-    decoder->Release();
-    *out_width = 0;
-    *out_height = 0;
-    *out_channels = 0;
-    *out_bit_depth = 0;
-    return nullptr;
+      g_wic_factory->CreateFormatConverter(&converter);
+      converter->Initialize(frame, target_format, WICBitmapDitherTypeNone, NULL,
+                            0.0, WICBitmapPaletteTypeCustom);
+      converter->CopyPixels(NULL, (UINT)(w * channels * (bit_depth / 8)),
+                            (UINT)size_bytes, (BYTE *)gpu_ptr);
+      converter->Release();
+    } else {
+      frame->CopyPixels(NULL, (UINT)(w * channels * (bit_depth / 8)),
+                        (UINT)size_bytes, (BYTE *)gpu_ptr);
+    }
+    ti_unmap_memory(rt->runtime(), gpu_mem);
   }
 
-  allocation_lock.unlock();
   frame->Release();
   decoder->Release();
   return (void *)gpu_mem;
 
 #else
   // TODO: Implement for Linux/Android using stb_image or similar
-  set_engine_error(engine, "ti_imread_to_gpu: native image reader is unavailable on this platform");
   return nullptr;
 #endif
 }
@@ -2335,137 +1765,31 @@ EXPORT void *ti_imread_to_gpu(void *runtime, const char *path, int *out_width,
 EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
                                 int width, int height, int channels,
                                 int bit_depth) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
-  clear_engine_error(engine);
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
-  if (!gl_scope.ready()) {
-    set_engine_error(engine, "ti_imwrite_from_gpu: native graphics context is not ready");
+  if (!gl_scope.ready())
     return false;
-  }
   ti::Runtime *rt = engine_runtime(engine);
-  if (!rt || !path || !gpu_mem) {
-    set_engine_error(engine, "ti_imwrite_from_gpu: invalid runtime, path, or GPU handle");
+  if (!rt || !path || !gpu_mem)
     return false;
-  }
 
 #ifdef _WIN32
   init_wic();
-  if (!g_wic_factory) {
-    set_engine_error(engine, "ti_imwrite_from_gpu: WIC factory initialization failed");
+  if (!g_wic_factory)
     return false;
-  }
-
-  uint64_t stride64 = 0;
-  uint64_t size64 = 0;
-  if (!checked_image_geometry(width, height, channels, bit_depth, &stride64,
-                              &size64) ||
-      stride64 > std::numeric_limits<UINT>::max() ||
-      size64 > std::numeric_limits<UINT>::max()) {
-    set_engine_error(engine,
-                     "ti_imwrite_from_gpu: invalid image geometry or byte-size overflow");
-    return false;
-  }
-
-  std::unique_lock<std::mutex> allocation_lock(engine->mutex);
-  if (!validate_gpu_allocation_locked(engine, (TiMemory)gpu_mem, size64,
-                                      "ti_imwrite_from_gpu"))
-    return false;
-
-  // Map the source before creating or truncating the destination file.  A
-  // failed map must be fail-closed without leaving an empty/partial output at
-  // the requested path.
-  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
-  if (!gpu_ptr) {
-    engine->last_error = "ti_imwrite_from_gpu: GPU map failed";
-    return false;
-  }
-  auto allocation_it = engine->allocations.find((TiMemory)gpu_mem);
-  if (allocation_it == engine->allocations.end()) {
-    ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
-    engine->last_error =
-        "ti_imwrite_from_gpu: allocation disappeared during GPU map";
-    return false;
-  }
-  allocation_it->second.mapped = true;
 
   IWICStream *stream = nullptr;
-  IWICBitmapEncoder *encoder = nullptr;
-  IWICBitmapFrameEncode *frame = nullptr;
-  std::vector<wchar_t> temp_w;
-  auto cleanup = [&]() {
-    if (gpu_ptr) {
-      ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
-      gpu_ptr = nullptr;
-      auto it = engine->allocations.find((TiMemory)gpu_mem);
-      if (it != engine->allocations.end())
-        it->second.mapped = false;
-    }
-    if (frame) {
-      frame->Release();
-      frame = nullptr;
-    }
-    if (encoder) {
-      encoder->Release();
-      encoder = nullptr;
-    }
-    if (stream) {
-      stream->Release();
-      stream = nullptr;
-    }
-  };
+  g_wic_factory->CreateStream(&stream);
 
-  auto fail = [&](const char *operation, HRESULT hr) {
-    cleanup();
-    if (!temp_w.empty())
-      DeleteFileW(temp_w.data());
-    std::ostringstream message;
-    message << "ti_imwrite_from_gpu: " << operation << " failed";
-    if (hr != S_OK)
-      message << " (HRESULT=0x" << std::hex << static_cast<unsigned long>(hr)
-              << ")";
-    engine->last_error = message.str();
+  wchar_t w_path[MAX_PATH];
+  MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
+
+  if (FAILED(stream->InitializeFromFilename(w_path, GENERIC_WRITE))) {
+    stream->Release();
     return false;
-  };
+  }
 
-  if (image_io_test_failure("map"))
-    return fail("injected GPU map failure", E_FAIL);
-
-  const int target_chars = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
-  if (target_chars <= 0)
-    return fail("UTF-8 path conversion", HRESULT_FROM_WIN32(GetLastError()));
-  std::vector<wchar_t> target_w(static_cast<size_t>(target_chars));
-  if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, target_w.data(), target_chars))
-    return fail("UTF-8 path conversion", HRESULT_FROM_WIN32(GetLastError()));
-
-  static std::atomic<uint64_t> temp_sequence{0};
-  const uint64_t sequence = ++temp_sequence;
-  std::string temp_path = std::string(path) + ".pixelrefine.tmp." +
-                          std::to_string(GetCurrentProcessId()) + "." +
-                          std::to_string(sequence);
-  const int temp_chars =
-      MultiByteToWideChar(CP_UTF8, 0, temp_path.c_str(), -1, nullptr, 0);
-  if (temp_chars <= 0)
-    return fail("temporary path conversion", HRESULT_FROM_WIN32(GetLastError()));
-  temp_w.resize(static_cast<size_t>(temp_chars));
-  if (!MultiByteToWideChar(CP_UTF8, 0, temp_path.c_str(), -1, temp_w.data(),
-                           temp_chars))
-    return fail("temporary path conversion", HRESULT_FROM_WIN32(GetLastError()));
-
-  HANDLE temp_handle = CreateFileW(temp_w.data(), GENERIC_WRITE, 0, nullptr,
-                                    CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-  if (temp_handle == INVALID_HANDLE_VALUE)
-    return fail("temporary file creation", HRESULT_FROM_WIN32(GetLastError()));
-  CloseHandle(temp_handle);
-
-  HRESULT hr = g_wic_factory->CreateStream(&stream);
-  if (FAILED(hr) || !stream)
-    return fail("WIC stream creation", FAILED(hr) ? hr : E_FAIL);
-
-  hr = stream->InitializeFromFilename(temp_w.data(), GENERIC_WRITE);
-  if (FAILED(hr))
-    return fail("temporary stream initialization", hr);
-
+  IWICBitmapEncoder *encoder = nullptr;
   // Auto-detect encoder based on extension
   GUID encoder_guid = GUID_ContainerFormatPng;
   std::string s_path = path;
@@ -2476,25 +1800,17 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
     encoder_guid = GUID_ContainerFormatTiff;
   }
 
-  if (image_io_test_failure("encoder"))
-    return fail("injected WIC encoder failure", E_FAIL);
-  hr = g_wic_factory->CreateEncoder(encoder_guid, NULL, &encoder);
-  if (FAILED(hr) || !encoder)
-    return fail("WIC encoder creation", FAILED(hr) ? hr : E_FAIL);
+  if (FAILED(g_wic_factory->CreateEncoder(encoder_guid, NULL, &encoder))) {
+    stream->Release();
+    return false;
+  }
 
-  hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-  if (FAILED(hr))
-    return fail("WIC encoder initialization", hr);
+  encoder->Initialize(stream, WICBitmapEncoderNoCache);
 
-  hr = encoder->CreateNewFrame(&frame, NULL);
-  if (FAILED(hr) || !frame)
-    return fail("WIC frame creation", FAILED(hr) ? hr : E_FAIL);
-  hr = frame->Initialize(NULL);
-  if (FAILED(hr))
-    return fail("WIC frame initialization", hr);
-  hr = frame->SetSize(width, height);
-  if (FAILED(hr))
-    return fail("WIC frame sizing", hr);
+  IWICBitmapFrameEncode *frame = nullptr;
+  encoder->CreateNewFrame(&frame, NULL);
+  frame->Initialize(NULL);
+  frame->SetSize(width, height);
 
   WICPixelFormatGUID format_guid = GUID_WICPixelFormat8bppGray;
   if (bit_depth == 8) {
@@ -2505,57 +1821,24 @@ EXPORT bool ti_imwrite_from_gpu(void *runtime, const char *path, void *gpu_mem,
                                   : GUID_WICPixelFormat48bppBGR;
   }
 
-  hr = frame->SetPixelFormat(&format_guid);
-  if (FAILED(hr))
-    return fail("WIC pixel-format selection", hr);
-  WICPixelFormatGUID expected_format =
-      (bit_depth == 8)
-          ? ((channels == 1) ? GUID_WICPixelFormat8bppGray
-                             : GUID_WICPixelFormat24bppBGR)
-          : ((channels == 1) ? GUID_WICPixelFormat16bppGray
-                             : GUID_WICPixelFormat48bppBGR);
-  if (format_guid != expected_format)
-    return fail("unsupported WIC pixel-format conversion", E_FAIL);
+  frame->SetPixelFormat(&format_guid);
 
-  HRESULT write_result = frame->WritePixels(
-      static_cast<UINT>(height), static_cast<UINT>(stride64),
-      static_cast<UINT>(size64), (BYTE *)gpu_ptr);
-  ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
-  gpu_ptr = nullptr;
-  auto mapped_it = engine->allocations.find((TiMemory)gpu_mem);
-  if (mapped_it != engine->allocations.end())
-    mapped_it->second.mapped = false;
-  if (FAILED(write_result))
-    return fail("WIC pixel write", write_result);
-  if (image_io_test_failure("frame_commit"))
-    return fail("injected WIC frame commit failure", E_FAIL);
-  hr = frame->Commit();
-  if (FAILED(hr))
-    return fail("WIC frame commit", hr);
-  if (image_io_test_failure("encoder_commit"))
-    return fail("injected WIC encoder commit failure", E_FAIL);
-  hr = encoder->Commit();
-  if (FAILED(hr))
-    return fail("WIC encoder commit", hr);
-
-  if (image_io_test_failure("replace"))
-    return fail("injected final file replace failure", E_FAIL);
-  cleanup();
-  if (!MoveFileExW(temp_w.data(), target_w.data(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    const HRESULT move_error = HRESULT_FROM_WIN32(GetLastError());
-    DeleteFileW(temp_w.data());
-    std::ostringstream message;
-    message << "ti_imwrite_from_gpu: final file replace failed (HRESULT=0x"
-            << std::hex << static_cast<unsigned long>(move_error) << ")";
-    engine->last_error = message.str();
-    return false;
+  void *gpu_ptr = ti_map_memory(rt->runtime(), (TiMemory)gpu_mem);
+  if (gpu_ptr) {
+    UINT stride = width * channels * (bit_depth / 8);
+    UINT size = stride * height;
+    frame->WritePixels(height, stride, size, (BYTE *)gpu_ptr);
+    ti_unmap_memory(rt->runtime(), (TiMemory)gpu_mem);
   }
 
+  frame->Commit();
+  encoder->Commit();
+
+  frame->Release();
+  encoder->Release();
+  stream->Release();
   return true;
 #else
-  set_engine_error(engine,
-                   "ti_imwrite_from_gpu: native image writer is unavailable on this platform");
   return false;
 #endif
 }
@@ -3013,11 +2296,8 @@ EXPORT bool ti_cast_buffer(void *src_ptr, void *dst_ptr,
 // -----------------------------------------------------------------------
 // Internal Helper for Argument Mapping
 // -----------------------------------------------------------------------
-static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
-                          int i, EngineContext *engine = nullptr,
-                          const char *operation = "dynamic argument") {
-  if (!dyn_arg.name || dyn_arg.name[0] == '\0')
-    return false;
+static void _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
+                         int i) {
   arg.name = dyn_arg.name;
   /*
   if (dyn_arg.elem_dim_count > 0) {
@@ -3030,11 +2310,7 @@ static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
   }
   */
 
-  if (dyn_arg.arg_type != 0 && dyn_arg.arg_type != 1)
-    return false;
   if (dyn_arg.arg_type == 1) { // Scalar
-    if (dyn_arg.dtype != 0 && dyn_arg.dtype != 1)
-      return false;
     if (dyn_arg.dtype == 0) {  // f32
       arg.argument.type = TI_ARGUMENT_TYPE_F32;
       union {
@@ -3062,23 +2338,6 @@ static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
       }
     }
   } else { // NDArray
-    if (dyn_arg.dtype < 0 || dyn_arg.dtype > 5 || dyn_arg.val_u64 == 0 ||
-        dyn_arg.dim_count < 1 || dyn_arg.dim_count > 8 ||
-        dyn_arg.elem_dim_count < 0 || dyn_arg.elem_dim_count > 8 ||
-        (dyn_arg.is_vector != 0 && dyn_arg.is_vector != 1) ||
-       (dyn_arg.is_vector &&
-         (dyn_arg.vector_dim < 2 || dyn_arg.vector_dim > 4)))
-      return false;
-    for (int d = 0; d < dyn_arg.dim_count; d++) {
-      if (dyn_arg.shape[d] <= 0)
-        return false;
-    }
-    for (int d = 0; d < dyn_arg.elem_dim_count; d++) {
-      if (dyn_arg.elem_shape[d] <= 0)
-        return false;
-    }
-    if (!validate_dynamic_arg_allocation(engine, dyn_arg, operation))
-      return false;
     arg.argument.type = TI_ARGUMENT_TYPE_NDARRAY;
     arg.argument.value.ndarray.memory = (TiMemory)dyn_arg.val_u64;
 
@@ -3104,7 +2363,6 @@ static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
       arg.argument.value.ndarray.elem_shape.dims[d] = dyn_arg.elem_shape[d];
     }
   }
-  return true;
 }
 
 // -----------------------------------------------------------------------
@@ -3113,41 +2371,14 @@ static bool _fill_ti_arg(TiNamedArgument &arg, const DynamicArg &dyn_arg,
 EXPORT void run_aot_graph(void *runtime, void *module_ctx,
                           const char *graph_name, DynamicArg *args_array,
                           int num_args) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
-  ModuleLease module_lease(module_ctx);
-  ModuleContext *ctx = module_lease.get();
-  if (!rt)
+  ModuleContext *ctx = (ModuleContext *)module_ctx;
+  if (!rt || !ctx || !ctx->module || !args_array)
     return;
-  if (!ctx) {
-    set_engine_error(engine, "run_aot_graph: module handle is stale");
-    return;
-  }
-  if (!ctx->module) {
-    set_engine_error(engine, "run_aot_graph: module is not live");
-    return;
-  }
-  if (ctx->owner != engine) {
-    set_engine_error(engine,
-                     "run_aot_graph: module belongs to a different runtime");
-    return;
-  }
-  if (!graph_name || graph_name[0] == '\0') {
-    set_engine_error(engine, "run_aot_graph: graph name is empty");
-    return;
-  }
-  if (num_args < 0 || num_args > kMaxDynamicArgs) {
-    set_engine_error(engine, "run_aot_graph: invalid DynamicArg count");
-    return;
-  }
-  if (num_args > 0 && !args_array) {
-    set_engine_error(engine, "run_aot_graph: argument array is null");
-    return;
-  }
 
   try {
     FILE *entry_log = is_debug_logging_enabled() ? fopen("engine_debug.log", "a") : nullptr;
@@ -3176,11 +2407,7 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
     ti_args.reserve(num_args);
     for (int i = 0; i < num_args; i++) {
       TiNamedArgument arg = {};
-      if (!_fill_ti_arg(arg, args_array[i], i, engine, "run_aot_graph")) {
-        if (!engine_has_error(engine))
-          set_engine_error(engine, "run_aot_graph: invalid DynamicArg descriptor");
-        return;
-      }
+      _fill_ti_arg(arg, args_array[i], i);
       ti_args.push_back(arg);
     }
 
@@ -3236,49 +2463,32 @@ EXPORT void run_aot_graph(void *runtime, void *module_ctx,
 // -----------------------------------------------------------------------
 
 EXPORT void clear_pipeline(void *module_ctx, const char *pipeline_name) {
-  ModuleLease module_lease(module_ctx);
-  ModuleContext *mod = module_lease.get();
-  // A null module owner used to mean "broadcast this name to every engine".
-  // That is unsafe: normal pipeline cleanup must never mutate an unrelated
-  // runtime. Legacy process-global cleanup, if ever needed, must be exposed
-  // as a separate explicit API rather than hidden behind nullptr.
-  if (!mod || !mod->owner || !pipeline_name)
+  ModuleContext *mod = (ModuleContext *)module_ctx;
+  if (mod && mod->owner) {
+    std::lock_guard<std::mutex> lock(mod->owner->mutex);
+    mod->owner->pipelines.erase(pipeline_name);
     return;
-  std::lock_guard<std::mutex> lock(mod->owner->mutex);
-  mod->owner->pipelines.erase(pipeline_name);
-}
+  }
 
-EXPORT void clear_pipeline_for_engine(void *runtime, const char *pipeline_name) {
-  EngineLease engine_lease(runtime);
-  EngineContext *ctx = engine_lease.get();
-  if (!ctx || !pipeline_name)
-    return;
-  std::lock_guard<std::mutex> lock(ctx->mutex);
-  ctx->pipelines.erase(pipeline_name);
+  {
+    std::lock_guard<std::mutex> lock(pipelines_mutex);
+    global_pipelines.erase(pipeline_name);
+  }
+  std::lock_guard<std::mutex> lock(engine_contexts_mutex);
+  for (auto *ctx : engine_contexts) {
+    if (!ctx)
+      continue;
+    std::lock_guard<std::mutex> ctx_lock(ctx->mutex);
+    ctx->pipelines.erase(pipeline_name);
+  }
 }
 
 EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
                             const char *graph_name, DynamicArg *args_array,
                             int num_args) {
-  ModuleLease module_lease(module_ctx);
-  ModuleContext *mod = module_lease.get();
-  if (!mod)
+  ModuleContext *mod = (ModuleContext *)module_ctx;
+  if (!args_array || !mod)
     return;
-  if (!pipeline_name || pipeline_name[0] == '\0' || !graph_name ||
-      graph_name[0] == '\0') {
-    set_engine_error(mod->owner,
-                     "add_to_pipeline: pipeline and graph names are required");
-    return;
-  }
-  if (num_args < 0 || num_args > kMaxDynamicArgs) {
-    set_engine_error(mod->owner, "add_to_pipeline: invalid DynamicArg count");
-    return;
-  }
-  if (num_args > 0 && !args_array) {
-    set_engine_error(mod->owner, "add_to_pipeline: argument array is null");
-    return;
-  }
-  clear_engine_error(mod->owner);
 
   GraphDispatch dispatch;
   dispatch.module_ctx = module_ctx;
@@ -3288,12 +2498,6 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
 
   for (int i = 0; i < num_args; i++) {
     DynamicArg arg = args_array[i];
-    TiNamedArgument validation = {};
-    if (!_fill_ti_arg(validation, arg, i, mod->owner, "add_to_pipeline")) {
-      if (!engine_has_error(mod->owner))
-        set_engine_error(mod->owner, "add_to_pipeline: invalid DynamicArg descriptor");
-      return;
-    }
     // Allocate storage for name string to keep it alive
     dispatch.arg_names.push_back(args_array[i].name);
     arg.name = dispatch.arg_names.back().c_str();
@@ -3312,26 +2516,13 @@ EXPORT void add_to_pipeline(void *module_ctx, const char *pipeline_name,
 EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
                          uint64_t *old_handles, DynamicArg *new_args,
                          int num_overrides) {
-  EngineLease lease(runtime);
-  EngineContext *engine = lease.get();
+  EngineContext *engine = as_engine(runtime);
   ScopedOpenGLContext gl_scope(engine);
   if (!gl_scope.ready())
     return;
   ti::Runtime *rt = engine_runtime(engine);
   if (!rt)
     return;
-  if (!pipeline_name || pipeline_name[0] == '\0') {
-    set_engine_error(engine, "run_pipeline: pipeline name is empty");
-    return;
-  }
-  if (num_overrides < 0 || num_overrides > kMaxDynamicArgs) {
-    set_engine_error(engine, "run_pipeline: invalid override count");
-    return;
-  }
-  if (num_overrides > 0 && (!old_handles || !new_args)) {
-    set_engine_error(engine, "run_pipeline: override arrays are null");
-    return;
-  }
 
   Pipeline pipe;
   {
@@ -3368,17 +2559,9 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
   try {
     clear_engine_error(engine);
     for (auto &step : pipe.steps) {
-      ModuleLease module_lease(step.module_ctx);
-      ModuleContext *ctx = module_lease.get();
-      if (!ctx) {
-        set_engine_error(engine, "run_pipeline: module handle is stale");
-        return;
-      }
-      if (ctx->owner != engine) {
-        set_engine_error(engine,
-                         "run_pipeline: module belongs to a different runtime");
-        return;
-      }
+      ModuleContext *ctx = (ModuleContext *)step.module_ctx;
+      if (!ctx)
+        continue;
 
       std::lock_guard<std::mutex> lock(ctx->cache_mutex);
       auto it_g = ctx->graph_cache.find(step.graph_name);
@@ -3407,11 +2590,7 @@ EXPORT void run_pipeline(void *runtime, const char *pipeline_name,
             }
           }
         }
-        if (!_fill_ti_arg(arg, *final_arg, arg_idx++, engine, "run_pipeline")) {
-          if (!engine_has_error(engine))
-            set_engine_error(engine, "run_pipeline: invalid DynamicArg descriptor");
-          return;
-        }
+        _fill_ti_arg(arg, *final_arg, arg_idx++);
 
         // CRITICAL: Always use the original name from the recorded step.
         // The override argument from Python might have a generic name like

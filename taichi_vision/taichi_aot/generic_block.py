@@ -15,8 +15,6 @@ arbitrary payload when it supplies ``output_factory`` and ``merge_tile``.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 from dataclasses import dataclass, field
 from hashlib import blake2b
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
@@ -816,41 +814,36 @@ class GenericBlockExecutor:
             version=str(spec.version),
         )
 
-    @contextmanager
     def _cached(self, spec, block, context, block_id):
         if not spec.cache:
-            yield None
-            return
+            return None
         validator = spec.validate_tile or (
             lambda value, ctx: self._default_validate(value, ctx, spec)
         )
         cache = self.runtime.get_block_cache()
-        with cache.lease(block_id) as record:
-            if record is not None:
-                valid = False
-                try:
-                    valid = bool(
-                        record.is_valid()
-                        and record.source_checksum == context.source_checksum
-                        and _payload_checksum(record.data) == record.checksum
-                    )
-                    if valid:
-                        valid = bool(validator(record.data, context))
-                except Exception:
-                    valid = False
+        record = cache.get(block_id)
+        if record is not None:
+            valid = False
+            try:
+                valid = bool(
+                    record.is_valid()
+                    and record.source_checksum == context.source_checksum
+                    and _payload_checksum(record.data) == record.checksum
+                )
                 if valid:
-                    yield record
-                    return
-                cache.invalidate(block_id)
+                    valid = bool(validator(record.data, context))
+            except Exception:
+                valid = False
+            if valid:
+                return record
+            cache.invalidate(block_id)
 
         restore = getattr(self.runtime, "restore_resident_block", None)
         if restore is None:
-            yield None
-            return
+            return None
         record = restore(block_id, context.source_checksum)
         if record is None:
-            yield None
-            return
+            return None
         valid = False
         try:
             valid = bool(
@@ -866,11 +859,9 @@ class GenericBlockExecutor:
                 self.runtime.get_device_block_cache().invalidate(block_id)
             except Exception:
                 pass
-            yield None
-            return
+            return None
         self.runtime.put_block_record(record)
-        with cache.lease(block_id) as cached:
-            yield cached
+        return record
 
     def _fallback(
         self,
@@ -1018,16 +1009,16 @@ class GenericBlockExecutor:
                 source_checksum=source_checksum,
                 metadata=spec.metadata,
             )
-            with self._cached(spec, block, context, block_id) as cached:
-                if cached is not None:
-                    if result is None:
-                        result = self._make_result(spec, cached.data)
-                    merger = spec.merge_tile or (lambda out, payload, ctx: self._default_merge(out, payload, ctx, spec))
-                    merge_started = time.perf_counter()
-                    merger(result, cached.data, context)
-                    merge_seconds += time.perf_counter() - merge_started
-                    cache_hits += 1
-                    continue
+            cached = self._cached(spec, block, context, block_id)
+            if cached is not None:
+                if result is None:
+                    result = self._make_result(spec, cached.data)
+                merger = spec.merge_tile or (lambda out, payload, ctx: self._default_merge(out, payload, ctx, spec))
+                merge_started = time.perf_counter()
+                merger(result, cached.data, context)
+                merge_seconds += time.perf_counter() - merge_started
+                cache_hits += 1
+                continue
 
             last_error = None
             payload = None

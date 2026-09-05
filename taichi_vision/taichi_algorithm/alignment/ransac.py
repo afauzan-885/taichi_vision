@@ -1111,10 +1111,15 @@ def vsac_fundamental(pts1, pts2, confidence=0.999, threshold=1.0, max_lo=1, n_hy
         return np.eye(3, dtype=np.float64), np.zeros(n_pts, dtype=np.bool_), {"error": "Need >= 8 points"}
 
     if os.environ.get("AOT_MODE", "1") == "1" or not TAICHI_AVAILABLE:
-        raise RuntimeError(
-            "vsac_fundamental requires the taichi_vision AOT/TCM path; "
-            "the legacy JIT module has no OpenCV fallback"
-        )
+        try:
+            import cv2
+            F_cv, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, threshold, confidence)
+            if F_cv is not None and F_cv.shape == (3, 3):
+                inlier_mask = mask.ravel().astype(np.bool_)
+                return F_cv.astype(np.float64), inlier_mask, {"time_ms": (time.time() - t0) * 1000, "n_inliers": int(inlier_mask.sum())}
+        except Exception:
+            pass
+        return np.eye(3, dtype=np.float64), np.zeros(n_pts, dtype=np.bool_), {"error": "No backend available"}
 
     pts1_gpu = ti.ndarray(dtype=ti.f32, shape=(n_pts, 2))
     pts2_gpu = ti.ndarray(dtype=ti.f32, shape=(n_pts, 2))

@@ -123,34 +123,7 @@ def zncc(image, template):
     if os.environ.get("AOT_MODE", "1") == "1":
         from taichi_vision import taichi_aot
         return taichi_aot.zncc(image, template, return_gpu=True)
-    image = np.asarray(image, dtype=np.float32)
-    template = np.asarray(template, dtype=np.float32)
-    if image.ndim != 2 or template.ndim != 2:
-        raise ValueError("ZNCC expects 2D image and template arrays")
-    th, tw = template.shape
-    ih, iw = image.shape
-    if th == 0 or tw == 0 or th > ih or tw > iw:
-        raise ValueError("template must fit inside image and be non-empty")
-
-    template_centered = template.astype(np.float64) - float(template.mean())
-    template_energy = float(np.sum(template_centered * template_centered))
-    output = np.empty((ih - th + 1, iw - tw + 1), dtype=np.float32)
-    for y in range(output.shape[0]):
-        windows = np.lib.stride_tricks.sliding_window_view(
-            image[y : y + th], (th, tw)
-        )[0].astype(np.float64, copy=False)
-        centered = windows - windows.mean(axis=(-2, -1), keepdims=True)
-        numerator = np.sum(centered * template_centered, axis=(-2, -1))
-        denominator = np.sqrt(
-            np.maximum(0.0, np.sum(centered * centered, axis=(-2, -1)) * template_energy)
-        )
-        output[y] = np.divide(
-            numerator,
-            denominator,
-            out=np.zeros_like(numerator, dtype=np.float64),
-            where=denominator > 1.0e-12,
-        ).clip(-1.0, 1.0)
-    return output
+    return None
 
 def match_template(image, template, method="zncc"):
     """Compatibility wrapper for OpenCV-style template matching."""

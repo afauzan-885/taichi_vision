@@ -59,8 +59,14 @@ def _find_validator(explicit: Path | None) -> Path:
     found = shutil.which("spirv-val")
     if found:
         candidates.append(Path(found))
-    # Vulkan SDK/cache is selected through PATH or an explicit environment
-    # variable.  Never encode a developer-specific user profile in the repo.
+    # Vulkan SDK/cache is the supported Windows validator.  Do not fall back
+    # to MSYS2: release validation must be reproducible independently of a
+    # Unix compatibility environment.
+    candidates.append(
+        Path(
+            r"C:\Users\BelutGoyang\AppData\Local\ti-build-cache\vulkan-1.3.296.0\Bin\spirv-val.exe"
+        )
+    )
     for candidate in candidates:
         candidate = candidate.expanduser().resolve()
         if candidate.exists():

@@ -9,7 +9,6 @@ remains fail-closed on its full-frame path.
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import blake2b
@@ -600,10 +599,6 @@ class BlockRecord:
     # evicted until the predicate reports completion; ordinary CPU records
     # leave it unset for backward compatibility.
     fence_ready: Any = None
-    # Logical invalidation/clear is separated from physical detachment while
-    # a consumer holds a cache lease.  This prevents a validated payload from
-    # disappearing between lookup and merge.
-    pending_remove: bool = False
 
     def is_valid(self) -> bool:
         return self.state not in (BlockState.CORRUPT, BlockState.RELEASED) and self.data is not None
@@ -682,81 +677,20 @@ class BlockCache:
     def get(self, block_id: str) -> Optional[BlockRecord]:
         with self._lock:
             record = self._records.get(block_id)
-            if record is not None and record.is_valid():
+            if record is not None:
                 self._records.move_to_end(block_id)
                 if self._telemetry is not None:
                     self._telemetry.add("hits")
                 owner = str(record.owner or "default")
                 self._owner_hits[owner] = self._owner_hits.get(owner, 0) + 1
-            else:
-                record = None
-                if self._telemetry is not None:
-                    self._telemetry.add("misses")
-            return record
-
-    @contextmanager
-    def lease(self, block_id: str) -> Iterator[Optional[BlockRecord]]:
-        """Lease a valid host payload until the caller finishes using it.
-
-        ``get()`` remains available for scheduling/inspection compatibility,
-        but consumers that use ``record.data`` outside the cache lock must use
-        this context manager.  Invalidation, clear, and collection may mark a
-        leased record for removal, but cannot detach its payload until the
-        final lease is released.
-        """
-        record = None
-        with self._lock:
-            candidate = self._records.get(block_id)
-            if candidate is not None and candidate.is_valid():
-                candidate.ref_count += 1
-                self._records.move_to_end(block_id)
-                record = candidate
-                if self._telemetry is not None:
-                    self._telemetry.add("hits")
-                owner = str(candidate.owner or "default")
-                self._owner_hits[owner] = self._owner_hits.get(owner, 0) + 1
             elif self._telemetry is not None:
                 self._telemetry.add("misses")
-        try:
-            yield record
-        finally:
-            if record is not None:
-                self._release_lease(block_id, record)
-
-    def _release_lease(self, block_id: str, record: BlockRecord) -> None:
-        with self._lock:
-            # A record can be replaced after logical invalidation.  The lease
-            # still owns the old object and must release that exact object.
-            record.ref_count = max(0, int(record.ref_count) - 1)
-            if record.ref_count or record.pinned or not record.pending_remove:
-                return
-            current = self._records.get(block_id)
-            if current is record:
-                self._remove_locked(block_id, record)
-            else:
-                # The record is no longer indexed, but a defensive detach
-                # keeps a deferred payload from surviving its final lease.
-                record.data = None
-
-    def _remove_locked(self, block_id: str, record: BlockRecord) -> None:
-        """Detach one record and subtract its accounting exactly once."""
-        entry_bytes = self.data_nbytes(record.data)
-        self._size_bytes = max(0, self._size_bytes - entry_bytes)
-        owner = str(record.owner or "default")
-        self._owner_bytes[owner] = max(
-            0, self._owner_bytes.get(owner, 0) - entry_bytes
-        )
-        record.data = None
-        self._records.pop(block_id, None)
-        if self._owner_bytes.get(owner, 0) == 0:
-            self._owner_bytes.pop(owner, None)
-            self._owner_hits.pop(owner, None)
+            return record
 
     def peek(self, block_id: str) -> Optional[BlockRecord]:
         """Inspect an entry for scheduling without changing LRU or telemetry."""
         with self._lock:
-            record = self._records.get(block_id)
-            return record if record is not None and record.is_valid() else None
+            return self._records.get(block_id)
 
     def put(self, record: BlockRecord) -> BlockRecord:
         with self._lock:
@@ -773,9 +707,6 @@ class BlockCache:
                 self._owner_bytes[previous_owner] = max(
                     0, self._owner_bytes.get(previous_owner, 0) - previous_bytes
                 )
-                previous.pending_remove = True
-                if previous is not record and not previous.ref_count:
-                    previous.data = None
             record.owner = str(record.owner or "default")
             record.generation = next(self._generation)
             self._records[record.block_id] = record
@@ -801,19 +732,23 @@ class BlockCache:
             # payload here would create a use-after-free for that consumer.
             if record.pinned or record.ref_count:
                 record.state = BlockState.CORRUPT
-                record.pending_remove = True
                 record.checksum = None
                 record.source_checksum = None
                 record.dirty = False
                 if self._telemetry is not None:
                     self._telemetry.add("invalidations")
                 return True
+            entry_bytes = self.data_nbytes(record.data)
+            self._size_bytes = max(0, self._size_bytes - entry_bytes)
+            self._owner_bytes[owner] = max(
+                0, self._owner_bytes.get(owner, 0) - entry_bytes
+            )
             record.state = BlockState.CORRUPT
-            record.pending_remove = True
+            record.data = None
             record.checksum = None
             record.source_checksum = None
             record.dirty = False
-            self._remove_locked(block_id, record)
+            self._records.pop(block_id, None)
             if self._owner_bytes.get(owner, 0) == 0:
                 self._owner_bytes.pop(owner, None)
                 self._owner_hits.pop(owner, None)
@@ -840,7 +775,6 @@ class BlockCache:
                 # future lookups and let the normal lifecycle release it.
                 if record.pinned or record.ref_count:
                     record.state = BlockState.CORRUPT
-                    record.pending_remove = True
                     record.checksum = None
                     record.source_checksum = None
                     record.dirty = False
@@ -848,11 +782,16 @@ class BlockCache:
                     if self._telemetry is not None:
                         self._telemetry.add("invalidations")
                     continue
+                entry_bytes = self.data_nbytes(record.data)
+                self._size_bytes = max(0, self._size_bytes - entry_bytes)
+                self._owner_bytes[owner] = max(
+                    0, self._owner_bytes.get(owner, 0) - entry_bytes
+                )
                 record.state = BlockState.CORRUPT
-                record.pending_remove = True
+                record.data = None
                 record.checksum = None
                 record.dirty = False
-                self._remove_locked(block_id, record)
+                self._records.pop(block_id, None)
                 invalidated += 1
                 if self._telemetry is not None:
                     self._telemetry.add("invalidations")
@@ -884,14 +823,18 @@ class BlockCache:
                 if record.pinned or record.dirty or record.ref_count:
                     continue
                 entry_bytes = self.data_nbytes(record.data)
+                self._size_bytes -= entry_bytes
                 owner = str(record.owner or "default")
                 was_borrowed = (
                     self.max_bytes is not None
                     and self._owner_bytes.get(owner, 0) > (targets.get(owner) or 0)
                 )
+                self._owner_bytes[owner] = max(
+                    0, self._owner_bytes.get(owner, 0) - entry_bytes
+                )
                 record.state = BlockState.RELEASED
-                record.pending_remove = True
-                self._remove_locked(block_id, record)
+                record.data = None
+                self._records.pop(block_id)
                 evicted.append(block_id)
                 if self._telemetry is not None:
                     self._telemetry.add("evictions")
@@ -903,13 +846,12 @@ class BlockCache:
     def clear(self) -> None:
         """Release every cached record."""
         with self._lock:
-            for block_id, record in list(self._records.items()):
+            for record in self._records.values():
                 record.state = BlockState.RELEASED
-                record.pending_remove = True
-                if not record.ref_count:
-                    self._remove_locked(block_id, record)
-            # Idle records were removed above.  Keep accounting for leased
-            # records until their final release so bytes are subtracted once.
+                record.data = None
+            self._records.clear()
+            self._size_bytes = 0
+            self._owner_bytes.clear()
             self._owner_hits.clear()
 
     def __len__(self) -> int:
@@ -1924,16 +1866,6 @@ def operation_path(name: str) -> BlockPath:
     return OPERATION_PATHS.get(name, BlockPath.DIRECT)
 
 
-def is_known_operation(name: str) -> bool:
-    """Return whether ``name`` is an exact maintained operation key.
-
-    ``operation_path()`` intentionally returns ``DIRECT`` for unknown names
-    for compatibility, so callers that need to decide whether lazy adapter
-    registration is allowed must not use ``path is not None`` as a proxy.
-    """
-    return canonical_operation_name(name) in OPERATION_PATHS
-
-
 def operation_capability(name: str) -> BlockCapability:
     """Return dependency-aware block metadata for ``name``.
 
@@ -2392,7 +2324,7 @@ __all__ = [
     "SHAPE_CHANGING_OPERATIONS", "OPERATION_CONTRACTS",
     "CANONICAL_OPERATION_ALIASES", "OPERATION_ALIASES",
     "LEGACY_PARTITION_EVIDENCE", "legacy_partition_evidence",
-    "canonical_operation_name", "is_known_operation", "register_block_adapter",
+    "canonical_operation_name", "register_block_adapter",
     "lookup_block_adapter", "get_block_adapter", "registered_block_adapters",
     "block_coverage_report",
     "operation_path", "operation_capability", "operation_contract",

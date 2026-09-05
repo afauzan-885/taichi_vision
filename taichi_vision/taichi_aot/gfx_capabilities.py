@@ -8,11 +8,8 @@ does not equate a legacy rendering API with Taichi's compute-capable path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import re
-from typing import Any, Iterable, Mapping
-
-from taichi_vision.backend_config import parse_policy_bool
+from typing import Iterable, Mapping
 
 
 # Keep probe spellings interchangeable while exposing one stable policy name.
@@ -53,150 +50,6 @@ class GfxDecision:
         return self.status in {"native_candidate", "software_candidate"}
 
 
-@dataclass(frozen=True)
-class GraphicsCapabilitySnapshot:
-    """One immutable graphics capability negotiation result.
-
-    The snapshot is the hand-off object between device probing, backend
-    admission, and TCM preflight.  A missing or untrusted evidence source is
-    represented as ``unknown`` rather than being promoted from a backend or
-    vendor name.
-    """
-
-    decision: GfxDecision
-    features: frozenset[str] = frozenset()
-    evidence_source: str = "none"
-    explicit_override: bool = False
-
-    @property
-    def usable(self) -> bool:
-        return self.decision.usable
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "backend": self.decision.backend,
-            "status": self.decision.status,
-            "profile": self.decision.profile,
-            "reason": self.decision.reason,
-            "api_version": self.decision.api_version,
-            "spirv_version": self.decision.spirv_version,
-            "features": sorted(self.features),
-            "evidence_source": self.evidence_source,
-            "explicit_override": self.explicit_override,
-        }
-
-
-def unknown_graphics_snapshot(backend: str, reason: str, *, source: str = "none"):
-    """Create a fail-closed snapshot when a probe did not supply evidence."""
-
-    decision = GfxDecision(
-        str(backend).lower(),
-        "unknown",
-        f"{str(backend).lower()}-unknown",
-        str(reason),
-        (0, 0),
-    )
-    return GraphicsCapabilitySnapshot(decision, evidence_source=source)
-
-
-def negotiate_graphics_capabilities(
-    backend: str,
-    evidence: Mapping[str, Any] | None,
-    *,
-    required_spirv: object = "1.3",
-) -> GraphicsCapabilitySnapshot:
-    """Negotiate one graphics profile from explicit probe evidence only."""
-
-    backend = str(backend or "").strip().lower()
-    metadata = evidence if isinstance(evidence, Mapping) else {}
-    source = str(metadata.get("capability_source") or metadata.get("evidence_source") or "none")
-    explicit_override = source in {"environment_override", "explicit_override"}
-    if explicit_override and os.environ.get("AOT_CAPABILITY_OVERRIDE") != "1":
-        return unknown_graphics_snapshot(
-            backend,
-            "explicit graphics capability override requires AOT_CAPABILITY_OVERRIDE=1",
-            source=source,
-        )
-
-    if backend == "vulkan":
-        api = metadata.get("api_version") or metadata.get("vulkan_api_version")
-        features = metadata.get("features") or metadata.get("graphics_features")
-        if api in (None, "") or not isinstance(features, Mapping):
-            return unknown_graphics_snapshot(
-                backend,
-                "Vulkan API version and feature probe evidence are required",
-                source=source,
-            )
-        decision = classify_vulkan(
-            api,
-            features=features,
-            required_spirv=metadata.get("spirv_version", required_spirv),
-        )
-    elif backend == "opengl":
-        api = metadata.get("api_version") or metadata.get("gl_version")
-        if api in (None, ""):
-            return unknown_graphics_snapshot(
-                backend,
-                "OpenGL API version and compute/SSBO probe evidence are required",
-                source=source,
-            )
-        if "compute_shader" not in metadata and "compute" not in metadata:
-            return unknown_graphics_snapshot(
-                backend,
-                "OpenGL compute-shader probe evidence is required",
-                source=source,
-            )
-        if "ssbo" not in metadata and "storage_buffer" not in metadata:
-            return unknown_graphics_snapshot(
-                backend,
-                "OpenGL SSBO probe evidence is required",
-                source=source,
-            )
-        decision = classify_desktop_opengl(
-            api,
-            metadata.get("extensions", ()),
-            compute_shader=metadata.get("compute_shader", metadata.get("compute")),
-            ssbo=metadata.get("ssbo", metadata.get("storage_buffer")),
-        )
-        features = {
-            feature
-            for feature, enabled in {
-                "compute": metadata.get("compute_shader", metadata.get("compute")),
-                "ssbo": metadata.get("ssbo", metadata.get("storage_buffer")),
-            }.items()
-            if _explicit_capability(enabled)
-        }
-        return GraphicsCapabilitySnapshot(
-            decision,
-            frozenset(features),
-            source,
-            explicit_override,
-        )
-    elif backend == "gles":
-        api = metadata.get("api_version") or metadata.get("gles_version")
-        if api in (None, ""):
-            return unknown_graphics_snapshot(
-                backend,
-                "GLES API version and compute/SSBO probe evidence are required",
-                source=source,
-            )
-        decision = classify_gles(
-            api,
-            metadata.get("extensions", ()),
-            compute_shader=metadata.get("compute_shader", metadata.get("compute")),
-            ssbo=metadata.get("ssbo", metadata.get("storage_buffer")),
-        )
-    else:
-        return unknown_graphics_snapshot(backend, "not a graphics backend", source=source)
-
-    return GraphicsCapabilitySnapshot(
-        decision,
-        frozenset(_feature_set(features if backend == "vulkan" else ())),
-        source,
-        explicit_override,
-    )
-
-
 def parse_version(value: object) -> tuple[int, int]:
     if isinstance(value, (tuple, list)) and len(value) >= 2:
         return int(value[0]), int(value[1])
@@ -217,20 +70,10 @@ def _feature_set(features: Iterable[str] | Mapping[str, object]) -> frozenset[st
         return _FEATURE_ALIASES.get(raw, raw)
 
     if isinstance(features, Mapping):
-        # Mapping values often cross JSON/subprocess/persisted-data boundaries.
-        # Never let a non-empty string such as "false" enable a capability.
         return frozenset(
-            canonical(key)
-            for key, enabled in features.items()
-            if parse_policy_bool(enabled, default=False) is True
+            canonical(key) for key, enabled in features.items() if bool(enabled)
         )
     return frozenset(canonical(feature) for feature in features)
-
-
-def _explicit_capability(value: object) -> bool:
-    """Return an explicit capability flag with ambiguous evidence fail-closed."""
-
-    return parse_policy_bool(value, default=False) is True
 
 
 def classify_desktop_opengl(
@@ -250,10 +93,10 @@ def classify_desktop_opengl(
             f"desktop OpenGL API {api} is outside the qualified 2.0-{_OPENGL_MAX_API[0]}.{_OPENGL_MAX_API[1]} range",
             api,
         )
-    has_compute = _explicit_capability(compute_shader) if compute_shader is not None else (
+    has_compute = bool(compute_shader) if compute_shader is not None else (
         api >= (4, 3) or "gl_arb_compute_shader" in ext
     )
-    has_ssbo = _explicit_capability(ssbo) if ssbo is not None else (
+    has_ssbo = bool(ssbo) if ssbo is not None else (
         api >= (4, 3)
         or "gl_shader_storage_buffer_object" in ext
         or "gl_arb_shader_storage_buffer_object" in ext
@@ -283,8 +126,8 @@ def classify_gles(
             f"OpenGLES API {api} is outside the qualified 2.0-{_GLES_MAX_API[0]}.{_GLES_MAX_API[1]} range",
             api,
         )
-    has_compute = _explicit_capability(compute_shader) if compute_shader is not None else api >= (3, 1)
-    has_ssbo = _explicit_capability(ssbo) if ssbo is not None else api >= (3, 1)
+    has_compute = bool(compute_shader) if compute_shader is not None else api >= (3, 1)
+    has_ssbo = bool(ssbo) if ssbo is not None else api >= (3, 1)
     if api < (3, 1):
         return GfxDecision("gles", "legacy_render", "gles-legacy", "compute shaders are unavailable below GLES 3.1", api)
     if not (has_compute and has_ssbo):

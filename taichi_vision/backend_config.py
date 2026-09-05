@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import os
-from typing import Any, Mapping, Optional
+from typing import Mapping, Optional
 
 
 CANONICAL_BACKENDS = ("cpu", "cuda", "vulkan", "opengl", "gles")
@@ -48,46 +48,9 @@ _ALIASES = {
     "default": "auto",
 }
 
-_POLICY_TRUE = frozenset(("1", "true", "yes", "on"))
-_POLICY_FALSE = frozenset(("0", "false", "no", "off"))
-
 
 def _token(value) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-
-
-def parse_policy_bool(value, default: Optional[bool] = None) -> Optional[bool]:
-    """Parse a safety/configuration boolean without Python truthiness traps.
-
-    This helper is deliberately strict because many callers consume JSON,
-    persisted selectors, probe metadata, or graph-policy mappings where a
-    non-empty string such as ``"false"`` must never become ``True`` merely by
-    passing through ``bool(value)``.
-
-    Only real booleans, integer 0/1, and explicit common serialized spellings
-    are accepted.  Ambiguous values return ``default`` so safety-sensitive
-    callers can fail closed by using ``default=False`` (or retain ``None`` to
-    distinguish missing/invalid evidence).
-    """
-
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        if value == 1:
-            return True
-        if value == 0:
-            return False
-        return default
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in _POLICY_TRUE:
-            return True
-        if token in _POLICY_FALSE:
-            return False
-        return default
-    if value is None:
-        return default
-    return default
 
 
 def normalize_backend(value, *, allow_auto: bool = True, strict: bool = False) -> str:
@@ -189,9 +152,6 @@ class BackendConfig:
     explicit: bool = False
     source: str = "auto"
     strict: bool = False
-    # Optional immutable graphics negotiation object. Kept as Any here so
-    # this dependency-free module does not import the AOT policy layer.
-    capability_snapshot: Any = None
 
     def __post_init__(self):
         object.__setattr__(self, "backend", normalize_backend(self.backend, allow_auto=False, strict=True))
@@ -231,12 +191,6 @@ class BackendConfig:
             "explicit": self.explicit,
             "source": self.source,
             "strict": self.strict,
-            "capability_snapshot": (
-                self.capability_snapshot.as_dict()
-                if self.capability_snapshot is not None
-                and hasattr(self.capability_snapshot, "as_dict")
-                else None
-            ),
             "is_gpu": self.is_gpu,
             "target_family": self.target_family,
         }
@@ -263,6 +217,5 @@ __all__ = [
     "normalize_backend",
     "normalize_vendor",
     "parse_device_id",
-    "parse_policy_bool",
     "requested_backend",
 ]

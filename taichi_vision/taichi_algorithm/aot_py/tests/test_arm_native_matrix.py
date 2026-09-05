@@ -74,10 +74,7 @@ class ArmNativeMatrixTests(unittest.TestCase):
             ROOT / "taichi_vision" / "taichi_algorithm" / "aot_tcm" / "target_manifest.json"
         )
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        payload.setdefault("runtime_requirements", {})["cpu_arm64_android"] = {
-            "qualification": "compile_only",
-            "native_runtime": True,
-        }
+        payload["runtime_requirements"]["cpu_arm64_android"]["native_runtime"] = True
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "manifest.json"
             candidate.write_text(json.dumps(payload), encoding="utf-8")

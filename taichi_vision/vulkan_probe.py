@@ -147,10 +147,11 @@ def vulkan_inventory_digest(project_root=None):
             root / "taichi_vision" / "intel_vulkan_qualification.py",
             root / "taichi_vision" / "spirv_compatibility.py",
             root
-            / "taichi_vision"
-            / "taichi_algorithm"
-            / "aot_py"
-            / "tests"
+            / "pixel_refine_desktop"
+            / "ui"
+            / "views"
+            / "settings"
+            / "Perfomance"
             / "test_comprehensif.py",
             Path(__file__).resolve(),
         )
@@ -850,7 +851,8 @@ def run_intel_vulkan_comprehensive(
         / "taichi_vision"
         / "taichi_algorithm"
         / "aot_tcm"
-        / "bicubic_vulkan.tcm"
+        / "vulkan_x86_64_windows"
+        / "bicubic_vulkan_x86_64_windows.tcm"
     )
     probes = [
         run_intel_vulkan_probe(
@@ -926,10 +928,11 @@ def run_intel_vulkan_comprehensive(
 
     test_script = (
         root
-        / "taichi_vision"
-        / "taichi_algorithm"
-        / "aot_py"
-        / "tests"
+        / "pixel_refine_desktop"
+        / "ui"
+        / "views"
+        / "settings"
+        / "Perfomance"
         / "test_comprehensif.py"
     )
     environment = os.environ.copy()

@@ -6,13 +6,14 @@ remaining orchestration gap with small, bounded reference implementations:
 
 * point-to-plane ICP with a 6-DoF Lie-algebra update;
 * chunked TSDF integration for calibrated depth frames;
-* explicit camera projection and a fail-closed PnP contract.
+* explicit camera projection and a quality-gated PnP wrapper.
 
-NumPy remains the default/reference backend for the legacy ICP/TSDF
-orchestrators.  Explicit ``backend="taichi"`` selects bounded CPU-JIT kernels
-when imported with ``AOT_MODE=0``; no backend is silently changed.  PnP has no
-qualified TCM graph yet and therefore fails closed rather than using a host
-implementation or returning a zero pose.
+NumPy remains the default/reference backend.  Explicit ``backend="taichi"``
+selects bounded CPU-JIT kernels when imported with ``AOT_MODE=0``; no backend
+is silently changed.  PnP delegates to the optional OpenCV reference solver
+because the existing public ``solvePnP`` facade is intentionally only a
+compatibility stub; unavailable dependencies fail with an actionable error
+rather than returning a zero pose.
 """
 
 from dataclasses import dataclass
@@ -976,14 +977,7 @@ def solve_pnp_checked(
     max_iterations: int = 100,
     min_inlier_ratio: float = 0.5,
 ) -> PnPResult:
-    """Validate PnP inputs and require a qualified native TCM solver.
-
-    The historical OpenCV reference implementation was intentionally removed
-    from the production path.  ``sfm_registration`` currently contains only
-    ICP and TSDF graphs, so admitting a host implementation here would violate
-    the core TCM-only boundary.  Keep the public API and its input contract,
-    then fail closed until a target-qualified ``sfm_pnp`` graph is available.
-    """
+    """Solve PnP through the optional OpenCV reference backend with gates."""
 
     object_array = _points3(object_points, name="object_points")
     image_array = np.ascontiguousarray(image_points, dtype=np.float64)
@@ -1003,14 +997,68 @@ def solve_pnp_checked(
     if not np.isfinite(reprojection_threshold_px) or float(reprojection_threshold_px) <= 0:
         raise ValueError("reprojection_threshold_px must be positive")
 
-    report = PipelineReport("pnp", backend="tcm-required")
+    report = PipelineReport("pnp", backend="opencv-reference")
     report.metrics["n_points"] = float(len(object_array))
-    report.success = False
-    report.add_warning(
-        "PnP requires a validated target-qualified sfm_pnp TCM graph; "
-        "the OpenCV reference backend is not part of taichi_vision core"
+    try:
+        import cv2
+    except Exception as exc:
+        report.success = False
+        report.add_warning("OpenCV is unavailable; no PnP reference backend is installed")
+        raise ImportError(report.warnings[-1]) from exc
+
+    stage_index = len(report.stages)
+    with timed_stage(report, "solve_pnp"):
+        flags = cv2.SOLVEPNP_ITERATIVE if len(object_array) >= 6 else cv2.SOLVEPNP_AP3P
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_array.astype(np.float64),
+            image_array.astype(np.float64),
+            intrinsics,
+            None,
+            flags=flags,
+            reprojectionError=float(reprojection_threshold_px),
+            confidence=float(confidence),
+            iterationsCount=int(max_iterations),
+        )
+        if not success:
+            report.success = False
+            report.add_warning("OpenCV solvePnPRansac did not find a pose")
+            return PnPResult(
+                success=False,
+                rotation=np.eye(3, dtype=np.float64),
+                translation=np.zeros(3, dtype=np.float64),
+                inlier_mask=np.zeros(len(object_array), dtype=bool),
+                reprojection_error_px=np.full(len(object_array), np.inf, dtype=np.float32),
+                report=report,
+            )
+        rotation, _ = cv2.Rodrigues(rvec)
+        translation = np.asarray(tvec, dtype=np.float64).reshape(3)
+    projected, valid = project_points(object_array, intrinsics, rotation, translation)
+    errors = np.linalg.norm(projected.astype(np.float64) - image_array, axis=1)
+    errors[~valid] = np.inf
+    inlier_mask = np.isfinite(errors) & (errors <= float(reprojection_threshold_px))
+    if inliers is not None:
+        explicit = np.zeros(len(object_array), dtype=bool)
+        explicit[np.asarray(inliers, dtype=np.int32).reshape(-1)] = True
+        inlier_mask &= explicit
+    report.metrics.update(
+        {
+            "n_inliers": float(np.count_nonzero(inlier_mask)),
+            "inlier_ratio": float(np.mean(inlier_mask)),
+            "median_reprojection_error_px": float(np.median(errors[inlier_mask])) if np.any(inlier_mask) else float("inf"),
+        }
     )
-    raise NotImplementedError(report.warnings[-1])
+    if np.count_nonzero(inlier_mask) < 4 or float(np.mean(inlier_mask)) < float(min_inlier_ratio):
+        report.success = False
+        report.add_warning("PnP reprojection quality gate rejected the returned pose")
+    update_stage_output(report, stage_index, errors)
+    return PnPResult(
+        success=bool(report.success),
+        rotation=np.asarray(rotation, dtype=np.float64),
+        translation=translation,
+        inlier_mask=inlier_mask,
+        reprojection_error_px=errors.astype(np.float32),
+        report=report,
+    )
 
 
 __all__ = [

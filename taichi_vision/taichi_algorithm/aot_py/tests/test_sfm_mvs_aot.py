@@ -9,16 +9,10 @@ import numpy as np
 
 class SfMMVSAOTTests(unittest.TestCase):
     def test_cpu_stereo_regularizer_leaves(self) -> None:
-        try:
-            from ...aot_api.research import (
-                sfm_patchmatch_iteration_aot,
-                sfm_sgm_path_aot,
-            )
-        except ImportError:  # pragma: no cover - direct pytest collection fallback
-            from taichi_vision.taichi_algorithm.aot_api.research import (
-                sfm_patchmatch_iteration_aot,
-                sfm_sgm_path_aot,
-            )
+        from ...aot_api.research import (
+            sfm_patchmatch_iteration_aot,
+            sfm_sgm_path_aot,
+        )
 
         cost = np.random.default_rng(19).random((4, 6, 7), dtype=np.float32)
         try:

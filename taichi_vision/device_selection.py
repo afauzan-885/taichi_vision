@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 from taichi_vision.cuda_arch_matrix import architecture_name, normalize_compute_capability
-from taichi_vision.backend_config import parse_policy_bool
 
 
 def normalize_device_name(value: str) -> str:
@@ -269,7 +268,6 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
     result = {"device_ordinal": ordinal}
     workgroup_values = []
     collect_workgroup = False
-    queue_compute_seen = False
     started = time.monotonic()
     try:
         assert process.stdout is not None
@@ -285,9 +283,6 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
                     break
                 continue
             if current != ordinal:
-                continue
-            if stripped.startswith("queueFlags"):
-                queue_compute_seen = queue_compute_seen or "COMPUTE" in stripped.upper()
                 continue
             if collect_workgroup:
                 if stripped.isdigit():
@@ -322,47 +317,7 @@ def query_vulkan_device_limits(device_id: int, timeout=30.0) -> dict:
             f"Incomplete Vulkan limits for ordinal {ordinal}: "
             + ", ".join(sorted(missing))
         )
-    if queue_compute_seen:
-        result["features"] = {
-            "compute": True,
-            "ssbo": (
-                int(result.get("maxPerStageDescriptorStorageBuffers", 0)) > 0
-                or int(result.get("maxDescriptorSetStorageBuffers", 0)) > 0
-            ),
-        }
-        result["capability_source"] = "vulkaninfo-probe"
     return result
-
-
-def query_vulkan_capability_snapshot(device_id: int, timeout=30.0) -> dict:
-    """Return one physical-device capability record for backend admission.
-
-    The API/version identity comes from the same ``vulkaninfo`` inventory as
-    device selection, while queue/storage evidence comes from the selected
-    device's limits.  Missing evidence is an error rather than an optimistic
-    ``COMPUTE``/``SSBO`` default.
-    """
-
-    ordinal = int(device_id)
-    records = scan_vulkan_device_records(timeout=timeout)
-    record = next(
-        (item for item in records if int(item.get("ordinal", -1)) == ordinal),
-        None,
-    )
-    if record is None:
-        raise LookupError(f"Vulkan device ordinal {ordinal} was not enumerated")
-    limits = query_vulkan_device_limits(ordinal, timeout=timeout)
-    features = limits.get("features")
-    if not isinstance(features, dict):
-        raise RuntimeError(
-            f"Vulkan capability evidence is incomplete for ordinal {ordinal}"
-        )
-    return {
-        **record,
-        **limits,
-        "features": features,
-        "capability_source": "vulkaninfo-probe",
-    }
 
 
 def query_vulkan_memory_budget(device_id: int) -> dict:
@@ -713,27 +668,13 @@ def resolve_device_selector(selector, devices, cached_id=None):
 
     wanted_fingerprint = str(selector.get("fingerprint") or "")
     if wanted_fingerprint:
-        fingerprint_matches = [
-            idx
-            for idx, _name, record in candidates
-            if device_fingerprint(record) == wanted_fingerprint
-        ]
-        if len(fingerprint_matches) == 1:
-            return fingerprint_matches[0]
-        if len(fingerprint_matches) > 1:
-            # Identical records without UUID/device-specific evidence are not
-            # stable identities.  Enumeration order and cached ordinals must
-            # never choose one silently.
-            return None
+        for idx, _name, record in candidates:
+            if device_fingerprint(record) == wanted_fingerprint:
+                return idx
 
     wanted_vendor_id = _parse_int(selector.get("vendor_id"))
     wanted_device_id = _parse_int(selector.get("device_id"))
-    native_value = selector.get("native")
-    wanted_native = parse_policy_bool(native_value, default=None)
-    if native_value is not None and wanted_native is None:
-        # A malformed persisted selector must not silently become ``True``
-        # through Python truthiness or select an arbitrary adapter.
-        return None
+    wanted_native = selector.get("native")
     if wanted_vendor_id is not None and wanted_device_id is not None:
         hardware_matches = []
         for idx, _name, record in candidates:
@@ -742,29 +683,23 @@ def resolve_device_selector(selector, devices, cached_id=None):
                 and _parse_int(record.get("device_id")) == wanted_device_id
                 and (
                     wanted_native is None
-                    or wanted_native == (not is_translation_device(record))
+                    or bool(wanted_native) == (not is_translation_device(record))
                 )
             ):
                 hardware_matches.append((idx, record))
         if len(hardware_matches) == 1:
             return hardware_matches[0][0]
-        if len(hardware_matches) > 1:
-            return None
 
     if wanted_name:
-        name_matches = [
-            idx
-            for idx, name, record in candidates
-            if normalize_device_name(name) == wanted_name
-            and (
-                wanted_native is None
-                or wanted_native == (not is_translation_device(record))
-            )
-        ]
-        if len(name_matches) == 1:
-            return name_matches[0]
-        if len(name_matches) > 1:
-            return None
+        for idx, name, record in candidates:
+            if (
+                normalize_device_name(name) == wanted_name
+                and (
+                    wanted_native is None
+                    or bool(wanted_native) == (not is_translation_device(record))
+                )
+            ):
+                return idx
 
     if wanted_vendor and wanted_vendor != "unknown":
         vendor_matches = [
@@ -773,12 +708,17 @@ def resolve_device_selector(selector, devices, cached_id=None):
             if device_vendor(name) == wanted_vendor
             and (
                 wanted_native is None
-                or wanted_native == (not is_translation_device(record))
+                or bool(wanted_native) == (not is_translation_device(record))
             )
         ]
         if len(vendor_matches) == 1:
             return vendor_matches[0][0]
-        # A vendor-only selector is ambiguous as soon as more than one
-        # matching adapter exists.  The cached ordinal is not physical
-        # identity and must not become a hidden tie-breaker.
+        # Keep a cached ordinal only when it still identifies the same vendor.
+        try:
+            cached_id = int(cached_id)
+        except (TypeError, ValueError):
+            cached_id = None
+        for idx, _name, _record in vendor_matches:
+            if idx == cached_id:
+                return idx
     return None

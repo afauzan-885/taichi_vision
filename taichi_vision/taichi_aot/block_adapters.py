@@ -86,7 +86,6 @@ class PartitionContext:
 _DEFAULT_ADAPTERS_LOCK = threading.RLock()
 _DEFAULT_ADAPTERS_INITIALIZED = False
 _DEFAULT_ADAPTER_REGISTRATION_ERRORS: dict[str, str] = {}
-_DEFAULT_ADAPTER_REGISTRATION_STATUS: dict[str, str] = {}
 
 
 def ensure_default_block_adapters(
@@ -110,11 +109,7 @@ def ensure_default_block_adapters(
     global _DEFAULT_ADAPTERS_INITIALIZED
     canonical = canonical_operation_name(operation) if operation else None
     with _DEFAULT_ADAPTERS_LOCK:
-        if (
-            not _DEFAULT_ADAPTERS_INITIALIZED
-            or replace
-            or bool(_DEFAULT_ADAPTER_REGISTRATION_ERRORS)
-        ):
+        if not _DEFAULT_ADAPTERS_INITIALIZED:
             # Discover registration helpers at call time so newly added
             # adapter tranches participate without a second central list.
             # Imported ``register_block_adapter`` does not match this suffix.
@@ -128,26 +123,17 @@ def ensure_default_block_adapters(
                     continue
                 helpers.append((name, value))
             for name, helper in helpers:
-                if (
-                    not replace
-                    and name in _DEFAULT_ADAPTER_REGISTRATION_STATUS
-                    and name not in _DEFAULT_ADAPTER_REGISTRATION_ERRORS
-                ):
-                    continue
                 try:
                     signature = inspect.signature(helper)
                     if "replace" in signature.parameters:
                         helper(replace=replace)
                     else:
                         helper()
-                    _DEFAULT_ADAPTER_REGISTRATION_STATUS[name] = "ready"
-                    _DEFAULT_ADAPTER_REGISTRATION_ERRORS.pop(name, None)
                 except Exception as exc:
-                    _DEFAULT_ADAPTER_REGISTRATION_STATUS[name] = "failed"
                     _DEFAULT_ADAPTER_REGISTRATION_ERRORS[name] = (
                         f"{type(exc).__name__}: {exc}"
                     )
-            _DEFAULT_ADAPTERS_INITIALIZED = not _DEFAULT_ADAPTER_REGISTRATION_ERRORS
+            _DEFAULT_ADAPTERS_INITIALIZED = True
 
         if canonical:
             return lookup_block_adapter(canonical)

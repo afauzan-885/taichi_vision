@@ -2,12 +2,14 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+build/
+dist/
 
-taichi_algorithm/aot_tcm/.cpu_aot_cache/
-taichi_algorithm/aot_tcm/**/.cpu_aot_cache/
-taichi_algorithm/aot_tcm/.quarantine*/
+# Local bridge build sandboxes; runtime loads only aot_py/aot_dll/<backend>.
+taichi_algorithm/aot_py/issue*_bridge/
 taichi_algorithm/aot_py/**/*.obj
 taichi_algorithm/aot_py/**/*.exp
 taichi_algorithm/aot_py/**/*.lib
-taichi_algorithm/aot_py/test_output*/
-taichi_algorithm/aot_py/test_report.txt
+
+# Runtime expansion of packed CPU AOT archives.
+taichi_algorithm/aot_tcm/**/.cpu_aot_cache/

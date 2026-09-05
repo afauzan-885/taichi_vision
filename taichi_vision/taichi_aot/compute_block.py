@@ -402,8 +402,8 @@ def _resolve_adapter_selection(metadata: ComputeBlockMetadata):
         from .block import (
             BlockAdapter,
             canonical_operation_name,
-            is_known_operation,
             lookup_block_adapter,
+            operation_path,
         )
     except Exception:
         return None, metadata.adapter
@@ -446,7 +446,7 @@ def _resolve_adapter_selection(metadata: ComputeBlockMetadata):
     # continues through the established generic image wrapper unchanged.
     canonical = canonical_operation_name(metadata.name)
     adapter = lookup_block_adapter(canonical)
-    if adapter is None and is_known_operation(canonical):
+    if adapter is None and operation_path(canonical) is not None:
         # Exact operation names are safe to resolve lazily.  Arbitrary
         # decorated helper names remain on the generic path and do not pay
         # the registration cost or gain an accidental algorithm mapping.

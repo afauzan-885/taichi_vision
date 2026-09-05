@@ -12,16 +12,10 @@ from contextlib import contextmanager
 
 
 _CACHE_PROCESS_LOCK = threading.RLock()
-
-
-def _file_digest(path: str) -> str:
-    """Return a bounded-memory digest for one regular artifact file."""
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# The status cache records runtime load results, not only artifact identity.
+# Bump this namespace when the loader/bridge contract changes so a previous
+# native failure cannot permanently block a now-compatible artifact.
+_CACHE_SCHEMA = "3"
 
 
 def _cache_path():
@@ -32,49 +26,26 @@ def _cache_path():
     return os.path.join(root, "artifact_status.json")
 
 
-def artifact_key(
-    path,
-    backend,
-    device_id=0,
-    device_name="unknown",
-    *,
-    target_id="",
-    device_fingerprint="",
-    driver_version="",
-    driver_uuid="",
-    artifact_digest=None,
-):
+def artifact_key(path, backend, device_id=0, device_name="unknown"):
     # Windows paths are case-insensitive, but ``Path.resolve()`` and a
     # subprocess launched through a differently-cased drive letter can yield
-    # Case differences in drive-qualified paths are normalized by Path.resolve.
-    # Hash a canonical real path so a valid
+    # ``E:\\...`` versus ``e:\\...``.  Hash a canonical real path so a valid
     # artifact is not mistaken for a different (and quarantined) artifact.
     path = os.path.normcase(os.path.realpath(os.path.abspath(path)))
     st = os.stat(path) if os.path.isfile(path) else None
-    if artifact_digest is None and st is not None:
-        # Size/mtime are useful telemetry but are not a content identity: a
-        # build system can replace an artifact while preserving both values.
-        artifact_digest = _file_digest(path)
-    token = "|".join(
-        (
-            path,
-            backend.lower(),
-            str(device_id),
-            str(device_name),
-            str(target_id),
-            str(device_fingerprint),
-            str(driver_version),
-            str(driver_uuid),
-            platform.platform(),
-            str(getattr(st, "st_size", 0)),
-            str(getattr(st, "st_mtime_ns", 0)),
-            str(artifact_digest or ""),
-        )
+    compatibility = os.environ.get(
+        "PIXEL_REFINE_GFX_COMPAT_MODE",
+        os.environ.get("PIXEL_REFINE_INTEL_GFX_COMPAT", "auto"),
     )
+    token = "|".join((_CACHE_SCHEMA, str(compatibility).lower(), path, backend.lower(), str(device_id), device_name,
+                       platform.platform(), str(getattr(st, "st_size", 0)),
+                       str(getattr(st, "st_mtime_ns", 0))))
     return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()
 
 
 def get_status(key):
+    if os.environ.get("PIXEL_REFINE_AOT_DISABLE_CACHE", "0") == "1":
+        return None
     try:
         with open(_cache_path(), "r", encoding="utf-8") as f:
             return json.load(f).get(key)
@@ -121,6 +92,8 @@ def _cache_write_lock(path):
 
 
 def set_status(key, status, **extra):
+    if os.environ.get("PIXEL_REFINE_AOT_DISABLE_CACHE", "0") == "1":
+        return
     path = _cache_path()
     with _cache_write_lock(path):
         try:

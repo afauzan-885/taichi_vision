@@ -1,3 +1,4 @@
+"""Compile pure-Taichi compression preparation graphs to a target artifact."""
 import os
 import sys
 from pathlib import Path
@@ -13,8 +14,8 @@ import taichi as ti
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
 import taichi_vision.taichi_algorithm.compression.kernels as compression_kernels
+
 from taichi_vision.taichi_algorithm.compression.kernels import (
     JPEG_QUALITY_TABLE,
     JPEG_CHROMA_TABLE,
@@ -40,11 +41,11 @@ from taichi_vision.taichi_algorithm.compression.kernels import (
     canonical_huffman_codes_kernel,
     jpeg_pack_block_bits_kernel,
     jpeg_pack_block_bytes_flat2d_kernel,
-    jpeg_pack_scan_stream_kernel,
     jpeg_scatter_block_bits_kernel,
     jpeg_bits_to_bytes_kernel,
     jpeg_quantize_dct_zigzag_flat2d_kernel,
     jpeg_prepare_tokens_flat2d_kernel,
+    jpeg_fused_transform_tokens_histogram_2d,
     png_filter_rows_kernel,
     dng_delta_rows_kernel,
     dng_undelta_rows_kernel,
@@ -253,17 +254,15 @@ def compile_compression(arch=ti.cpu, output: str | None = None) -> str:
         # Taichi backend before ti.init; writing a Vulkan/OpenGL archive from
         # the default CPU arch would create a target-named but invalid TCM.
         target_backend = target_id.split("_", 1)[0].lower()
-        if target_backend == "opengl":
-            arch = ti.vulkan
-        else:
-            target_arch = {
-                "cpu": ti.cpu,
-                "vulkan": ti.vulkan,
-                "gles": ti.gles,
-                "cuda": ti.cuda,
-            }.get(target_backend)
-            if target_arch is not None and arch == ti.cpu and target_backend != "cpu":
-                arch = target_arch
+        target_arch = {
+            "cpu": ti.cpu,
+            "vulkan": ti.vulkan,
+            "opengl": ti.opengl,
+            "gles": ti.gles,
+            "cuda": ti.cuda,
+        }.get(target_backend)
+        if target_arch is not None and arch == ti.cpu and target_backend != "cpu":
+            arch = target_arch
         output = Path(__file__).parents[1] / "aot_tcm" / target_id / f"compression_image_{target_id}.tcm"
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -405,6 +404,30 @@ def compile_compression(arch=ti.cpu, output: str | None = None) -> str:
     builder = ti.graph.GraphBuilder()
     builder.dispatch(_jpeg_symbol_histogram_flat2d_kernel, dc_diff_2d, symbols_2d, counts_2d, dc_histogram_2d, ac_histogram_2d, hb, wb)
     module.add_graph("compression_jpeg_symbol_histogram_2d", builder.compile())
+
+    # Fully fused JPEG pipeline: DCT+quant+zigzag → tokens → histogram
+    # This eliminates all intermediate GPU↔CPU round-trips by combining
+    # all transform stages into a single GPU dispatch.
+    fused_src = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "src", ti.f32, ndim=2)
+    fused_quant = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "quant_table", ti.f32, ndim=1)
+    fused_basis = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "basis", ti.f32, ndim=2)
+    fused_order = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "order", ti.i32, ndim=1)
+    fused_dc_values = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "dc_values", ti.f32, ndim=1)
+    fused_symbols = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "symbols", ti.i32, ndim=2)
+    fused_categories = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "categories", ti.i32, ndim=2)
+    fused_amplitudes = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "amplitudes", ti.i32, ndim=2)
+    fused_token_count = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "token_count", ti.i32, ndim=2)
+    fused_dc_histogram = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "dc_histogram", ti.i32, ndim=1)
+    fused_ac_histogram = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "ac_histogram", ti.i32, ndim=1)
+    builder = ti.graph.GraphBuilder()
+    builder.dispatch(
+        jpeg_fused_transform_tokens_histogram_2d,
+        fused_src, fused_quant, fused_basis, fused_order,
+        fused_dc_values, fused_symbols, fused_categories, fused_amplitudes,
+        fused_token_count, fused_dc_histogram, fused_ac_histogram,
+        hb, wb,
+    )
+    module.add_graph("compression_jpeg_fused_transform_tokens_histogram_2d", builder.compile())
 
     dc = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "zigzag", ti.f32, ndim=3)
     differences = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "dc_diff", ti.f32, ndim=1)
@@ -572,26 +595,6 @@ def compile_compression(arch=ti.cpu, output: str | None = None) -> str:
     )
     module.add_graph("compression_jpeg_scatter_block_bits", builder.compile())
 
-    pack_stream_block_bytes = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "block_bytes", ti.i32, ndim=2)
-    pack_stream_block_counts = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "block_counts", ti.i32, ndim=1)
-    pack_stream_out_bytes = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "out_bytes", ti.i32, ndim=1)
-    pack_stream_out_length = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "out_length", ti.i32, ndim=1)
-    pack_stream_num_blocks = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "num_blocks", ti.i32)
-    pack_stream_max_bytes = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "max_output_bytes", ti.i32)
-    pack_stream_restart = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "restart_interval", ti.i32)
-    builder = ti.graph.GraphBuilder()
-    builder.dispatch(
-        jpeg_pack_scan_stream_kernel,
-        pack_stream_block_bytes,
-        pack_stream_block_counts,
-        pack_stream_out_bytes,
-        pack_stream_out_length,
-        pack_stream_num_blocks,
-        pack_stream_max_bytes,
-        pack_stream_restart,
-    )
-    module.add_graph("compression_jpeg_pack_scan_stream", builder.compile())
-
     module.archive(str(output_path))
     ti.reset()
     print(f"compiled {output_path}")
@@ -605,23 +608,4 @@ def compile_compression_aot(arch=ti.cpu, save_path: str | None = None) -> str:
 
 
 if __name__ == "__main__":
-    target = sys.argv[1].lower() if len(sys.argv) > 1 else "all"
-    targets = {
-        "cpu": (ti.cpu, "cpu_x86_64_windows"),
-        "opengl": (ti.vulkan, "opengl_x86_64_windows"),
-        "vulkan": (ti.vulkan, "vulkan_x86_64_windows"),
-        "cuda": (ti.cuda, "cuda_x86_64_windows"),
-    }
-    if target in targets:
-        arch, variant = targets[target]
-        out = Path(__file__).parents[1] / "aot_tcm" / variant / f"compression_image_{variant}.tcm"
-        compile_compression(arch=arch, output=out)
-    elif target == "all":
-        for t_arch, t_var in [targets["cpu"], targets["opengl"], targets["vulkan"]]:
-            out = Path(__file__).parents[1] / "aot_tcm" / t_var / f"compression_image_{t_var}.tcm"
-            try:
-                compile_compression(arch=t_arch, output=out)
-            except Exception as exc:
-                print(f"Skipping {t_var}: {exc}")
-    else:
-        compile_compression()
+    compile_compression()

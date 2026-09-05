@@ -14,38 +14,94 @@ backend-management helpers used by the application.
 
 import os
 import sys
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
-# ``engine.py`` is the single maintained runtime implementation.  Older
-# packaging used this flag as if a second Python fallback implementation
-# existed, but both branches imported the same side-effecting module.  Import
-# it exactly once so a backend/driver initialization failure is never mistaken
-# for permission to retry a partially initialized runtime.
+
+def _load_canonical_engine_source():
+    """Load the maintained Python engine instead of a stale compiled sibling.
+
+    Python gives ``engine.cp*.pyd`` precedence over ``engine.py``.  The
+    checked-in binary was built against the retired package namespace, while
+    ``engine.py`` is the maintained lifecycle/runtime source.  Loading the
+    source module explicitly keeps backend initialization canonical and makes
+    the package independent from that stale build artifact.
+    """
+    module_name = f"{__name__}.engine"
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        return loaded
+
+    source_path = Path(__file__).with_name("engine.py")
+    spec = spec_from_file_location(module_name, source_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load canonical engine source: {source_path}")
+    module = module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+_load_canonical_engine_source()
+
+# Jalur Dynamic Loading: Utamakan Binary Native DLL (.pyd/.so) di Mode Production,
+# dan fallback ke source code .py di Mode Development.
 _USE_NATIVE = os.getenv("PIXEL_REFINE_USE_NATIVE_ENGINE", "1") == "1"
 
-from .engine import (
-    AOTEngine,
-    TaichiGPUBuffer,
-    InputArray,
-    OutputArray,
-    select_backend,
-    resolve_backend_config,
-    get_backend_config,
-    get_backend_name,
-    backend_info,
-    engine,
-    enable_experiment_mode,
-    is_experiment_mode,
-    INTER_CUBIC,
-    INTER_LINEAR,
-    INTER_NEAREST,
-    INTER_AREA,
-    COLOR_BGR2GRAY,
-    COLOR_RGB2GRAY,
-    COLOR_GRAY2BGR,
-)
-
-if _USE_NATIVE:
-    print("[AOT Native] Production Engine Active (C++ Compiled)")
+try:
+    if _USE_NATIVE:
+        # Coba import native binary engine terlebih dahulu
+        from .engine import (
+            AOTEngine,
+            TaichiGPUBuffer,
+            InputArray,
+            OutputArray,
+            select_backend,
+            resolve_backend_config,
+            get_backend_config,
+            get_backend_name,
+            backend_info,
+            engine,
+            enable_experiment_mode,
+            is_experiment_mode,
+            INTER_CUBIC,
+            INTER_LINEAR,
+            INTER_NEAREST,
+            INTER_AREA,
+            COLOR_BGR2GRAY,
+            COLOR_RGB2GRAY,
+            COLOR_GRAY2BGR,
+        )
+        print("[AOT Native] Production Engine Active (C++ Compiled)")
+    else:
+        raise ImportError("Development mode forced")
+except Exception:
+    # Jalur Development / Fallback
+    from .engine import (
+        AOTEngine,
+        TaichiGPUBuffer,
+        InputArray,
+        OutputArray,
+        select_backend,
+        resolve_backend_config,
+        get_backend_config,
+        get_backend_name,
+        backend_info,
+        engine,
+        enable_experiment_mode,
+        is_experiment_mode,
+        INTER_CUBIC,
+        INTER_LINEAR,
+        INTER_NEAREST,
+        INTER_AREA,
+        COLOR_BGR2GRAY,
+        COLOR_RGB2GRAY,
+        COLOR_GRAY2BGR,
+    )
 
 from .backend_config import (
     BackendConfig,
@@ -306,24 +362,21 @@ from taichi_vision.taichi_algorithm.compression.raw_pipeline import (
 
 # Keep the complete historical algorithm surface available at the old import
 # path.  The implementation is now maintained only in ``taichi_algorithm``.
-try:
-    from taichi_vision.taichi_algorithm.aot_api import *  # noqa: F401,F403,E402
-    from taichi_vision.taichi_algorithm.aot_api import (  # noqa: E402
-        _mod,
-        _module_cache,
-        load_tcm,
-        unload_all_modules,
-        get_engine,
-        set_block_mode,
-        get_block_config,
-        get_block_cache_stats,
-        clear_block_quarantine,
-        get_memory_status,
-        auto_pipeline,
-        configure_block_reservation,
-    )
-except (ImportError, AttributeError):
-    pass
+from taichi_vision.taichi_algorithm.aot_api import *  # noqa: F401,F403,E402
+from taichi_vision.taichi_algorithm.aot_api import (  # noqa: E402
+    _mod,
+    _module_cache,
+    load_tcm,
+    unload_all_modules,
+    get_engine,
+    set_block_mode,
+    get_block_config,
+    get_block_cache_stats,
+    clear_block_quarantine,
+    get_memory_status,
+    auto_pipeline,
+    configure_block_reservation,
+)
 
 try:
     from taichi_vision.taichi_algorithm.taichi_worker import ti_thread

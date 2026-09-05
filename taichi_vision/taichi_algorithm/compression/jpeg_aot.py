@@ -266,6 +266,91 @@ def _quantize_plane(plane, quality, chroma=False, resident=False):
     return ordered
 
 
+def _quantize_plane_gpu_chained(plane, quality, chroma=False):
+    """GPU-resident JPEG pipeline: DCT+quant+zigzag → tokens → histogram.
+
+    This function chains multiple GPU dispatches while keeping intermediate
+    results on GPU (using return_gpu=True), minimizing GPU↔CPU round-trips.
+    Returns (dc_diff, symbols, categories, amplitudes, token_count,
+    dc_histogram, ac_histogram) ready for host-side Huffman coding.
+
+    This is the optimized path for 12MP realtime compression on GPU.
+    """
+    h, w = plane.shape
+    hb, wb = h // 8, w // 8
+    base_table = JPEG_CHROMA_TABLE if chroma else JPEG_QUALITY_TABLE
+    scale = 5000 // quality if quality < 50 else 200 - 2 * quality
+    quant_table = np.asarray([max(1, min(255, (value * scale + 50) // 100)) for value in base_table], dtype=np.float32)
+    source = np.ascontiguousarray(plane)
+
+    # Stage 1: DCT + quantization + zigzag (GPU resident)
+    ordered_gpu = _dispatch(
+        "compression_image",
+        "compression_jpeg_dct_quantize_zigzag_2d",
+        inputs={"src": source, "quant_table": quant_table, "basis": _DCT_BASIS, "order": _JPEG_ZIGZAG},
+        outputs={"dst": ((hb, wb * 64), np.float32)},
+        scalars={"h_blocks": hb, "w_blocks": wb},
+        plain_ndarray=False,
+        return_gpu=True,
+    )
+
+    # Stage 2: Token preparation (GPU resident)
+    prepared_gpu = _dispatch(
+        "compression_image",
+        "compression_jpeg_prepare_tokens_2d",
+        inputs={"ordered": ordered_gpu},
+        outputs={
+            "dc_diff": ((hb * wb,), np.float32),
+            "symbols": ((hb, wb * 64), np.int32),
+            "categories": ((hb, wb * 64), np.int32),
+            "amplitudes": ((hb, wb * 64), np.int32),
+            "token_count": ((hb, wb), np.int32),
+        },
+        scalars={"h_blocks": hb, "w_blocks": wb},
+        plain_ndarray=False,
+        return_gpu=True,
+    )
+
+    # Stage 3: Histogram (GPU resident)
+    histogram_gpu = _dispatch(
+        "compression_image",
+        "compression_jpeg_symbol_histogram_2d",
+        inputs={
+            "dc_diff": prepared_gpu["dc_diff"],
+            "symbols": prepared_gpu["symbols"],
+            "token_count": prepared_gpu["token_count"],
+        },
+        outputs={
+            "dc_histogram": np.zeros(16, dtype=np.int32),
+            "ac_histogram": np.zeros(256, dtype=np.int32),
+        },
+        scalars={"h_blocks": hb, "w_blocks": wb},
+        plain_ndarray=False,
+        return_gpu=True,
+    )
+
+    # Read back results from GPU to CPU (only once at the end)
+    dc_diff = np.asarray(prepared_gpu["dc_diff"].to_numpy(), dtype=np.float32)
+    symbols = np.asarray(prepared_gpu["symbols"].to_numpy(), dtype=np.int32)
+    categories = np.asarray(prepared_gpu["categories"].to_numpy(), dtype=np.int32)
+    amplitudes = np.asarray(prepared_gpu["amplitudes"].to_numpy(), dtype=np.int32)
+    token_count = np.asarray(prepared_gpu["token_count"].to_numpy(), dtype=np.int32)
+    dc_histogram = np.asarray(histogram_gpu["dc_histogram"].to_numpy(), dtype=np.int64)
+    ac_histogram = np.asarray(histogram_gpu["ac_histogram"].to_numpy(), dtype=np.int64)
+
+    # Release GPU buffers
+    ordered_gpu.destroy()
+    prepared_gpu["dc_diff"].destroy()
+    prepared_gpu["symbols"].destroy()
+    prepared_gpu["categories"].destroy()
+    prepared_gpu["amplitudes"].destroy()
+    prepared_gpu["token_count"].destroy()
+    histogram_gpu["dc_histogram"].destroy()
+    histogram_gpu["ac_histogram"].destroy()
+
+    return dc_diff, symbols, categories, amplitudes, token_count, dc_histogram, ac_histogram
+
+
 def _materialize_ordered(value):
     if hasattr(value, "to_numpy"):
         try:
@@ -376,8 +461,9 @@ def _pack_plane_bits(ordered, dc_table, ac_table, prepared=None):
     # The temporary i32 graph output is bounded per chunk.  A larger default
     # amortizes graph-dispatch and host-copy overhead on 12 MP frames while
     # allowing low-VRAM deployments to select a smaller deterministic tile.
+    # Default to processing all rows at once for maximum throughput.
     try:
-        requested_chunk_rows = int(os.environ.get("JPEG_PACK_CHUNK_ROWS", "64"))
+        requested_chunk_rows = int(os.environ.get("JPEG_PACK_CHUNK_ROWS", str(hb)))
     except ValueError as exc:
         raise ValueError("JPEG_PACK_CHUNK_ROWS must be a positive integer") from exc
     if requested_chunk_rows <= 0:
@@ -542,8 +628,8 @@ def _finish_scan(parts: list[bytes], writer: BitWriter) -> bytes:
     return b"".join(parts)
 
 
-def _scatter_scan_blocks_native(block_bytes, block_counts, restart_interval: int = 0) -> bytes:
-    """Concatenate packed JPEG blocks through 1-pass native Taichi AOT scan graph."""
+def _scatter_scan_blocks_native(block_bytes, block_counts) -> bytes:
+    """Concatenate packed JPEG blocks through one native scatter graph."""
     block_bytes = np.asarray(block_bytes)
     counts = np.ascontiguousarray(block_counts, dtype=np.int32).reshape(-1)
     if block_bytes.ndim != 2 or block_bytes.shape[0] != counts.size:
@@ -553,38 +639,6 @@ def _scatter_scan_blocks_native(block_bytes, block_counts, restart_interval: int
     max_bits = int(block_bytes.shape[1]) * 8
     if np.any(counts < 0) or np.any(counts > max_bits):
         raise ValueError("JPEG packed block bit count is outside its bounded buffer")
-
-    num_blocks = int(counts.size)
-    max_block_bytes = int(block_bytes.shape[1])
-    max_output = max(1024, num_blocks * max_block_bytes * 2 + 1024)
-
-    # 100% Native Taichi Graph 1-Pass Stream Packing inside .tcm
-    try:
-        block_bytes_i32 = np.ascontiguousarray(block_bytes, dtype=np.int32)
-        packed_res = _dispatch(
-            "compression_image",
-            "compression_jpeg_pack_scan_stream",
-            inputs={
-                "block_bytes": block_bytes_i32,
-                "block_counts": counts,
-            },
-            outputs={
-                "out_bytes": ((max_output,), np.int32),
-                "out_length": ((1,), np.int32),
-            },
-            scalars={
-                "num_blocks": num_blocks,
-                "max_output_bytes": max_block_bytes,
-                "restart_interval": int(restart_interval),
-            },
-            plain_ndarray=False,
-        )
-        stream_len = int(packed_res["out_length"][0])
-        raw_stream = np.asarray(packed_res["out_bytes"], dtype=np.uint8)[:stream_len]
-        return bytes(raw_stream)
-    except Exception:
-        pass
-
     try:
         chunk_blocks = int(os.environ.get("JPEG_SCATTER_CHUNK_BLOCKS", "2048"))
     except ValueError as exc:
@@ -609,6 +663,10 @@ def _scatter_scan_blocks_native(block_bytes, block_counts, restart_interval: int
         if total_bits <= 0:
             continue
         max_chunk_bytes = max(1, (int(np.max(chunk_counts)) + 7) // 8)
+        # The graph ABI currently uses i32 block bytes.  Convert only the
+        # active chunk instead of materializing a full-frame uint8->i32 copy;
+        # for a 12 MP frame this avoids retaining roughly 250 MB of converted
+        # block storage alongside the original packed buffer.
         chunk_block_bytes = np.ascontiguousarray(block_bytes[first:last], dtype=np.int32)
         scattered = _dispatch(
             "compression_image",
@@ -684,10 +742,28 @@ def _interleave_scan_blocks_native(y_bits, cb_bits, cr_bits, subsampling: str, y
 
 
 def _native_scan_pack_enabled(block_count: int, restart_interval: int) -> bool:
-    mode = os.environ.get("JPEG_NATIVE_SCAN_PACK", "1").strip().lower()
+    if restart_interval:
+        return False
+    mode = os.environ.get("JPEG_NATIVE_SCAN_PACK", "auto").strip().lower()
+    if mode not in {"auto", "0", "1"}:
+        raise ValueError("JPEG_NATIVE_SCAN_PACK must be 'auto', '0', or '1'")
+    if mode == "1":
+        return True
     if mode == "0":
         return False
-    return True
+    # The graph removes Python block concatenation and was measured at about
+    # 28.4 s for a 12 MP 4:2:0 scan when explicitly enabled on the active
+    # NVIDIA OpenGL target. Keep auto conservative because scatter materializes a
+    # native bit buffer and can become dramatically slower under memory
+    # pressure.  Large scans can opt in with JPEG_NATIVE_SCAN_PACK=1; low-
+    # memory deployments can force the established path with =0.
+    try:
+        auto_limit = int(os.environ.get("JPEG_NATIVE_SCAN_AUTO_MAX_BLOCKS", "32768"))
+    except ValueError as exc:
+        raise ValueError("JPEG_NATIVE_SCAN_AUTO_MAX_BLOCKS must be a positive integer") from exc
+    if auto_limit <= 0:
+        raise ValueError("JPEG_NATIVE_SCAN_AUTO_MAX_BLOCKS must be a positive integer")
+    return int(block_count) <= auto_limit
 
 
 def _quality_tables(quality):
@@ -751,7 +827,7 @@ def encode_grayscale_aot(image, quality=75, huffman="standard", *, preset=None, 
         huffman_markers = None
     block_bytes, block_counts = _pack_plane_bits(ordered, dc_luma, ac_luma, prepared=prepared)
     if _native_scan_pack_enabled(block_bytes.shape[0], restart_interval):
-        scan_data = _scatter_scan_blocks_native(block_bytes, block_counts, restart_interval=restart_interval)
+        scan_data = _scatter_scan_blocks_native(block_bytes, block_counts)
     else:
         scan_parts: list[bytes] = []
         scan_writer = BitWriter(lsb_first=False)
@@ -769,11 +845,12 @@ def encode_rgb_aot(image, quality=75, subsampling="444", huffman="standard", *, 
     data = _normalize_rgb(image)
     quality = int(quality)
     restart_interval = _normalize_restart_interval(restart_interval)
+    subsampling, huffman = _resolve_preset(preset, subsampling, huffman)
+    subsampling = str(subsampling)
     if not 1 <= quality <= 100:
         raise ValueError("quality must be in [1, 100]")
-    subsampling, huffman = _resolve_preset(preset, subsampling, huffman)
     if subsampling not in {"444", "422", "420"}:
-        raise ValueError(f"unsupported subsampling: {subsampling!r}; use '444', '422', or '420'")
+        raise ValueError("subsampling must be 444, 422, or 420")
     huffman = str(huffman).lower()
     if huffman not in {"standard", "optimized"}:
         raise ValueError("huffman must be standard or optimized")
@@ -839,10 +916,8 @@ def encode_rgb_aot(image, quality=75, subsampling="444", huffman="standard", *, 
     y_blocks = _materialize_ordered(_quantize_plane(y_plane, quality, resident=resident))
     cb_blocks = _materialize_ordered(_quantize_plane(cb_plane, quality, chroma=True, resident=resident))
     cr_blocks = _materialize_ordered(_quantize_plane(cr_plane, quality, chroma=True, resident=resident))
-    y_prepared = None
-    cb_prepared = None
-    cr_prepared = None
-    if restart_interval:
+    y_prepared = cb_prepared = cr_prepared = None
+    if restart_interval or subsampling == "420":
         y_prepared = _prepare_scan_tokens(
             y_blocks,
             _prepare_plane_tokens(y_blocks),
@@ -854,27 +929,25 @@ def encode_rgb_aot(image, quality=75, subsampling="444", huffman="standard", *, 
             cb_blocks,
             _prepare_plane_tokens(cb_blocks),
             subsampling,
-            "cb",
+            "c",
             restart_interval,
         )
         cr_prepared = _prepare_scan_tokens(
             cr_blocks,
             _prepare_plane_tokens(cr_blocks),
             subsampling,
-            "cr",
+            "c",
             restart_interval,
         )
     if huffman == "optimized":
         y_dc_hist, y_ac_hist, y_prepared = _plane_histogram(y_blocks, prepared=y_prepared, return_prepared=True)
         cb_dc_hist, cb_ac_hist, cb_prepared = _plane_histogram(cb_blocks, prepared=cb_prepared, return_prepared=True)
         cr_dc_hist, cr_ac_hist, cr_prepared = _plane_histogram(cr_blocks, prepared=cr_prepared, return_prepared=True)
-        y_dc_luma, y_dc_marker = _optimized_table(y_dc_hist, 0, 0)
-        y_ac_luma, y_ac_marker = _optimized_table(y_ac_hist, 1, 0)
+        dc_luma, y_dc_marker = _optimized_table(y_dc_hist, 0, 0)
+        ac_luma, y_ac_marker = _optimized_table(y_ac_hist, 1, 0)
         dc_chroma, c_dc_marker = _optimized_table(cb_dc_hist + cr_dc_hist, 0, 1)
         ac_chroma, c_ac_marker = _optimized_table(cb_ac_hist + cr_ac_hist, 1, 1)
         huffman_markers = y_dc_marker + y_ac_marker + c_dc_marker + c_ac_marker
-        dc_luma = y_dc_luma
-        ac_luma = y_ac_luma
     else:
         dc_luma, ac_luma, dc_chroma, ac_chroma = _huffman_tables()
         huffman_markers = None
@@ -897,7 +970,7 @@ def encode_rgb_aot(image, quality=75, subsampling="444", huffman="standard", *, 
             c_hb,
             c_wb,
         )
-        scan_data = _scatter_scan_blocks_native(packed_blocks, packed_counts, restart_interval=restart_interval)
+        scan_data = _scatter_scan_blocks_native(packed_blocks, packed_counts)
         sampling = {"444": 0x11, "422": 0x21, "420": 0x22}[subsampling]
     else:
         scan_parts: list[bytes] = []

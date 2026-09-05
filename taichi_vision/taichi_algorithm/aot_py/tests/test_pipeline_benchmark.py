@@ -6,13 +6,7 @@ import unittest
 
 import numpy as np
 
-try:
-    from ..tools.pipeline_benchmark import BenchmarkCase, run_benchmark
-except ImportError:  # pragma: no cover - direct pytest collection fallback
-    from taichi_vision.taichi_algorithm.aot_py.tools.pipeline_benchmark import (
-        BenchmarkCase,
-        run_benchmark,
-    )
+from ..tools.pipeline_benchmark import BenchmarkCase, run_benchmark
 
 
 class PipelineBenchmarkTests(unittest.TestCase):

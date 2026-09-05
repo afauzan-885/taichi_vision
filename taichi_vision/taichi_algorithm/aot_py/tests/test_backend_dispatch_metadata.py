@@ -30,13 +30,7 @@ class BackendDispatchMetadataTests(unittest.TestCase):
 
     def test_backend_manager_accepts_probe_metadata(self):
         decision = BackendManager(
-            device={
-                "name": "Generic Compute Adapter",
-                "vendor": "NVIDIA",
-                "api_version": "1.3",
-                "features": {"compute": True, "ssbo": True},
-                "capability_source": "vulkan-probe",
-            },
+            device={"name": "Generic Compute Adapter", "vendor": "NVIDIA"},
             validated={"vulkan": "validated", "opengl": "validated"},
         ).decide("auto")
         self.assertEqual(decision.selected, "vulkan")

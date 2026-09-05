@@ -46,12 +46,6 @@ _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_KERNELS = 65536
 _MAX_ARGS_PER_KERNEL = 4096
 _MAX_PAYLOADS = 65536
-_MAX_ARCHIVE_MEMBERS = 65536
-_MAX_MEMBER_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
-_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
-_MAX_COMPRESSION_RATIO = 1000
-_MIN_RATIO_CHECK_COMPRESSED_BYTES = 4096
-_MAX_LEGACY_INSPECTION_BYTES = 32 * 1024 * 1024
 
 _ARCH_ALIASES = {
     "amd64": "x86_64",
@@ -179,8 +173,8 @@ def _normalize_target(value: Any) -> dict[str, Any]:
     vendor = _canonical_vendor(target.get("vendor", "unknown"))
     if backend not in _BACKENDS:
         raise TcmContractError(f"unsupported TCM target backend {backend!r}")
-    abi = str(target.get("abi", "") or "").strip().lower()
-    variant = str(target.get("variant", "") or "").strip().lower()
+    abi = str(target.get("abi", "") or "").strip()
+    variant = str(target.get("variant", "") or "").strip()
     if backend == "cuda" and vendor not in {"unknown", "nvidia"}:
         raise TcmContractError("CUDA TCM targets must use the NVIDIA vendor")
     if backend == "gles" and os_name not in {"android", "linux", "unknown"}:
@@ -295,20 +289,6 @@ def validate_manifest(
             raise TcmContractError(
                 f"TCM target mismatch for vendor: manifest={target['vendor']!r}, requested={requested['vendor']!r}"
             )
-        # ABI and optimized variant are part of the executable identity.  A
-        # coarse backend/arch match is not enough to prove that a payload can
-        # be loaded by this runtime.  If either side declares a qualifier,
-        # both sides must declare the same normalized value.
-        for field in ("abi", "variant"):
-            manifest_value = str(target.get(field, "") or "").strip().lower()
-            requested_value = str(
-                _target_value(requested_target, field, "") or ""
-            ).strip().lower()
-            if manifest_value != requested_value:
-                raise TcmContractError(
-                    f"TCM target mismatch for {field}: "
-                    f"manifest={manifest_value!r}, requested={requested_value!r}"
-                )
 
     payloads = source.get("payloads", [])
     if isinstance(payloads, (str, bytes, bytearray)) or not isinstance(payloads, Iterable):
@@ -391,73 +371,10 @@ def _read_manifest(archive: zipfile.ZipFile) -> Optional[Mapping[str, Any]]:
     if info.file_size > _MAX_MANIFEST_BYTES:
         raise TcmContractError("TCM manifest exceeds the maximum allowed size")
     try:
-        with archive.open(info, "r") as source:
-            encoded = source.read(_MAX_MANIFEST_BYTES + 1)
-        if len(encoded) > _MAX_MANIFEST_BYTES:
-            raise TcmContractError("TCM manifest exceeds the maximum allowed size")
-        decoded = json.loads(encoded.decode("utf-8"))
+        decoded = json.loads(archive.read(TCM_MANIFEST_NAME).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise TcmContractError("TCM manifest is not valid UTF-8 JSON") from exc
     return _require_mapping(decoded, "manifest")
-
-
-def _validate_archive_limits(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    """Validate ZIP metadata before any untrusted member is fully read."""
-
-    infos = archive.infolist()
-    if len(infos) > _MAX_ARCHIVE_MEMBERS:
-        raise TcmContractError(
-            f"TCM archive contains too many members ({len(infos)} > {_MAX_ARCHIVE_MEMBERS})"
-        )
-    total_size = 0
-    for info in infos:
-        size = int(info.file_size)
-        compressed = int(info.compress_size)
-        if size < 0 or size > _MAX_MEMBER_UNCOMPRESSED_BYTES:
-            raise TcmContractError(f"TCM member is too large: {info.filename}")
-        total_size += size
-        if total_size > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
-            raise TcmContractError("TCM archive exceeds the total uncompressed size limit")
-        if (
-            compressed >= _MIN_RATIO_CHECK_COMPRESSED_BYTES
-            and size > compressed * _MAX_COMPRESSION_RATIO
-        ):
-            raise TcmContractError(
-                f"TCM member has an excessive compression ratio: {info.filename}"
-            )
-    return infos
-
-
-def validate_archive_limits(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    """Validate ZIP resource limits for callers inspecting a TCM archive.
-
-    Target resolvers may need to inspect a small portion of a legacy archive
-    before the full manifest preflight runs.  They must share the same
-    archive-level limits so that this early admission path cannot bypass the
-    contract validator.
-    """
-
-    return _validate_archive_limits(archive)
-
-
-def _stream_sha256(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
-    digest = hashlib.sha256()
-    with archive.open(info, "r") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _read_legacy_member_text(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
-    """Read only a bounded prefix of legacy LLVM text for target inspection."""
-
-    with archive.open(info, "r") as source:
-        encoded = source.read(_MAX_LEGACY_INSPECTION_BYTES + 1)
-    if len(encoded) > _MAX_LEGACY_INSPECTION_BYTES:
-        raise TcmContractError(
-            f"legacy LLVM inspection exceeds the limit: {info.filename}"
-        )
-    return encoded.decode("utf-8", errors="replace")
 
 
 def _validate_legacy_payload_target(
@@ -481,52 +398,20 @@ def _validate_legacy_payload_target(
     backend = _canonical_backend(_target_value(requested_target, "backend", "cpu"), target_os)
     if backend not in {"cuda", "cpu"}:
         return
-    llvm_entries = [
-        info for info in archive.infolist()
-        if info.filename.lower().endswith((".ll", ".tic"))
-    ]
-    if backend == "cuda":
-        triples = []
-        for info in llvm_entries:
-            try:
-                text = _read_legacy_member_text(archive, info)
-            except (KeyError, OSError):
-                continue
-            triples.extend(re.findall(r'target triple = "([^"]+)"', text))
-        if not triples:
-            return
-        normalized = tuple(triple.lower() for triple in triples)
-        if not any("nvptx64" in triple for triple in normalized):
-            raise TcmContractError(
-                "legacy CUDA payload target mismatch: expected NVPTX LLVM triple (NVPTX64)"
-            )
-        expected_arch = _canonical_arch(_target_value(requested_target, "arch"))
-        for triple in normalized:
-            if "nvptx" in triple:
-                continue
-            host_arch_ok = (
-                (expected_arch == "x86_64" and ("x86_64" in triple or "amd64" in triple))
-                or (expected_arch == "arm64" and ("aarch64" in triple or "arm64" in triple))
-            )
-            host_os_ok = (
-                (target_os == "windows" and ("windows" in triple or "win32" in triple or "msvc" in triple))
-                or (target_os == "linux" and "linux" in triple and "android" not in triple)
-                or (target_os == "android" and "android" in triple)
-            )
-            if not (host_arch_ok and host_os_ok):
-                raise TcmContractError(
-                    f"legacy CUDA host-helper target mismatch: {triple}"
-                )
-        return
-
-    for info in llvm_entries:
-        name = info.filename
+    llvm_entries = [name for name in archive.namelist() if name.lower().endswith((".ll", ".tic"))]
+    for name in llvm_entries:
         try:
-            text = _read_legacy_member_text(archive, info)
+            text = archive.read(name).decode("utf-8", errors="replace")
         except (KeyError, OSError):
             continue
         triples = re.findall(r'target triple = "([^"]+)"', text)
         if not triples:
+            continue
+        if backend == "cuda":
+            if any("nvptx" not in triple.lower() for triple in triples):
+                raise TcmContractError(
+                    f"legacy CUDA payload target mismatch in {name}: expected NVPTX LLVM triple"
+                )
             continue
         # CPU archives are also target-qualified.  Reject an obvious host
         # relabel (for example Windows/MSVC IR placed under the Linux target)
@@ -572,8 +457,7 @@ def validate_tcm(
         raise TcmContractError(f"TCM archive does not exist: {artifact}")
     try:
         with zipfile.ZipFile(artifact, "r") as archive:
-            infos = _validate_archive_limits(archive)
-            names = [info.filename for info in infos]
+            names = archive.namelist()
             if len(names) != len(set(names)):
                 raise TcmContractError("TCM archive contains duplicate entry names")
             manifest = _read_manifest(archive)
@@ -605,7 +489,7 @@ def validate_tcm(
                         f"payload size mismatch for {payload_path}: manifest={payload['size']}, archive={info.file_size}"
                     )
                 if "sha256" in payload:
-                    digest = _stream_sha256(archive, info)
+                    digest = hashlib.sha256(archive.read(payload_path)).hexdigest()
                     if digest.lower() != payload["sha256"].lower():
                         raise TcmContractError(f"payload checksum mismatch for {payload_path}")
             return {
@@ -658,13 +542,13 @@ def build_manifest_from_archive(
             kind = next((candidate for suffix, candidate in suffix_kinds if name.lower().endswith(suffix)), None)
             if kind is None:
                 continue
-            info = archive.getinfo(name)
+            data = archive.read(name)
             entry: dict[str, Any] = {
                 "path": name,
                 "kind": kind,
                 "version": str(versions.get(kind, "unspecified")),
-                "size": info.file_size,
-                "sha256": _stream_sha256(archive, info),
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
             }
             payloads.append(entry)
     manifest = {

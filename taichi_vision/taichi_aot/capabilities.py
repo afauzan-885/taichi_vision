@@ -8,37 +8,20 @@ the dispatcher can quarantine a backend without changing public APIs.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-import importlib.util
 import os
-import json
-import sys
-from pathlib import Path
 import subprocess
 import sys
-import tempfile
 from typing import Any, Mapping
 from taichi_vision.backend_config import (
     is_android_runtime,
     requested_backend as _requested_backend,
 )
+from taichi_vision.graphics_compatibility import graphics_compatibility_enabled
 from taichi_vision.cuda_arch_matrix import (
     bridge_target_status,
     load_bridge_manifest,
     profile_for,
 )
-try:
-    from .gfx_capabilities import negotiate_graphics_capabilities
-except (ImportError, ValueError):
-    _GFX_PATH = Path(__file__).with_name("gfx_capabilities.py")
-    _GFX_SPEC = importlib.util.spec_from_file_location(
-        "taichi_aot_gfx_capabilities_fallback", _GFX_PATH
-    )
-    if _GFX_SPEC is None or _GFX_SPEC.loader is None:  # pragma: no cover
-        raise RuntimeError(f"cannot load graphics capability policy: {_GFX_PATH}")
-    _GFX_MODULE = importlib.util.module_from_spec(_GFX_SPEC)
-    sys.modules[_GFX_SPEC.name] = _GFX_MODULE
-    _GFX_SPEC.loader.exec_module(_GFX_MODULE)
-    negotiate_graphics_capabilities = _GFX_MODULE.negotiate_graphics_capabilities
 
 
 @dataclass(frozen=True)
@@ -79,60 +62,13 @@ def _device_metadata(device: Any) -> tuple[Mapping[str, Any], str, str]:
     vendor = (
         "intel"
         if "intel" in searchable
-        else "nvidia"
-        if ("nvidia" in searchable or "geforce" in searchable)
-        else "amd"
-        if ("amd" in searchable or "radeon" in searchable)
-        else "unknown"
+        else (
+            "nvidia"
+            if ("nvidia" in searchable or "geforce" in searchable)
+            else "amd" if ("amd" in searchable or "radeon" in searchable) else "unknown"
+        )
     )
     return metadata, device_name, vendor
-
-
-def _device_ordinal(metadata: Mapping[str, Any]):
-    """Return the ordinal carried by the evaluated device record, if any.
-
-    Capability policy must never borrow ``AOT_DEVICE`` to identify a different
-    argument.  Device discovery records use ``ordinal`` today; the additional
-    aliases keep the helper tolerant of existing probe dictionaries without
-    making environment state part of identity.
-    """
-
-    for key in ("ordinal", "device_id", "index"):
-        value = metadata.get(key)
-        if value in (None, ""):
-            continue
-        try:
-            ordinal = int(value)
-        except (TypeError, ValueError):
-            return None
-        return ordinal if ordinal >= 0 else None
-    return None
-
-
-def _intel_vulkan_validated(metadata: Mapping[str, Any]) -> bool:
-    """Query qualification for exactly the Intel device being evaluated."""
-
-    ordinal = _device_ordinal(metadata)
-    if ordinal is None:
-        return False
-
-    try:
-        from taichi_vision.vulkan_probe import intel_vulkan_is_validated
-
-        return bool(intel_vulkan_is_validated(device_id=ordinal))
-    except Exception:
-        return False
-
-
-def _negotiated_graphics_snapshot(backend: str, metadata: Mapping[str, Any]):
-    """Reuse a canonical snapshot when the resolver already supplied one."""
-
-    snapshot = metadata.get("capability_snapshot")
-    if snapshot is not None and getattr(
-        getattr(snapshot, "decision", None), "backend", None
-    ) == backend:
-        return snapshot
-    return negotiate_graphics_capabilities(backend, metadata)
 
 
 def classify_device(device: Any, backend: str, driver: str = "unknown"):
@@ -238,73 +174,23 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             safe=True,
             reason="NVIDIA CUDA selected; compute capability will be validated by the native runtime",
         )
-    if backend == "vulkan":
-        snapshot = _negotiated_graphics_snapshot(backend, metadata)
-        if not snapshot.usable:
+    if backend == "vulkan" and vendor == "intel":
+        try:
+            from taichi_vision.vulkan_probe import intel_vulkan_is_validated
+
+            validated = intel_vulkan_is_validated(int(os.environ.get("AOT_DEVICE", 0)))
+        except Exception:
+            validated = False
+        if validated:
             return BackendCapabilities(
                 backend,
                 vendor,
                 device_name,
                 driver,
-                safe=False,
-                reason=f"graphics capability snapshot rejected: {snapshot.decision.reason}",
+                safe=True,
+                reason="Intel Vulkan lifecycle, parity, and pipeline manifest validated",
             )
-        if vendor == "intel":
-            validated = _intel_vulkan_validated(metadata)
-            if not validated:
-                ordinal = _device_ordinal(metadata)
-                reason = (
-                    "Intel Vulkan AOT is quarantined after ABI/pipeline failures"
-                    if ordinal is not None
-                    else "Intel Vulkan qualification requires the exact evaluated device identity"
-                )
-                return BackendCapabilities(
-                    backend,
-                    vendor,
-                    device_name,
-                    driver,
-                    safe=False,
-                    reason=reason,
-                )
-            reason = "Intel Vulkan lifecycle, parity, and pipeline manifest validated"
-        else:
-            reason = (
-                "Vulkan capability snapshot validated: "
-                f"{snapshot.decision.profile} ({snapshot.evidence_source})"
-            )
-        return BackendCapabilities(
-            backend,
-            vendor,
-            device_name,
-            driver,
-            safe=True,
-            reason=reason,
-        )
-    if backend == "opengl":
-        snapshot = _negotiated_graphics_snapshot(backend, metadata)
-        if not snapshot.usable:
-            return BackendCapabilities(
-                backend,
-                vendor,
-                device_name,
-                driver,
-                safe=False,
-                reason=f"graphics capability snapshot rejected: {snapshot.decision.reason}",
-            )
-        return BackendCapabilities(
-            backend,
-            vendor,
-            device_name,
-            driver,
-            safe=True,
-            reason=(
-                "OpenGL capability snapshot validated: "
-                f"{snapshot.decision.profile} ({snapshot.evidence_source})"
-            ),
-        )
-    if backend == "gles":
-        snapshot = _negotiated_graphics_snapshot(backend, metadata)
-        if snapshot.usable:
+        if graphics_compatibility_enabled(backend, vendor):
             return BackendCapabilities(
                 backend,
                 vendor,
@@ -312,10 +198,49 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
                 driver,
                 safe=True,
                 reason=(
-                    "GLES capability snapshot validated: "
-                    f"{snapshot.decision.profile} ({snapshot.evidence_source})"
+                    "Intel Vulkan admitted through conservative host-visible "
+                    "memory and direct-dispatch compatibility policy"
                 ),
             )
+        return BackendCapabilities(
+            backend,
+            vendor,
+            device_name,
+            driver,
+            safe=False,
+            reason="Intel Vulkan AOT is quarantined after ABI/pipeline failures",
+        )
+    if backend == "opengl":
+        if vendor == "intel" and sys.platform.startswith("win"):
+            if graphics_compatibility_enabled(backend, vendor):
+                return BackendCapabilities(
+                    backend,
+                    vendor,
+                    device_name,
+                    driver,
+                    safe=True,
+                    reason=(
+                        "Intel Windows OpenGL admitted through conservative "
+                        "direct-dispatch compatibility policy"
+                    ),
+                )
+            return BackendCapabilities(
+                backend,
+                vendor,
+                device_name,
+                driver,
+                safe=False,
+                reason="Intel Windows OpenGL ICD causes access violation during native runtime initialization",
+            )
+        return BackendCapabilities(
+            backend,
+            vendor,
+            device_name,
+            driver,
+            safe=True,
+            reason="OpenGL artifact/load smoke tests validated",
+        )
+    if backend == "gles":
         # GLES artifacts and the ARM64 bridge are statically validated, but a
         # real Android GLES context is required before automatic dispatch can
         # call this target.  Keep it visible to diagnostics without allowing a
@@ -326,10 +251,7 @@ def classify_device(device: Any, backend: str, driver: str = "unknown"):
             device_name,
             driver,
             safe=False,
-            reason=(
-                "GLES capability snapshot rejected: "
-                f"{snapshot.decision.reason}"
-            ),
+            reason="GLES TCM/bridge static gates passed; Android device execution is pending",
         )
     return BackendCapabilities(backend, vendor, device_name, driver)
 
@@ -340,22 +262,31 @@ def requested_backend():
 
 def backend_candidates(device: Any = "unknown"):
     """Return deterministic preference order for automatic dispatch."""
-    metadata, device_name, vendor = _device_metadata(device)
-    auto_fallback = (
-        os.environ.get("PIXEL_REFINE_AOT_AUTO_FALLBACK", "0") == "1"
-    )
+    _, device_name, vendor = _device_metadata(device)
+    auto_fallback = os.environ.get("PIXEL_REFINE_AOT_AUTO_FALLBACK", "0") == "1"
     if is_android_runtime():
         # Android's desktop-OpenGL spelling is not a valid artifact identity;
         # the resolver canonicalizes it to GLES. Keep the mobile preference
         # list explicit so auto mode never attempts a desktop OpenGL bridge.
         return ["vulkan", "gles", "cpu"]
     if vendor == "intel":
-        if _intel_vulkan_validated(metadata):
+        if auto_fallback or graphics_compatibility_enabled("vulkan", vendor):
             return ["vulkan", "opengl", "cpu"]
+        try:
+            from taichi_vision.vulkan_probe import intel_vulkan_is_validated
+
+            if intel_vulkan_is_validated(int(os.environ.get("AOT_DEVICE", 0))):
+                return ["vulkan", "opengl", "cpu"]
+        except Exception:
+            pass
         return ["opengl", "cpu"]
     # Auto-fallback order requested by the user: CUDA -> Vulkan -> OpenGL -> CPU.
     if vendor == "nvidia":
-        return ["cuda", "vulkan", "opengl", "cpu"] if auto_fallback else ["vulkan", "opengl", "cpu"]
+        return (
+            ["cuda", "vulkan", "opengl", "cpu"]
+            if auto_fallback
+            else ["vulkan", "opengl", "cpu"]
+        )
     if vendor == "amd":
         # CUDA is NVIDIA-only; never advertise it for an AMD device even when
         # the optional automatic-fallback switch is enabled.

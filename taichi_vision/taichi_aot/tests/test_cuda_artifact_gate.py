@@ -12,7 +12,6 @@ from pathlib import Path
 import zipfile
 
 from taichi_vision.taichi_aot.artifact_targets import TargetSpec, resolve_artifact
-from taichi_vision.taichi_aot import artifact_targets
 from taichi_vision.taichi_aot.tcm_preflight import preflight_tcm
 
 
@@ -64,12 +63,4 @@ def test_legacy_cuda_host_payload_cannot_be_enabled_by_compatibility_flag(tmp_pa
     path = tmp_path / "sfm_registration_cuda.tcm"
     _write_legacy_cuda(path, "x86_64-pc-windows-msvc19.44.35228")
     assert resolve_artifact(tmp_path, "sfm_registration", CUDA_TARGET, allow_legacy=True) is None
-
-
-def test_resolver_bounds_legacy_llvm_inspection(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / CUDA_TARGET.target_id / CUDA_TARGET.artifact_name("sfm_stereo")
-    _write_legacy_cuda(path, "nvptx64-nvidia-cuda" + ("-" * 32))
-    monkeypatch.setattr(artifact_targets, "_MAX_TARGET_INSPECTION_BYTES", 8)
-
-    assert resolve_artifact(tmp_path, "sfm_stereo", CUDA_TARGET, allow_legacy=False) is None
 

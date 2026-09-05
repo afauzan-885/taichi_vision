@@ -25,8 +25,6 @@ import zipfile
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from .tcm_contract import TcmContractError, validate_archive_limits
-
 
 _ARCH_ALIASES = {
     "amd64": "x86_64",
@@ -69,36 +67,6 @@ _BACKEND_ALIASES = {
 }
 
 _VENDORS = {"unknown", "nvidia", "intel", "amd", "qualcomm", "arm", "apple"}
-_MAX_GRAPH_INDEX_BYTES = 4 * 1024 * 1024
-_MAX_TARGET_INSPECTION_BYTES = 32 * 1024 * 1024
-
-
-def _read_prefix(
-    archive: zipfile.ZipFile,
-    info: zipfile.ZipInfo,
-    limit: int,
-    *,
-    require_complete: bool = False,
-) -> bytes:
-    """Read only the bounded prefix needed for target qualification."""
-
-    if require_complete and int(info.file_size) > limit:
-        raise TcmContractError(
-            f"target inspection exceeds the limit: {info.filename}"
-        )
-    with archive.open(info, "r") as source:
-        payload = source.read(limit + 1)
-    if len(payload) > limit:
-        if require_complete:
-            raise TcmContractError(
-                f"target inspection exceeds the limit: {info.filename}"
-            )
-        return payload[:limit]
-    if require_complete and len(payload) != int(info.file_size):
-        raise TcmContractError(
-            f"target inspection is truncated: {info.filename}"
-        )
-    return payload
 
 
 def canonical_arch(value: Optional[str]) -> str:
@@ -318,9 +286,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
     """
     try:
         with zipfile.ZipFile(path, "r") as archive:
-            infos = validate_archive_limits(archive)
-            names = {info.filename for info in infos}
-            members = {info.filename: info for info in infos}
+            names = set(archive.namelist())
             if target.backend in {"vulkan", "opengl", "gles"}:
                 # Graphics artifacts are consumed as SPIR-V by the native
                 # Vulkan/OpenGL/GLES bridges.  A ``graphs.tcb``/LLVM payload
@@ -341,20 +307,8 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                 if "graphs.json" not in names:
                     return False
                 try:
-                    graph_index = json.loads(
-                        _read_prefix(
-                            archive,
-                            members["graphs.json"],
-                            _MAX_GRAPH_INDEX_BYTES,
-                            require_complete=True,
-                        )
-                    )
-                except (
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    KeyError,
-                    TcmContractError,
-                ):
+                    graph_index = json.loads(archive.read("graphs.json"))
+                except (UnicodeDecodeError, json.JSONDecodeError, KeyError):
                     return False
                 if not isinstance(graph_index, (list, dict)):
                     return False
@@ -367,7 +321,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
                 # byte-level check independent of the host architecture.
                 spirv_magic = b"\x03\x02\x23\x07"
                 for name in shader_names:
-                    payload = _read_prefix(archive, members[name], 4)
+                    payload = archive.read(name)
                     if len(payload) < 4 or payload[:4] != spirv_magic:
                         return False
                 return True
@@ -375,12 +329,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
             if "graphs.tcb" not in names or not llvm_files:
                 return False
             samples = [
-                _read_prefix(
-                    archive,
-                    members[name],
-                    _MAX_TARGET_INSPECTION_BYTES,
-                    require_complete=True,
-                ).decode("utf-8", errors="replace")
+                archive.read(name).decode("utf-8", errors="replace")
                 for name in llvm_files
             ]
             triples = [
@@ -412,7 +361,7 @@ def _artifact_matches_target(path: Path, target: TargetSpec) -> bool:
             if target.os == "android":
                 return "android" in triple
             return True
-    except (OSError, zipfile.BadZipFile, KeyError, TcmContractError):
+    except (OSError, zipfile.BadZipFile, KeyError):
         return False
 
 

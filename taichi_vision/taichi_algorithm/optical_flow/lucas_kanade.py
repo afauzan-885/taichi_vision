@@ -2,8 +2,8 @@
 Lucas-Kanade Optical Flow - Grid Dense Variant
 ==============================================
 
-OpenCV-inspired Lucas-Kanade tracking with internal grid point generation.
-The public API intentionally mirrors cv2.calcOpticalFlowPyrLK, but returns a
+Taichi Lucas-Kanade tracking with internal grid point generation.
+The public API intentionally mirrors the shape of calcOpticalFlowPyrLK, but returns a
 dense flow map shaped (H, W, 2) for Pixel Refine alignment workflows.
 
 Design notes:
@@ -43,7 +43,14 @@ DEFAULT_MOTION_MODE = "fast"
 
 def _as_gray_f32(image):
     if image.ndim == 3:
-        image = image.mean(axis=2)
+        if image.shape[2] >= 3:
+            image = (
+                0.2126 * image[:, :, 0]
+                + 0.7152 * image[:, :, 1]
+                + 0.0722 * image[:, :, 2]
+            )
+        else:
+            image = image[:, :, 0]
     return np.ascontiguousarray(image, dtype=np.float32)
 
 
@@ -100,9 +107,9 @@ def _cpu_calc_pyr_lk_dense(
     max_level=DEFAULT_MAX_LEVEL,
     criteria=None,
 ):
-    raise RuntimeError(
-        "legacy Lucas-Kanade execution is disabled; use the validated "
-        "taichi_vision AOT/TCM facade"
+    raise ImportError(
+        "Taichi is required for Lucas-Kanade CPU execution; "
+        "the OpenCV fallback was removed."
     )
 
 
@@ -573,9 +580,9 @@ def calcOpticalFlowPyrLK(
 ):
     """Dense grid Lucas-Kanade flow with cv2-like name and no point setup."""
     if not TAICHI_AVAILABLE:
-        raise RuntimeError(
-            "calcOpticalFlowPyrLK requires the taichi_vision AOT/TCM facade; "
-            "legacy CPU/OpenCV fallback is disabled"
+        raise ImportError(
+            "Taichi is required for Lucas-Kanade execution; "
+            "the OpenCV fallback was removed."
         )
 
     from taichi_vision.taichi_algorithm import common
