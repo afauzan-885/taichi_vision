@@ -13,3 +13,4 @@ def test_spirv_tools_accept_explicit_environment_paths(tmp_path, monkeypatch):
 
     assert Path(spirv_compatibility._tool("spirv-val")) == validator.resolve()
     assert Path(spirv_compatibility._tool("spirv-dis")) == disassembler.resolve()
+

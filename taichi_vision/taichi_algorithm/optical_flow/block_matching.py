@@ -62,11 +62,45 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
             flow[y, x, 0] = 0.0
             flow[y, x, 1] = 0.0
 
+
     @ti.kernel
     def _bm_zero_stats_kernel(stats: ti.types.ndarray()):
         n = stats.shape[0]
         for i in range(n):
             stats[i] = 0.0
+
+    @ti.func
+    def _bm_popcount32(v: ti.i32) -> ti.i32:
+        v = v - ((v >> 1) & 0x55555555)
+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+        v = (v + (v >> 4)) & 0x0F0F0F0F
+        v = v + (v >> 8)
+        v = v + (v >> 16)
+        return v & 0x3F
+
+    @ti.func
+    def _bm_mct8_at(img: ti.types.ndarray(), y: ti.i32, x: ti.i32, h: ti.i32, w: ti.i32) -> ti.i32:
+        v0 = _bm_read_i32(img, y - 1, x - 1, h, w)
+        v1 = _bm_read_i32(img, y - 1, x,     h, w)
+        v2 = _bm_read_i32(img, y - 1, x + 1, h, w)
+        v3 = _bm_read_i32(img, y,     x - 1, h, w)
+        v4 = _bm_read_i32(img, y,     x,     h, w)
+        v5 = _bm_read_i32(img, y,     x + 1, h, w)
+        v6 = _bm_read_i32(img, y + 1, x - 1, h, w)
+        v7 = _bm_read_i32(img, y + 1, x,     h, w)
+        v8 = _bm_read_i32(img, y + 1, x + 1, h, w)
+        mu = (v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8) * 0.111111111
+
+        desc = 0
+        if v0 > mu: desc |= 1
+        if v1 > mu: desc |= 2
+        if v2 > mu: desc |= 4
+        if v3 > mu: desc |= 8
+        if v5 > mu: desc |= 16
+        if v6 > mu: desc |= 32
+        if v7 > mu: desc |= 64
+        if v8 > mu: desc |= 128
+        return desc
 
     @ti.func
     def _bm_patch_sad_5point(
@@ -80,9 +114,7 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
         w: ti.i32,
         win_radius: ti.i32,
     ) -> ti.types.vector(5, ti.f32):
-        # Single-pass 5-point stencil accumulator in registers:
-        # [0]=center, [1]=left, [2]=right, [3]=up, [4]=down
-        sad_vec = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0])
+        cost_vec = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0])
         half_r = win_radius // 2
         for oy_i in range(-half_r, half_r + 1):
             oy = oy_i * 2
@@ -90,19 +122,18 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
             for ox_i in range(-half_r, half_r + 1):
                 ox = ox_i * 2
                 xx_i = cx + ox
-                p_val = _bm_read_i32(prev, yy_i, xx_i, h, w)
-
-                # Center
-                sad_vec[0] += ti.abs(_bm_read_i32(next, yy_i + fy, xx_i + fx, h, w) - p_val)
-                # Left (fx - 1)
-                sad_vec[1] += ti.abs(_bm_read_i32(next, yy_i + fy, xx_i + fx - 1, h, w) - p_val)
-                # Right (fx + 1)
-                sad_vec[2] += ti.abs(_bm_read_i32(next, yy_i + fy, xx_i + fx + 1, h, w) - p_val)
-                # Up (fy - 1)
-                sad_vec[3] += ti.abs(_bm_read_i32(next, yy_i + fy - 1, xx_i + fx, h, w) - p_val)
-                # Down (fy + 1)
-                sad_vec[4] += ti.abs(_bm_read_i32(next, yy_i + fy + 1, xx_i + fx, h, w) - p_val)
-        return sad_vec
+                d_p = _bm_mct8_at(prev, yy_i, xx_i, h, w)
+                d_c = _bm_mct8_at(next, yy_i + fy, xx_i + fx, h, w)
+                d_l = _bm_mct8_at(next, yy_i + fy, xx_i + fx - 1, h, w)
+                d_r = _bm_mct8_at(next, yy_i + fy, xx_i + fx + 1, h, w)
+                d_u = _bm_mct8_at(next, yy_i + fy - 1, xx_i + fx, h, w)
+                d_d = _bm_mct8_at(next, yy_i + fy + 1, xx_i + fx, h, w)
+                cost_vec[0] += ti.cast(_bm_popcount32(d_p ^ d_c), ti.f32)
+                cost_vec[1] += ti.cast(_bm_popcount32(d_p ^ d_l), ti.f32)
+                cost_vec[2] += ti.cast(_bm_popcount32(d_p ^ d_r), ti.f32)
+                cost_vec[3] += ti.cast(_bm_popcount32(d_p ^ d_u), ti.f32)
+                cost_vec[4] += ti.cast(_bm_popcount32(d_p ^ d_d), ti.f32)
+        return cost_vec
 
     @ti.func
     def _bm_patch_sad(
@@ -116,7 +147,7 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
         w: ti.i32,
         win_radius: ti.i32,
     ) -> ti.f32:
-        sad = 0.0
+        cost = 0.0
         half_r = win_radius // 2
         for oy_i in range(-half_r, half_r + 1):
             oy = oy_i * 2
@@ -124,12 +155,83 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
             for ox_i in range(-half_r, half_r + 1):
                 ox = ox_i * 2
                 xx_i = cx + ox
-                diff = _bm_read_i32(next, yy_i + shift_y, xx_i + shift_x, h, w) - _bm_read_i32(prev, yy_i, xx_i, h, w)
-                sad += ti.abs(diff)
-        return sad
+                d1 = _bm_mct8_at(prev, yy_i, xx_i, h, w)
+                d2 = _bm_mct8_at(next, yy_i + shift_y, xx_i + shift_x, h, w)
+                cost += ti.cast(_bm_popcount32(d1 ^ d2), ti.f32)
+        return cost
+
+    @ti.func
+    def _bm_patch_sad_static(
+        prev: ti.types.ndarray(),
+        next: ti.types.ndarray(),
+        cy: ti.i32,
+        cx: ti.i32,
+        shift_y: ti.i32,
+        shift_x: ti.i32,
+        h: ti.i32,
+        w: ti.i32,
+        win_radius: ti.template(),
+    ) -> ti.f32:
+        """Exact SAD path with a compile-time patch radius.
+
+        The public API still permits arbitrary window sizes through
+        :func:`_bm_patch_sad`.  The shipped BM presets only use radii 6, 7,
+        and 8, however.  Making those loop bounds static lets CUDA unroll the
+        sparse patch without changing samples, traversal order, or rounding.
+        """
+        cost = 0.0
+        half_r = ti.static(win_radius // 2)
+        for oy_i in ti.static(range(-half_r, half_r + 1)):
+            oy = oy_i * 2
+            yy_i = cy + oy
+            for ox_i in ti.static(range(-half_r, half_r + 1)):
+                ox = ox_i * 2
+                xx_i = cx + ox
+                d1 = _bm_mct8_at(prev, yy_i, xx_i, h, w)
+                d2 = _bm_mct8_at(next, yy_i + shift_y, xx_i + shift_x, h, w)
+                cost += ti.cast(_bm_popcount32(d1 ^ d2), ti.f32)
+        return cost
+
+    @ti.func
+    def _bm_patch_sad_5point_static(
+        prev: ti.types.ndarray(),
+        next: ti.types.ndarray(),
+        cy: ti.i32,
+        cx: ti.i32,
+        fy: ti.i32,
+        fx: ti.i32,
+        h: ti.i32,
+        w: ti.i32,
+        win_radius: ti.template(),
+    ) -> ti.types.vector(5, ti.f32):
+        """Static-radius equivalent of the five-point parabolic stencil."""
+        cost_vec = ti.Vector([0.0, 0.0, 0.0, 0.0, 0.0])
+        half_r = ti.static(win_radius // 2)
+        for oy_i in ti.static(range(-half_r, half_r + 1)):
+            oy = oy_i * 2
+            yy_i = cy + oy
+            for ox_i in ti.static(range(-half_r, half_r + 1)):
+                ox = ox_i * 2
+                xx_i = cx + ox
+                d_p = _bm_mct8_at(prev, yy_i, xx_i, h, w)
+                d_c = _bm_mct8_at(next, yy_i + fy, xx_i + fx, h, w)
+                d_l = _bm_mct8_at(next, yy_i + fy, xx_i + fx - 1, h, w)
+                d_r = _bm_mct8_at(next, yy_i + fy, xx_i + fx + 1, h, w)
+                d_u = _bm_mct8_at(next, yy_i + fy - 1, xx_i + fx, h, w)
+                d_d = _bm_mct8_at(next, yy_i + fy + 1, xx_i + fx, h, w)
+                cost_vec[0] += ti.cast(_bm_popcount32(d_p ^ d_c), ti.f32)
+                cost_vec[1] += ti.cast(_bm_popcount32(d_p ^ d_l), ti.f32)
+                cost_vec[2] += ti.cast(_bm_popcount32(d_p ^ d_r), ti.f32)
+                cost_vec[3] += ti.cast(_bm_popcount32(d_p ^ d_u), ti.f32)
+                cost_vec[4] += ti.cast(_bm_popcount32(d_p ^ d_d), ti.f32)
+        return cost_vec
 
     @ti.kernel
-    def _bm_grid_track_kernel(
+    @ti.func
+    def _bm_median3(a: ti.i32, b: ti.i32, c: ti.i32) -> ti.i32:
+        return a + b + c - ti.min(a, ti.min(b, c)) - ti.max(a, ti.max(b, c))
+
+def _bm_grid_track_kernel(
         prev: ti.types.ndarray(),
         next: ti.types.ndarray(),
         prev_grid_flow: ti.types.ndarray(),
@@ -146,12 +248,11 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
         grid_h = grid_flow.shape[0]
         grid_w = grid_flow.shape[1]
 
-        pts_side = (win_radius * 2) // 2 + 1
-        inv_patch_area = 1.0 / ti.cast(pts_side * pts_side, ti.f32)
+        pts_side = (win_radius // 2) * 2 + 1
+        inv_patch_area = 1.0 / ti.cast(pts_side * pts_side * 8, ti.f32)
 
-        # Adaptive Tri-Tier Thresholds (Normalized to [0.0, 1.0] intensity)
-        tau_low = 0.020    # 2.0% average pixel delta -> Tier 1 (Candidate evaluation only)
-        tau_high = 0.080   # 8.0% average pixel delta -> Tier 2 (Micro 3x3 search) vs Tier 3 (Full bounded)
+        tau_stop = 0.04
+        tau_low = 0.10
 
         for gy, gx in ti.ndrange(grid_h, grid_w):
             px = ti.cast(border_margin + gx * grid_step, ti.f32)
@@ -175,6 +276,16 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
                     cgy = _bm_clamp(gy >> 1, 0, prev_grid_flow.shape[0] - 1)
                     init_dx = ti.cast(ti.round(prev_grid_flow[cgy, cgx, 0] * 2.0), ti.i32)
                     init_dy = ti.cast(ti.round(prev_grid_flow[cgy, cgx, 1] * 2.0), ti.i32)
+                elif gx > 0 or gy > 0:
+                    # MP4 Video Compression Spatial Motion Vector Predictor (MVP: Left, Top, Top-Right)
+                    mv_ax = ti.cast(ti.round(grid_flow[gy, ti.max(0, gx - 1), 0]), ti.i32) if gx > 0 else 0
+                    mv_ay = ti.cast(ti.round(grid_flow[gy, ti.max(0, gx - 1), 1]), ti.i32) if gx > 0 else 0
+                    mv_bx = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), gx, 0]), ti.i32) if gy > 0 else 0
+                    mv_by = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), gx, 1]), ti.i32) if gy > 0 else 0
+                    mv_cx = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), ti.min(grid_w - 1, gx + 1), 0]), ti.i32) if gy > 0 else mv_ax
+                    mv_cy = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), ti.min(grid_w - 1, gx + 1), 1]), ti.i32) if gy > 0 else mv_ay
+                    init_dx = _bm_median3(mv_ax, mv_bx, mv_cx)
+                    init_dy = _bm_median3(mv_ay, mv_by, mv_cy)
 
                 best_cy = init_dy
                 best_cx = init_dx
@@ -184,15 +295,14 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
                 initial_norm_sad = baseline_sad * inv_patch_area
                 best_sad = baseline_sad
 
-                # === ADAPTIVE TRI-TIER SEARCH ===
-                if has_prev_flow == 1 and initial_norm_sad <= tau_low:
-                    # TIER 1: Error Rendah (Tebakan Coarse Sangat Bagus)
-                    # Lewati semua integer search, gunakan langsung tebakan untuk subpixel fit
+                # === MP4-INSPIRED MOTION ESTIMATION SEARCH ===
+                if initial_norm_sad <= tau_stop:
+                    # MP4 Early Termination: Residual below noise floor, motion converged
                     best_cy = init_dy
                     best_cx = init_dx
-                elif has_prev_flow == 1 and initial_norm_sad <= tau_high:
-                    # TIER 2: Error Menengah (Mikro Search 3x3 di sekitar tebakan)
-                    for foy_s, fox_s in ti.static(((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1))):
+                elif initial_norm_sad <= tau_low:
+                    # Refinement: Small Diamond Search
+                    for foy_s, fox_s in ti.static(((-1, 0), (1, 0), (0, -1), (0, 1))):
                         soy = init_dy + foy_s
                         sox = init_dx + fox_s
                         sad = _bm_patch_sad(prev, next, center_y, center_x, soy, sox, h, w, win_radius)
@@ -201,17 +311,17 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
                             best_cy = soy
                             best_cx = sox
                 else:
-                    # TIER 3: Error Tinggi / Base Level (Full Coarse Diamond Search + Fine Refinement)
-                    for coy_s, cox_s in ti.static(((-2, 0), (2, 0), (0, -2), (0, 2))):
-                        soy = init_dy + coy_s
-                        sox = init_dx + cox_s
+                    # MP4 Hexagonal Search Pattern (HEXBS: 6 hexagonal test points)
+                    for hoy_s, hox_s in ti.static(((0, -2), (0, 2), (-2, -1), (-2, 1), (2, -1), (2, 1))):
+                        soy = init_dy + hoy_s
+                        sox = init_dx + hox_s
                         sad = _bm_patch_sad(prev, next, center_y, center_x, soy, sox, h, w, win_radius)
                         if sad < best_sad:
                             best_sad = sad
                             best_cy = soy
                             best_cx = sox
 
-                    # Fine Diamond around best coarse
+                    # Fine Diamond Search around best candidate
                     best_fy_tmp = best_cy
                     best_fx_tmp = best_cx
                     for foy_s, fox_s in ti.static(((-1, 0), (1, 0), (0, -1), (0, 1))):
@@ -256,23 +366,214 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
                 dy = ti.max(-max_flow, ti.min(max_flow, dy))
 
                 residual = sad_center * inv_patch_area
+                motion2 = dx * dx + dy * dy
 
                 grid_flow[gy, gx, 0] = dx
                 grid_flow[gy, gx, 1] = dy
                 grid_flow[gy, gx, 2] = 1.0
 
-                motion2 = dx * dx + dy * dy
                 med_thr = ti.cast(grid_step * grid_step, ti.f32) * 0.04
                 high_thr = ti.cast(grid_step * grid_step, ti.f32) * 0.20
                 cls = 0.0
-                if motion2 > med_thr or residual > 0.05:
+                if motion2 > med_thr or residual > 0.12:
                     cls = 1.0
-                if motion2 > high_thr or residual > 0.12:
+                if motion2 > high_thr or residual > 0.25:
                     cls = 2.0
+
                 grid_meta[gy, gx, 0] = residual
-                grid_meta[gy, gx, 1] = 1.0
+                grid_meta[gy, gx, 1] = initial_norm_sad
                 grid_meta[gy, gx, 2] = cls
                 grid_meta[gy, gx, 3] = motion2
+
+    @ti.func
+    def _bm_grid_track_static_impl(
+        prev: ti.types.ndarray(),
+        next: ti.types.ndarray(),
+        prev_grid_flow: ti.types.ndarray(),
+        grid_flow: ti.types.ndarray(),
+        grid_meta: ti.types.ndarray(),
+        grid_step: ti.i32,
+        border_margin: ti.i32,
+        has_prev_flow: ti.i32,
+        epsilon: ti.f32,
+        win_radius: ti.template(),
+    ):
+        h = prev.shape[0]
+        w = prev.shape[1]
+        grid_h = grid_flow.shape[0]
+        grid_w = grid_flow.shape[1]
+        pts_side = ti.static((win_radius // 2) * 2 + 1)
+        inv_patch_area = 1.0 / ti.cast(pts_side * pts_side * 8, ti.f32)
+        tau_stop = 0.04
+        tau_low = 0.10
+
+        for gy, gx in ti.ndrange(grid_h, grid_w):
+            px = ti.cast(border_margin + gx * grid_step, ti.f32)
+            py = ti.cast(border_margin + gy * grid_step, ti.f32)
+            grid_flow[gy, gx, 0] = 0.0
+            grid_flow[gy, gx, 1] = 0.0
+            grid_flow[gy, gx, 2] = 0.0
+            grid_meta[gy, gx, 0] = 0.0
+            grid_meta[gy, gx, 1] = 0.0
+            grid_meta[gy, gx, 2] = 2.0
+            grid_meta[gy, gx, 3] = 0.0
+
+            if px < ti.cast(w - border_margin, ti.f32) and py < ti.cast(h - border_margin, ti.f32):
+                center_y = border_margin + gy * grid_step
+                center_x = border_margin + gx * grid_step
+                init_dx = 0
+                init_dy = 0
+                if has_prev_flow == 1:
+                    cgx = _bm_clamp(gx >> 1, 0, prev_grid_flow.shape[1] - 1)
+                    cgy = _bm_clamp(gy >> 1, 0, prev_grid_flow.shape[0] - 1)
+                    init_dx = ti.cast(ti.round(prev_grid_flow[cgy, cgx, 0] * 2.0), ti.i32)
+                    init_dy = ti.cast(ti.round(prev_grid_flow[cgy, cgx, 1] * 2.0), ti.i32)
+                elif gx > 0 or gy > 0:
+                    # MP4 Video Compression Spatial Motion Vector Predictor (MVP: Left, Top, Top-Right)
+                    mv_ax = ti.cast(ti.round(grid_flow[gy, ti.max(0, gx - 1), 0]), ti.i32) if gx > 0 else 0
+                    mv_ay = ti.cast(ti.round(grid_flow[gy, ti.max(0, gx - 1), 1]), ti.i32) if gx > 0 else 0
+                    mv_bx = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), gx, 0]), ti.i32) if gy > 0 else 0
+                    mv_by = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), gx, 1]), ti.i32) if gy > 0 else 0
+                    mv_cx = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), ti.min(grid_w - 1, gx + 1), 0]), ti.i32) if gy > 0 else mv_ax
+                    mv_cy = ti.cast(ti.round(grid_flow[ti.max(0, gy - 1), ti.min(grid_w - 1, gx + 1), 1]), ti.i32) if gy > 0 else mv_ay
+                    init_dx = _bm_median3(mv_ax, mv_bx, mv_cx)
+                    init_dy = _bm_median3(mv_ay, mv_by, mv_cy)
+
+                best_cy = init_dy
+                best_cx = init_dx
+                baseline_sad = _bm_patch_sad_static(
+                    prev, next, center_y, center_x, init_dy, init_dx, h, w, win_radius
+                )
+                initial_norm_sad = baseline_sad * inv_patch_area
+                best_sad = baseline_sad
+
+                if initial_norm_sad <= tau_stop:
+                    # MP4 Early Termination
+                    best_cy = init_dy
+                    best_cx = init_dx
+                elif initial_norm_sad <= tau_low:
+                    # Refinement: Small Diamond Search
+                    for foy_s, fox_s in ti.static(((-1, 0), (1, 0), (0, -1), (0, 1))):
+                        soy = init_dy + foy_s
+                        sox = init_dx + fox_s
+                        sad = _bm_patch_sad_static(
+                            prev, next, center_y, center_x, soy, sox, h, w, win_radius
+                        )
+                        if sad < best_sad:
+                            best_sad = sad
+                            best_cy = soy
+                            best_cx = sox
+                else:
+                    # MP4 Hexagonal Search Pattern (HEXBS)
+                    for hoy_s, hox_s in ti.static(((0, -2), (0, 2), (-2, -1), (-2, 1), (2, -1), (2, 1))):
+                        soy = init_dy + hoy_s
+                        sox = init_dx + hox_s
+                        sad = _bm_patch_sad_static(
+                            prev, next, center_y, center_x, soy, sox, h, w, win_radius
+                        )
+                        if sad < best_sad:
+                            best_sad = sad
+                            best_cy = soy
+                            best_cx = sox
+
+                    best_fy_tmp = best_cy
+                    best_fx_tmp = best_cx
+                    for foy_s, fox_s in ti.static(((-1, 0), (1, 0), (0, -1), (0, 1))):
+                        soy = best_cy + foy_s
+                        sox = best_cx + fox_s
+                        sad = _bm_patch_sad_static(
+                            prev, next, center_y, center_x, soy, sox, h, w, win_radius
+                        )
+                        if sad < best_sad:
+                            best_sad = sad
+                            best_fy_tmp = soy
+                            best_fx_tmp = sox
+                    best_cy = best_fy_tmp
+                    best_cx = best_fx_tmp
+
+                stencil = _bm_patch_sad_5point_static(
+                    prev, next, center_y, center_x, best_cy, best_cx, h, w, win_radius
+                )
+                sad_center = stencil[0]
+                sad_left = stencil[1]
+                sad_right = stencil[2]
+                sad_up = stencil[3]
+                sad_down = stencil[4]
+
+                dx_offset = 0.0
+                denom_x = sad_right - 2.0 * sad_center + sad_left
+                if ti.abs(denom_x) > 1e-4:
+                    dx_offset = -0.5 * (sad_right - sad_left) / denom_x
+                    dx_offset = ti.max(-0.5, ti.min(0.5, dx_offset))
+
+                dy_offset = 0.0
+                denom_y = sad_down - 2.0 * sad_center + sad_up
+                if ti.abs(denom_y) > 1e-4:
+                    dy_offset = -0.5 * (sad_down - sad_up) / denom_y
+                    dy_offset = ti.max(-0.5, ti.min(0.5, dy_offset))
+
+                dx = ti.cast(best_cx, ti.f32) + dx_offset
+                dy = ti.cast(best_cy, ti.f32) + dy_offset
+
+                max_flow = ti.cast(grid_step * 2 + win_radius * 2, ti.f32)
+                dx = ti.max(-max_flow, ti.min(max_flow, dx))
+                dy = ti.max(-max_flow, ti.min(max_flow, dy))
+
+                residual = sad_center * inv_patch_area
+                motion2 = dx * dx + dy * dy
+
+                grid_flow[gy, gx, 0] = dx
+                grid_flow[gy, gx, 1] = dy
+                grid_flow[gy, gx, 2] = 1.0
+
+                med_thr = ti.cast(grid_step * grid_step, ti.f32) * 0.04
+                high_thr = ti.cast(grid_step * grid_step, ti.f32) * 0.20
+                cls = 0.0
+                if motion2 > med_thr or residual > 0.12:
+                    cls = 1.0
+                if motion2 > high_thr or residual > 0.25:
+                    cls = 2.0
+
+                grid_meta[gy, gx, 0] = residual
+                grid_meta[gy, gx, 1] = initial_norm_sad
+                grid_meta[gy, gx, 2] = cls
+                grid_meta[gy, gx, 3] = motion2
+
+    @ti.kernel
+    def _bm_grid_track_kernel_r6(
+        prev: ti.types.ndarray(), next: ti.types.ndarray(),
+        prev_grid_flow: ti.types.ndarray(), grid_flow: ti.types.ndarray(),
+        grid_meta: ti.types.ndarray(), grid_step: ti.i32,
+        border_margin: ti.i32, has_prev_flow: ti.i32, epsilon: ti.f32,
+    ):
+        _bm_grid_track_static_impl(
+            prev, next, prev_grid_flow, grid_flow, grid_meta, grid_step,
+            border_margin, has_prev_flow, epsilon, 6,
+        )
+
+    @ti.kernel
+    def _bm_grid_track_kernel_r7(
+        prev: ti.types.ndarray(), next: ti.types.ndarray(),
+        prev_grid_flow: ti.types.ndarray(), grid_flow: ti.types.ndarray(),
+        grid_meta: ti.types.ndarray(), grid_step: ti.i32,
+        border_margin: ti.i32, has_prev_flow: ti.i32, epsilon: ti.f32,
+    ):
+        _bm_grid_track_static_impl(
+            prev, next, prev_grid_flow, grid_flow, grid_meta, grid_step,
+            border_margin, has_prev_flow, epsilon, 7,
+        )
+
+    @ti.kernel
+    def _bm_grid_track_kernel_r8(
+        prev: ti.types.ndarray(), next: ti.types.ndarray(),
+        prev_grid_flow: ti.types.ndarray(), grid_flow: ti.types.ndarray(),
+        grid_meta: ti.types.ndarray(), grid_step: ti.i32,
+        border_margin: ti.i32, has_prev_flow: ti.i32, epsilon: ti.f32,
+    ):
+        _bm_grid_track_static_impl(
+            prev, next, prev_grid_flow, grid_flow, grid_meta, grid_step,
+            border_margin, has_prev_flow, epsilon, 8,
+        )
 
     @ti.kernel
     def _bm_adaptive_refine_kernel(
@@ -292,8 +593,8 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
         grid_h = grid_flow.shape[0]
         grid_w = grid_flow.shape[1]
 
-        pts_side = (win_radius * 2) // 2 + 1
-        inv_patch_area = 1.0 / ti.cast(pts_side * pts_side, ti.f32)
+        pts_side = (win_radius // 2) * 2 + 1
+        inv_patch_area = 1.0 / ti.cast(pts_side * pts_side * 8, ti.f32)
 
         for gy, gx in ti.ndrange(grid_h, grid_w):
             cls = ti.cast(grid_meta[gy, gx, 2], ti.i32)
@@ -384,7 +685,7 @@ if TAICHI_AVAILABLE or os.environ.get("AOT_MODE", "1") == "1":
             gy0 = _bm_clamp(ti.cast(ti.floor(gy_f), ti.i32), 0, grid_h - 1)
             gx1 = _bm_clamp(gx0 + 1, 0, grid_w - 1)
             gy1 = _bm_clamp(gy0 + 1, 0, grid_h - 1)
-
+            
             f00_x = grid_flow[gy0, gx0, 0]
             f00_y = grid_flow[gy0, gx0, 1]
             f01_x = grid_flow[gy0, gx1, 0]

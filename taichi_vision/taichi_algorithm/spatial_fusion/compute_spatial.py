@@ -18,8 +18,11 @@ Graphs packaged by ``compile_spatial_tcm`` (all float32):
     remap_accumulate_average_tile,
     remap_accumulate_spatial_tile,
     remap_accumulate_spatial_vec3_tile,
+    remap_accumulate_cfa_weighted_plane, normalize_accumulator_cfa,
+    accumulate_cfa_homography_weighted_plane,
     mean_division_vec3_weight, fine_analysis_and_accumulate,
-    generate_fine_weights_4passes, postprocess_spatial_weight
+    generate_fine_weights_4passes, generate_spatial_weights_compact_v1,
+    postprocess_spatial_weight
 """
 
 import numpy as np
@@ -58,6 +61,7 @@ else:
         f32 = "float"
         def kernel(self, f): return f
         def func(self, f): return f
+        def template(self): return object
         class Types:
             def ndarray(self, *args, **kwargs): return "ndarray"
         types = Types()
@@ -78,9 +82,12 @@ def precompute_gradients_kernel(
             gx_center = img[y, x + 1] - img[y, x - 1]
             gx_top = img[y - 1, x + 1] - img[y - 1, x - 1]
             gx_bottom = img[y + 1, x + 1] - img[y + 1, x - 1]
-            grad_x[y, x] = (gx_center + gx_top + gx_bottom) * 0.333
+            grad_x[y, x] = (gx_center + gx_top + gx_bottom) * 0.33333333
 
-            grad_y[y, x] = img[y + 1, x] - img[y - 1, x]
+            gy_center = img[y + 1, x] - img[y - 1, x]
+            gy_left = img[y + 1, x - 1] - img[y - 1, x - 1]
+            gy_right = img[y + 1, x + 1] - img[y - 1, x + 1]
+            grad_y[y, x] = (gy_center + gy_left + gy_right) * 0.33333333
         else:
             grad_x[y, x] = 0.0
             grad_y[y, x] = 0.0
@@ -109,14 +116,20 @@ def precompute_gradients_pair_kernel(
             a_gx_center = img_a[y, x + 1] - img_a[y, x - 1]
             a_gx_top = img_a[y - 1, x + 1] - img_a[y - 1, x - 1]
             a_gx_bottom = img_a[y + 1, x + 1] - img_a[y + 1, x - 1]
-            grad_a_x[y, x] = (a_gx_center + a_gx_top + a_gx_bottom) * 0.333
-            grad_a_y[y, x] = img_a[y + 1, x] - img_a[y - 1, x]
+            grad_a_x[y, x] = (a_gx_center + a_gx_top + a_gx_bottom) * 0.33333333
+            a_gy_center = img_a[y + 1, x] - img_a[y - 1, x]
+            a_gy_left = img_a[y + 1, x - 1] - img_a[y - 1, x - 1]
+            a_gy_right = img_a[y + 1, x + 1] - img_a[y - 1, x + 1]
+            grad_a_y[y, x] = (a_gy_center + a_gy_left + a_gy_right) * 0.33333333
 
             b_gx_center = img_b[y, x + 1] - img_b[y, x - 1]
             b_gx_top = img_b[y - 1, x + 1] - img_b[y - 1, x - 1]
             b_gx_bottom = img_b[y + 1, x + 1] - img_b[y + 1, x - 1]
-            grad_b_x[y, x] = (b_gx_center + b_gx_top + b_gx_bottom) * 0.333
-            grad_b_y[y, x] = img_b[y + 1, x] - img_b[y - 1, x]
+            grad_b_x[y, x] = (b_gx_center + b_gx_top + b_gx_bottom) * 0.33333333
+            b_gy_center = img_b[y + 1, x] - img_b[y - 1, x]
+            b_gy_left = img_b[y + 1, x - 1] - img_b[y - 1, x - 1]
+            b_gy_right = img_b[y + 1, x + 1] - img_b[y - 1, x + 1]
+            grad_b_y[y, x] = (b_gy_center + b_gy_left + b_gy_right) * 0.33333333
         else:
             grad_a_x[y, x] = 0.0
             grad_a_y[y, x] = 0.0
@@ -133,6 +146,24 @@ def clear_f32_2d_kernel(
     """Clear a resident f32 plane without a host staging/upload round-trip."""
     for y, x in ti.ndrange(h, w):
         dst[y, x] = 0.0
+
+
+@ti.kernel
+def clear_f32_3d_kernel(
+    dst: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+    c: ti.i32,
+):
+    """Clear a resident multi-channel f32 buffer on the active backend.
+
+    Multi-channel reconstruction accumulators live on the device, and the
+    engine buffer pool may hand back storage that still holds a previous
+    frame's values.  Clearing on the device keeps the initialization from
+    costing a host allocation the size of the accumulator.
+    """
+    for y, x, k in ti.ndrange(h, w, c):
+        dst[y, x, k] = 0.0
 
 
 @ti.kernel
@@ -317,14 +348,387 @@ def phase2_fine_analysis_kernel(
                 final_conf = confidence_fine * guidance_val * stab_val
 
                 if final_conf >= 1e-6:
-                    for y, x in ti.ndrange(curr_h, curr_w):
+                    for y in range(curr_h):
                         wy = 0.5 * (1.0 - ti.cos(two_pi * float(y) * inv_tile_h)) if tile_h > 1 else 1.0
-                        wx = 0.5 * (1.0 - ti.cos(two_pi * float(x) * inv_tile_w)) if tile_w > 1 else 1.0
-                        wy = ti.max(wy, 1e-4)
-                        wx = ti.max(wx, 1e-4)
-                        w_val = wy * wx
+                        wy_conf = ti.max(wy, 1e-4) * final_conf
+                        for x in range(curr_w):
+                            wx = 0.5 * (1.0 - ti.cos(two_pi * float(x) * inv_tile_w)) if tile_w > 1 else 1.0
+                            wx = ti.max(wx, 1e-4)
+                            weight_map_sum[r + y, c + x] += wy_conf * wx
 
-                        weight_map_sum[r + y, c + x] += w_val * final_conf
+
+@ti.func
+def _fine_tile_confidence(
+    current: ti.template(),
+    reference: ti.template(),
+    guidance_map: ti.template(),
+    stability_map: ti.template(),
+    row: ti.i32,
+    col: ti.i32,
+    curr_h: ti.i32,
+    curr_w: ti.i32,
+    h: ti.i32,
+    w: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    noise_sigma: ti.f32,
+    motion_sensitivity: ti.f32,
+    noise_offset_factor: ti.f32,
+    use_stability: ti.i32,
+    use_guidance: ti.i32,
+    early_exit_threshold: ti.f32,
+) -> ti.f32:
+    """Compute one fine-tile confidence without materializing image gradients."""
+    center_x = ti.min(col + curr_w // 2, w - 1)
+    center_y = ti.min(row + curr_h // 2, h - 1)
+
+    guidance_val = 1.0
+    if use_guidance == 1:
+        guidance_val = guidance_map[center_y, center_x]
+    stability_val = 1.0
+    if use_stability == 1:
+        stability_val = stability_map[center_y, center_x]
+
+    final_conf = 0.0
+    if guidance_val >= early_exit_threshold and stability_val >= early_exit_threshold:
+        center_local_y = curr_h // 2
+        center_local_x = curr_w // 2
+        v0 = reference[row + center_local_y, col + center_local_x]
+        v1 = reference[row, col]
+        v2 = reference[row, col + curr_w - 1]
+        v3 = reference[row + curr_h - 1, col]
+        v4 = reference[row + curr_h - 1, col + curr_w - 1]
+
+        ref_min = ti.min(v0, ti.min(v1, ti.min(v2, ti.min(v3, v4))))
+        ref_max = ti.max(v0, ti.max(v1, ti.max(v2, ti.max(v3, v4))))
+        contrast = ref_max - ref_min
+        mean_luma = (v0 + v1 + v2 + v3 + v4) * 0.2
+        contrast_limit = 0.12 * ti.max(0.05, mean_luma)
+        contrast_range = 0.08 * ti.max(0.05, mean_luma)
+        flat_weight = ti.max(
+            0.0, ti.min(1.0, (contrast_limit - contrast) / contrast_range)
+        )
+
+        mad_score = calculate_hybrid_gradient_optimized(
+            current,
+            reference,
+            current,
+            current,
+            reference,
+            reference,
+            row,
+            col,
+            curr_h,
+            curr_w,
+            h,
+            w,
+            noise_sigma,
+            1.0,
+            1e-6,
+            flat_weight,
+        )
+        confidence = calculate_match_confidence(
+            mad_score, noise_sigma, motion_sensitivity, noise_offset_factor
+        )
+        final_conf = confidence * guidance_val * stability_val
+        if final_conf < 1e-6:
+            final_conf = 0.0
+    return final_conf
+
+
+@ti.kernel
+def compute_fine_tile_confidence_kernel(
+    current: ti.types.ndarray(),
+    reference: ti.types.ndarray(),
+    guidance_map: ti.types.ndarray(),
+    stability_map: ti.types.ndarray(),
+    tile_confidence: ti.types.ndarray(),
+    row_starts: ti.types.ndarray(),
+    col_starts: ti.types.ndarray(),
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    h: ti.i32,
+    w: ti.i32,
+    noise_sigma: ti.f32,
+    motion_sensitivity: ti.f32,
+    noise_offset_factor: ti.f32,
+    use_stability: ti.i32,
+    use_guidance: ti.i32,
+    early_exit_threshold: ti.f32,
+):
+    """Evaluate each fine tile once; output is only tile-grid sized."""
+    for tile_row, tile_col in ti.ndrange(tile_confidence.shape[0], tile_confidence.shape[1]):
+        row = row_starts[tile_row]
+        col = col_starts[tile_col]
+        curr_h = ti.min(tile_h, h - row)
+        curr_w = ti.min(tile_w, w - col)
+        value = 0.0
+        if curr_h > 0 and curr_w > 0:
+            value = _fine_tile_confidence(
+                current,
+                reference,
+                guidance_map,
+                stability_map,
+                row,
+                col,
+                curr_h,
+                curr_w,
+                h,
+                w,
+                tile_h,
+                tile_w,
+                noise_sigma,
+                motion_sensitivity,
+                noise_offset_factor,
+                use_stability,
+                use_guidance,
+                early_exit_threshold,
+            )
+        tile_confidence[tile_row, tile_col] = value
+
+
+@ti.kernel
+def compose_spatial_weights_regular_tiles_kernel(
+    tile_confidence: ti.types.ndarray(),
+    row_starts: ti.types.ndarray(),
+    col_starts: ti.types.ndarray(),
+    weight_map: ti.types.ndarray(),
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    stride_h: ti.i32,
+    stride_w: ti.i32,
+    h: ti.i32,
+    w: ti.i32,
+    exponent: ti.f32,
+    cutoff: ti.f32,
+):
+    """Gather overlapping regular tiles per pixel and apply ghost shaping.
+
+    Every destination pixel has one writer. This replaces four color passes
+    with scattered overlapping stores while preserving the sum of Hann-window
+    contributions (up to floating-point summation order).
+    """
+    inv_tile_h = 1.0 / float(tile_h - 1) if tile_h > 1 else 0.0
+    inv_tile_w = 1.0 / float(tile_w - 1) if tile_w > 1 else 0.0
+    two_pi = 2.0 * 3.1415926535
+    num_tile_rows = row_starts.shape[0]
+    num_tile_cols = col_starts.shape[0]
+
+    for y, x in ti.ndrange(h, w):
+        min_row_start = ti.max(0, y - tile_h + 1)
+        first_row = (min_row_start + stride_h - 1) // stride_h
+        last_row = ti.min(num_tile_rows - 1, y // stride_h)
+        min_col_start = ti.max(0, x - tile_w + 1)
+        first_col = (min_col_start + stride_w - 1) // stride_w
+        last_col = ti.min(num_tile_cols - 1, x // stride_w)
+
+        value = 0.0
+        for tile_row in range(first_row, last_row + 1):
+            row = row_starts[tile_row]
+            local_y = y - row
+            if 0 <= local_y < ti.min(tile_h, h - row):
+                wy = (
+                    0.5 * (1.0 - ti.cos(two_pi * float(local_y) * inv_tile_h))
+                    if tile_h > 1
+                    else 1.0
+                )
+                wy = ti.max(wy, 1e-4)
+                for tile_col in range(first_col, last_col + 1):
+                    col = col_starts[tile_col]
+                    local_x = x - col
+                    if 0 <= local_x < ti.min(tile_w, w - col):
+                        wx = (
+                            0.5 * (1.0 - ti.cos(two_pi * float(local_x) * inv_tile_w))
+                            if tile_w > 1
+                            else 1.0
+                        )
+                        wx = ti.max(wx, 1e-4)
+                        value += (
+                            wy
+                            * wx
+                            * tile_confidence[tile_row, tile_col]
+                        )
+
+        if exponent != 1.0:
+            value = ti.pow(ti.max(value, 0.0), exponent)
+        if cutoff > 0.0:
+            denom = ti.max(1.0e-5, 1.0 - cutoff)
+            value = (value - cutoff) / denom
+            value = ti.max(0.0, ti.min(1.0, value))
+        weight_map[y, x] = value
+
+
+@ti.kernel
+def phase2_fine_reliability_kernel(
+    current: ti.types.ndarray(),
+    reference: ti.types.ndarray(),
+    curr_grad_x: ti.types.ndarray(),
+    curr_grad_y: ti.types.ndarray(),
+    ref_grad_x: ti.types.ndarray(),
+    ref_grad_y: ti.types.ndarray(),
+    guidance_map: ti.types.ndarray(),
+    stability_map: ti.types.ndarray(),
+    reliability_num: ti.types.ndarray(),
+    reliability_den: ti.types.ndarray(),
+    base_window: ti.i32,  # Deprecated but kept for signature compatibility
+    row_starts: ti.types.ndarray(),
+    col_starts: ti.types.ndarray(),
+    pass_idx: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    h: ti.i32,
+    w: ti.i32,
+    noise_sigma: ti.f32,
+    motion_sensitivity: ti.f32,
+    noise_offset_factor: ti.f32,
+    use_stability: ti.i32,
+    use_guidance: ti.i32,
+    early_exit_threshold: ti.f32
+):
+    """Per-pixel reliability used as reconstruction guidance.
+
+    The window/MAD/guidance math is identical to
+    :func:`phase2_fine_analysis_kernel`.  Only the write differs: the window
+    confidence is accumulated together with the window weight in a *separate*
+    denominator plane so the caller can divide the two.
+
+    That division yields a window-average reliability in ``[0, 1]`` whose scale
+    does not depend on the tile overlap configuration, which is what the
+    reconstruction path needs.  The denoising path keeps the unnormalized
+    :func:`phase2_fine_analysis_kernel` because its final mean division already
+    divides by the same accumulated weight.
+    """
+    pass_row_mod = pass_idx // 2
+    pass_col_mod = pass_idx & 1
+
+    inv_tile_h = 1.0 / float(tile_h - 1) if tile_h > 1 else 0.0
+    inv_tile_w = 1.0 / float(tile_w - 1) if tile_w > 1 else 0.0
+    two_pi = 2.0 * 3.1415926535
+
+    num_rows = row_starts.shape[0]
+    num_cols = col_starts.shape[0]
+
+    limit_rows = (num_rows - pass_row_mod + 1) // 2
+    limit_cols = (num_cols - pass_col_mod + 1) // 2
+    for k, m in ti.ndrange(limit_rows, limit_cols):
+        i = pass_row_mod + k * 2
+        j = pass_col_mod + m * 2
+        r = row_starts[i]
+        c = col_starts[j]
+        curr_h = ti.min(tile_h, h - r)
+        curr_w = ti.min(tile_w, w - c)
+        if curr_h > 0 and curr_w > 0:
+            center_x = ti.min(c + curr_w // 2, w - 1)
+            center_y = ti.min(r + curr_h // 2, h - 1)
+
+            guidance_val = 1.0
+            if use_guidance == 1:
+                guidance_val = guidance_map[center_y, center_x]
+
+            stab_val = 1.0
+            if use_stability == 1:
+                stab_val = stability_map[center_y, center_x]
+
+            if guidance_val >= early_exit_threshold and stab_val >= early_exit_threshold:
+                c_y = curr_h // 2
+                c_x = curr_w // 2
+                v0 = reference[r + c_y, c + c_x]
+                v1 = reference[r, c]
+                v2 = reference[r, c + curr_w - 1]
+                v3 = reference[r + curr_h - 1, c]
+                v4 = reference[r + curr_h - 1, c + curr_w - 1]
+
+                ref_min = ti.min(v0, ti.min(v1, ti.min(v2, ti.min(v3, v4))))
+                ref_max = ti.max(v0, ti.max(v1, ti.max(v2, ti.max(v3, v4))))
+                contrast = ref_max - ref_min
+
+                mean_luma = (v0 + v1 + v2 + v3 + v4) * 0.2
+                contrast_limit = 0.12 * ti.max(0.05, mean_luma)
+                contrast_range = 0.08 * ti.max(0.05, mean_luma)
+                flat_weight = ti.max(0.0, ti.min(1.0, (contrast_limit - contrast) / contrast_range))
+
+                mad_score = calculate_hybrid_gradient_optimized(
+                    current, reference,
+                    curr_grad_x, curr_grad_y,
+                    ref_grad_x, ref_grad_y,
+                    r, c, curr_h, curr_w, h, w,
+                    noise_sigma, 1.0, 1e-6, flat_weight
+                )
+
+                confidence_fine = calculate_match_confidence(
+                    mad_score, noise_sigma, motion_sensitivity, noise_offset_factor
+                )
+
+                final_conf = confidence_fine * guidance_val * stab_val
+
+                if final_conf >= 1e-6:
+                    for y in range(curr_h):
+                        wy = 0.5 * (1.0 - ti.cos(two_pi * float(y) * inv_tile_h)) if tile_h > 1 else 1.0
+                        wy_clamped = ti.max(wy, 1e-4)
+                        wy_conf = wy_clamped * final_conf
+                        for x in range(curr_w):
+                            wx = 0.5 * (1.0 - ti.cos(two_pi * float(x) * inv_tile_w)) if tile_w > 1 else 1.0
+                            wx_clamped = ti.max(wx, 1e-4)
+                            reliability_num[r + y, c + x] += wy_conf * wx_clamped
+                            reliability_den[r + y, c + x] += wy_clamped * wx_clamped
+
+
+@ti.kernel
+def normalize_reliability_kernel(
+    reliability_num: ti.types.ndarray(),
+    reliability_den: ti.types.ndarray(),
+    dst: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+):
+    """Divide the accumulated reliability planes into a per-sample confidence.
+
+    A zero denominator means every covering analysis window was rejected as a
+    mismatch, so the sample is reported as unreliable.  The four-pass tiling
+    covers the whole frame, therefore "no denominator" cannot mean "no window
+    looked at this pixel" — it means the evidence was rejected.  Attempting to
+    treat it as full confidence would invert the rejection exactly where
+    ghosting happens.
+    """
+    for i, j in ti.ndrange(h, w):
+        den = reliability_den[i, j]
+        if den > 1e-8:
+            dst[i, j] = ti.max(0.0, ti.min(1.0, reliability_num[i, j] / den))
+        else:
+            dst[i, j] = 0.0
+
+
+@ti.kernel
+def accumulate_tile_hann_kernel(
+    result_tile: ti.types.ndarray(),
+    coverage_tile: ti.types.ndarray(),
+    hann_tile: ti.types.ndarray(),
+    acc_num: ti.types.ndarray(),
+    acc_den: ti.types.ndarray(),
+    channel: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+):
+    """Blend one reconstructed HR plane into the global Hann accumulators.
+
+    ``result_tile`` arrives already normalized by its own splat coverage, so
+    weighting it by ``hann * coverage`` and dividing by the accumulated weight
+    produces a weighted average of the overlapping windows.  The splat graph
+    emits one scalar plane per dispatch, hence one ``channel`` per call.
+
+    ``acc_den`` is updated only for ``channel == 0`` because the accumulated
+    weight is shared by every channel; counting it per channel would scale the
+    divisor by the channel count.  Every ``(i, j)`` is written exactly once per
+    dispatch, so no atomic is required.
+    """
+    for i, j in ti.ndrange(tile_h, tile_w):
+        w_val = hann_tile[i, j] * coverage_tile[i, j]
+        if w_val > 0.0:
+            if channel == 0:
+                acc_den[i + offset_y, j + offset_x] += w_val
+            acc_num[i + offset_y, j + offset_x, channel] += result_tile[i, j] * w_val
 
 
 @ti.kernel
@@ -535,6 +939,129 @@ def accumulate_average_kernel(
 
 
 @ti.kernel
+def accumulate_average_sum_region_kernel(
+    current_image_full: ti.types.ndarray(),
+    final_image_sum: ti.types.ndarray(),
+    h_full: ti.i32,
+    w_full: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+    finalize: ti.i32,
+    denominator: ti.f32,
+):
+    """Accumulate one disjoint region without a redundant uniform weight map."""
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h_full and gj < w_full:
+            for c in ti.static(range(3)):
+                value = final_image_sum[gi, gj, c] + current_image_full[gi, gj, c]
+                if finalize != 0:
+                    value /= ti.max(denominator, 1e-8)
+                final_image_sum[gi, gj, c] = value
+
+
+@ti.kernel
+def accumulate_spatial_merging_region_kernel(
+    current_image_full: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_image_sum: ti.types.ndarray(),
+    weight_map_sum_full: ti.types.ndarray(),
+    h_full: ti.i32,
+    w_full: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+    finalize: ti.i32,
+):
+    """Accumulate a region from a resident full frame using global coordinates."""
+    y_scale = float(h_work) / float(h_full)
+    x_scale = float(w_work) / float(w_full)
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h_full and gj < w_full:
+            y_work_f = float(gi) * y_scale
+            x_work_f = float(gj) * x_scale
+            y0 = ti.max(0, ti.cast(ti.floor(y_work_f), ti.i32))
+            x0 = ti.max(0, ti.cast(ti.floor(x_work_f), ti.i32))
+            y1 = ti.min(y0 + 1, h_work - 1)
+            x1 = ti.min(x0 + 1, w_work - 1)
+            wy = y_work_f - float(y0)
+            wx = x_work_f - float(x0)
+            weight = (
+                (1.0 - wy) * (1.0 - wx) * weight_map_work[y0, x0]
+                + (1.0 - wy) * wx * weight_map_work[y0, x1]
+                + wy * (1.0 - wx) * weight_map_work[y1, x0]
+                + wy * wx * weight_map_work[y1, x1]
+            )
+            total_weight = weight_map_sum_full[gi, gj] + weight
+            weight_map_sum_full[gi, gj] = total_weight
+            for c in ti.static(range(3)):
+                value = (
+                    final_image_sum[gi, gj, c]
+                    + current_image_full[gi, gj, c] * weight
+                )
+                if finalize != 0:
+                    value /= ti.max(total_weight, 1e-6)
+                final_image_sum[gi, gj, c] = value
+
+
+@ti.kernel
+def accumulate_spatial_merging_vec3_region_kernel(
+    current_image_full: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_image_sum: ti.types.ndarray(),
+    weight_map_sum_full: ti.types.ndarray(),
+    h_full: ti.i32,
+    w_full: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+    finalize: ti.i32,
+):
+    """Per-channel weight variant of region-based resident accumulation."""
+    y_scale = float(h_work) / float(h_full)
+    x_scale = float(w_work) / float(w_full)
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h_full and gj < w_full:
+            y_work_f = float(gi) * y_scale
+            x_work_f = float(gj) * x_scale
+            y0 = ti.max(0, ti.cast(ti.floor(y_work_f), ti.i32))
+            x0 = ti.max(0, ti.cast(ti.floor(x_work_f), ti.i32))
+            y1 = ti.min(y0 + 1, h_work - 1)
+            x1 = ti.min(x0 + 1, w_work - 1)
+            wy = y_work_f - float(y0)
+            wx = x_work_f - float(x0)
+            for c in ti.static(range(3)):
+                weight = (
+                    (1.0 - wy) * (1.0 - wx) * weight_map_work[y0, x0, c]
+                    + (1.0 - wy) * wx * weight_map_work[y0, x1, c]
+                    + wy * (1.0 - wx) * weight_map_work[y1, x0, c]
+                    + wy * wx * weight_map_work[y1, x1, c]
+                )
+                total_weight = weight_map_sum_full[gi, gj, c] + weight
+                value = (
+                    final_image_sum[gi, gj, c]
+                    + current_image_full[gi, gj, c] * weight
+                )
+                if finalize != 0:
+                    value /= ti.max(total_weight, 1e-8)
+                weight_map_sum_full[gi, gj, c] = total_weight
+                final_image_sum[gi, gj, c] = value
+
+
+@ti.kernel
 def accumulate_average_offset_kernel(
     current_image_tile: ti.types.ndarray(),
     final_image_sum: ti.types.ndarray(),
@@ -594,6 +1121,48 @@ def remap_accumulate_average_tile_kernel(
                     source_full, src_x, src_y, h_src, w_src, channel
                 )
                 weight_map_sum_full[gr, gc, channel] += 1.0
+
+
+@ti.kernel
+def remap_accumulate_average_sum_tile_kernel(
+    source_full: ti.types.ndarray(),
+    flow_work: ti.types.ndarray(),
+    final_image_sum: ti.types.ndarray(),
+    h_src: ti.i32,
+    w_src: ti.i32,
+    h_dst: ti.i32,
+    w_dst: ti.i32,
+    h_flow: ti.i32,
+    w_flow: ti.i32,
+    scale_x: ti.f32,
+    scale_y: ti.f32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+    finalize: ti.i32,
+    denominator: ti.f32,
+):
+    """Remap and accumulate an average tile without storing uniform weights."""
+    flow_x_scale = float(w_flow - 1) / float(w_dst - 1)
+    flow_y_scale = float(h_flow - 1) / float(h_dst - 1)
+    for r, c in ti.ndrange(tile_h, tile_w):
+        gr = r + offset_y
+        gc = c + offset_x
+        if gr < h_dst and gc < w_dst:
+            fx = float(gc) * flow_x_scale
+            fy = float(gr) * flow_y_scale
+            dx = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 0)
+            dy = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 1)
+            src_x = float(gc) + dx * scale_x
+            src_y = float(gr) + dy * scale_y
+            for channel in ti.static(range(3)):
+                value = final_image_sum[gr, gc, channel] + bilinear_at_3ch(
+                    source_full, src_x, src_y, h_src, w_src, channel
+                )
+                if finalize != 0:
+                    value /= ti.max(denominator, 1e-8)
+                final_image_sum[gr, gc, channel] = value
 
 
 @ti.kernel
@@ -721,6 +1290,307 @@ def remap_accumulate_spatial_vec3_tile_kernel(
 
 
 @ti.kernel
+def remap_accumulate_cfa_weighted_plane_kernel(
+    source_plane: ti.types.ndarray(),
+    flow_work: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_cfa_sum: ti.types.ndarray(),
+    final_cfa_weight: ti.types.ndarray(),
+    h_dst: ti.i32,
+    w_dst: ti.i32,
+    h_flow: ti.i32,
+    w_flow: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    h_plane: ti.i32,
+    w_plane: ti.i32,
+    plane_origin_y: ti.i32,
+    plane_origin_x: ti.i32,
+    cfa_channel: ti.i32,
+    scale_x: ti.f32,
+    scale_y: ti.f32,
+):
+    """Warp and accumulate one Bayer plane without leaving the active backend.
+
+    ``source_plane`` contains one colour lattice, not a full mosaiced image.
+    Interpolation is therefore always between samples of the same CFA colour.
+    Flow is sampled in the RGB-analysis domain and converted from full-sensor
+    pixels into this half-resolution lattice before the source lookup.
+    """
+    flow_x_scale = float(w_flow - 1) / float(w_dst - 1)
+    flow_y_scale = float(h_flow - 1) / float(h_dst - 1)
+    weight_x_scale = float(w_work) / float(w_dst)
+    weight_y_scale = float(h_work) / float(h_dst)
+    for r, c in ti.ndrange(h_plane, w_plane):
+        gr = r * 2 + plane_origin_y
+        gc = c * 2 + plane_origin_x
+        if gr < h_dst and gc < w_dst:
+            fx = float(gc) * flow_x_scale
+            fy = float(gr) * flow_y_scale
+            dx = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 0)
+            dy = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 1)
+            src_x = float(c) + dx * scale_x * 0.5
+            src_y = float(r) + dy * scale_y * 0.5
+
+            # Source validity is calculated in this graph, replacing the
+            # historical remapped all-ones mask and its host readback.
+            if 0.0 <= src_x <= float(w_plane - 1) and 0.0 <= src_y <= float(h_plane - 1):
+                sx0 = ti.cast(ti.floor(src_x), ti.i32)
+                sy0 = ti.cast(ti.floor(src_y), ti.i32)
+                sx1 = ti.min(sx0 + 1, w_plane - 1)
+                sy1 = ti.min(sy0 + 1, h_plane - 1)
+                tx = src_x - float(sx0)
+                ty = src_y - float(sy0)
+                value = (
+                    (1.0 - ty) * (1.0 - tx) * source_plane[sy0, sx0]
+                    + (1.0 - ty) * tx * source_plane[sy0, sx1]
+                    + ty * (1.0 - tx) * source_plane[sy1, sx0]
+                    + ty * tx * source_plane[sy1, sx1]
+                )
+
+                wx = float(gc) * weight_x_scale
+                wy = float(gr) * weight_y_scale
+                wx0 = ti.max(0, ti.cast(ti.floor(wx), ti.i32))
+                wy0 = ti.max(0, ti.cast(ti.floor(wy), ti.i32))
+                wx1 = ti.min(wx0 + 1, w_work - 1)
+                wy1 = ti.min(wy0 + 1, h_work - 1)
+                txw = wx - float(wx0)
+                tyw = wy - float(wy0)
+                weight = (
+                    (1.0 - tyw) * (1.0 - txw) * weight_map_work[wy0, wx0, cfa_channel]
+                    + (1.0 - tyw) * txw * weight_map_work[wy0, wx1, cfa_channel]
+                    + tyw * (1.0 - txw) * weight_map_work[wy1, wx0, cfa_channel]
+                    + tyw * txw * weight_map_work[wy1, wx1, cfa_channel]
+                )
+                weight = ti.max(0.0, ti.min(1.0, weight))
+                final_cfa_sum[gr, gc] += value * weight
+                final_cfa_weight[gr, gc] += weight
+
+
+@ti.kernel
+def remap_accumulate_cfa_scalar_weighted_plane_kernel(
+    source_plane: ti.types.ndarray(),
+    flow_work: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_cfa_sum: ti.types.ndarray(),
+    final_cfa_weight: ti.types.ndarray(),
+    h_dst: ti.i32,
+    w_dst: ti.i32,
+    h_flow: ti.i32,
+    w_flow: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    h_plane: ti.i32,
+    w_plane: ti.i32,
+    plane_origin_y: ti.i32,
+    plane_origin_x: ti.i32,
+    scale_x: ti.f32,
+    scale_y: ti.f32,
+):
+    """Scalar SpatialFusion weight variant for one Bayer lattice."""
+    flow_x_scale = float(w_flow - 1) / float(w_dst - 1)
+    flow_y_scale = float(h_flow - 1) / float(h_dst - 1)
+    weight_x_scale = float(w_work) / float(w_dst)
+    weight_y_scale = float(h_work) / float(h_dst)
+    for r, c in ti.ndrange(h_plane, w_plane):
+        gr = r * 2 + plane_origin_y
+        gc = c * 2 + plane_origin_x
+        if gr < h_dst and gc < w_dst:
+            fx = float(gc) * flow_x_scale
+            fy = float(gr) * flow_y_scale
+            dx = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 0)
+            dy = bilinear_at_3ch(flow_work, fx, fy, h_flow, w_flow, 1)
+            src_x = float(c) + dx * scale_x * 0.5
+            src_y = float(r) + dy * scale_y * 0.5
+            if 0.0 <= src_x <= float(w_plane - 1) and 0.0 <= src_y <= float(h_plane - 1):
+                sx0 = ti.cast(ti.floor(src_x), ti.i32)
+                sy0 = ti.cast(ti.floor(src_y), ti.i32)
+                sx1 = ti.min(sx0 + 1, w_plane - 1)
+                sy1 = ti.min(sy0 + 1, h_plane - 1)
+                tx = src_x - float(sx0)
+                ty = src_y - float(sy0)
+                value = (
+                    (1.0 - ty) * (1.0 - tx) * source_plane[sy0, sx0]
+                    + (1.0 - ty) * tx * source_plane[sy0, sx1]
+                    + ty * (1.0 - tx) * source_plane[sy1, sx0]
+                    + ty * tx * source_plane[sy1, sx1]
+                )
+                wx = float(gc) * weight_x_scale
+                wy = float(gr) * weight_y_scale
+                wx0 = ti.max(0, ti.cast(ti.floor(wx), ti.i32))
+                wy0 = ti.max(0, ti.cast(ti.floor(wy), ti.i32))
+                wx1 = ti.min(wx0 + 1, w_work - 1)
+                wy1 = ti.min(wy0 + 1, h_work - 1)
+                txw = wx - float(wx0)
+                tyw = wy - float(wy0)
+                weight = (
+                    (1.0 - tyw) * (1.0 - txw) * weight_map_work[wy0, wx0]
+                    + (1.0 - tyw) * txw * weight_map_work[wy0, wx1]
+                    + tyw * (1.0 - txw) * weight_map_work[wy1, wx0]
+                    + tyw * txw * weight_map_work[wy1, wx1]
+                )
+                weight = ti.max(0.0, ti.min(1.0, weight))
+                final_cfa_sum[gr, gc] += value * weight
+                # Keep the CFA denominator identical to the RGB scalar
+                # weighted-accumulation contract.  Omitting this term turns
+                # weighted averaging into an unnormalised weighted sum on
+                # dense-flow/no-alignment RAW paths.
+                final_cfa_weight[gr, gc] += weight
+
+
+@ti.kernel
+def accumulate_cfa_homography_weighted_plane_kernel(
+    source_plane: ti.types.ndarray(),
+    m_inv: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_cfa_sum: ti.types.ndarray(),
+    final_cfa_weight: ti.types.ndarray(),
+    h_dst: ti.i32,
+    w_dst: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    h_plane: ti.i32,
+    w_plane: ti.i32,
+    plane_origin_y: ti.i32,
+    plane_origin_x: ti.i32,
+    cfa_channel: ti.i32,
+):
+    """Gather a Bayer plane directly through a full-resolution homography.
+
+    ``m_inv`` maps reference-sensor coordinates back into the support sensor
+    (the same inverse used by ``warp_perspective``).  The destination loop is
+    over the reference CFA lattice, while the source lookup is converted to
+    the support plane's half-resolution lattice without mixing colour phases.
+    This is intentionally a separate graph from the historical
+    ``warp_perspective(plane) + zero-flow`` route so both implementations can
+    be compared on identical transforms.
+    """
+    weight_x_scale = float(w_work) / float(w_dst)
+    weight_y_scale = float(h_work) / float(h_dst)
+    for r, c in ti.ndrange(h_plane, w_plane):
+        gr = r * 2 + plane_origin_y
+        gc = c * 2 + plane_origin_x
+        if gr < h_dst and gc < w_dst:
+            u = m_inv[0, 0] * float(gc) + m_inv[0, 1] * float(gr) + m_inv[0, 2]
+            v = m_inv[1, 0] * float(gc) + m_inv[1, 1] * float(gr) + m_inv[1, 2]
+            z = m_inv[2, 0] * float(gc) + m_inv[2, 1] * float(gr) + m_inv[2, 2]
+            if ti.abs(z) > 1.0e-8:
+                sx_sensor = u / z
+                sy_sensor = v / z
+                src_x = (sx_sensor - float(plane_origin_x)) * 0.5
+                src_y = (sy_sensor - float(plane_origin_y)) * 0.5
+                if (
+                    0.0 <= src_x <= float(w_plane - 1)
+                    and 0.0 <= src_y <= float(h_plane - 1)
+                ):
+                    sx0 = ti.cast(ti.floor(src_x), ti.i32)
+                    sy0 = ti.cast(ti.floor(src_y), ti.i32)
+                    sx1 = ti.min(sx0 + 1, w_plane - 1)
+                    sy1 = ti.min(sy0 + 1, h_plane - 1)
+                    tx = src_x - float(sx0)
+                    ty = src_y - float(sy0)
+                    value = (
+                        (1.0 - ty) * (1.0 - tx) * source_plane[sy0, sx0]
+                        + (1.0 - ty) * tx * source_plane[sy0, sx1]
+                        + ty * (1.0 - tx) * source_plane[sy1, sx0]
+                        + ty * tx * source_plane[sy1, sx1]
+                    )
+                    wx = float(gc) * weight_x_scale
+                    wy = float(gr) * weight_y_scale
+                    wx0 = ti.max(0, ti.cast(ti.floor(wx), ti.i32))
+                    wy0 = ti.max(0, ti.cast(ti.floor(wy), ti.i32))
+                    wx1 = ti.min(wx0 + 1, w_work - 1)
+                    wy1 = ti.min(wy0 + 1, h_work - 1)
+                    txw = wx - float(wx0)
+                    tyw = wy - float(wy0)
+                    weight = (
+                        (1.0 - tyw) * (1.0 - txw) * weight_map_work[wy0, wx0, cfa_channel]
+                        + (1.0 - tyw) * txw * weight_map_work[wy0, wx1, cfa_channel]
+                        + tyw * (1.0 - txw) * weight_map_work[wy1, wx0, cfa_channel]
+                        + tyw * txw * weight_map_work[wy1, wx1, cfa_channel]
+                    )
+                    weight = ti.max(0.0, ti.min(1.0, weight))
+                    final_cfa_sum[gr, gc] += value * weight
+                    final_cfa_weight[gr, gc] += weight
+
+
+@ti.kernel
+def accumulate_cfa_homography_scalar_weighted_plane_kernel(
+    source_plane: ti.types.ndarray(),
+    m_inv: ti.types.ndarray(),
+    weight_map_work: ti.types.ndarray(),
+    final_cfa_sum: ti.types.ndarray(),
+    final_cfa_weight: ti.types.ndarray(),
+    h_dst: ti.i32,
+    w_dst: ti.i32,
+    h_work: ti.i32,
+    w_work: ti.i32,
+    h_plane: ti.i32,
+    w_plane: ti.i32,
+    plane_origin_y: ti.i32,
+    plane_origin_x: ti.i32,
+):
+    """Scalar-weight variant of ``accumulate_cfa_homography...``."""
+    weight_x_scale = float(w_work) / float(w_dst)
+    weight_y_scale = float(h_work) / float(h_dst)
+    for r, c in ti.ndrange(h_plane, w_plane):
+        gr = r * 2 + plane_origin_y
+        gc = c * 2 + plane_origin_x
+        if gr < h_dst and gc < w_dst:
+            u = m_inv[0, 0] * float(gc) + m_inv[0, 1] * float(gr) + m_inv[0, 2]
+            v = m_inv[1, 0] * float(gc) + m_inv[1, 1] * float(gr) + m_inv[1, 2]
+            z = m_inv[2, 0] * float(gc) + m_inv[2, 1] * float(gr) + m_inv[2, 2]
+            if ti.abs(z) > 1.0e-8:
+                src_x = (u / z - float(plane_origin_x)) * 0.5
+                src_y = (v / z - float(plane_origin_y)) * 0.5
+                if (
+                    0.0 <= src_x <= float(w_plane - 1)
+                    and 0.0 <= src_y <= float(h_plane - 1)
+                ):
+                    sx0 = ti.cast(ti.floor(src_x), ti.i32)
+                    sy0 = ti.cast(ti.floor(src_y), ti.i32)
+                    sx1 = ti.min(sx0 + 1, w_plane - 1)
+                    sy1 = ti.min(sy0 + 1, h_plane - 1)
+                    tx = src_x - float(sx0)
+                    ty = src_y - float(sy0)
+                    value = (
+                        (1.0 - ty) * (1.0 - tx) * source_plane[sy0, sx0]
+                        + (1.0 - ty) * tx * source_plane[sy0, sx1]
+                        + ty * (1.0 - tx) * source_plane[sy1, sx0]
+                        + ty * tx * source_plane[sy1, sx1]
+                    )
+                    wx = float(gc) * weight_x_scale
+                    wy = float(gr) * weight_y_scale
+                    wx0 = ti.max(0, ti.cast(ti.floor(wx), ti.i32))
+                    wy0 = ti.max(0, ti.cast(ti.floor(wy), ti.i32))
+                    wx1 = ti.min(wx0 + 1, w_work - 1)
+                    wy1 = ti.min(wy0 + 1, h_work - 1)
+                    txw = wx - float(wx0)
+                    tyw = wy - float(wy0)
+                    weight = (
+                        (1.0 - tyw) * (1.0 - txw) * weight_map_work[wy0, wx0]
+                        + (1.0 - tyw) * txw * weight_map_work[wy0, wx1]
+                        + tyw * (1.0 - txw) * weight_map_work[wy1, wx0]
+                        + tyw * txw * weight_map_work[wy1, wx1]
+                    )
+                    weight = ti.max(0.0, ti.min(1.0, weight))
+                    final_cfa_sum[gr, gc] += value * weight
+                    final_cfa_weight[gr, gc] += weight
+
+
+@ti.kernel
+def normalize_accumulator_cfa_kernel(
+    cfa_sum: ti.types.ndarray(),
+    cfa_weight: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+):
+    """Normalize a scalar CFA accumulator in place on the active backend."""
+    for y, x in ti.ndrange(h, w):
+        cfa_sum[y, x] /= ti.max(cfa_weight[y, x], 1.0e-6)
+
+
+@ti.kernel
 def mean_division_vec3_weight_kernel(
     sum_img: ti.types.ndarray(),
     sum_weight: ti.types.ndarray(),
@@ -738,6 +1608,94 @@ def mean_division_vec3_weight_kernel(
                 dst[i, j, c] = sum_img[i, j, c] / w_sum
             else:
                 dst[i, j, c] = ref_img[i, j, c]
+
+
+@ti.kernel
+def mean_division_vec3_scalar_weight_kernel(
+    sum_img: ti.types.ndarray(),
+    sum_weight: ti.types.ndarray(),
+    ref_img: ti.types.ndarray(),
+    dst: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+):
+    """Normalize RGB sums using one scalar weight per pixel.
+
+    SpatialFusion produces a luma-only 2D weight map.  Keeping that map
+    scalar avoids the historical device->host->device broadcast to HWC3;
+    the arithmetic is identical because the same denominator is used for
+    every channel.
+    """
+    for i, j in ti.ndrange(h, w):
+        w_sum = sum_weight[i, j]
+        for c in ti.static(range(3)):
+            if w_sum > 1e-8:
+                dst[i, j, c] = sum_img[i, j, c] / w_sum
+            else:
+                dst[i, j, c] = ref_img[i, j, c]
+
+
+@ti.kernel
+def normalize_accumulator_scalar_region_kernel(
+    sum_img: ti.types.ndarray(),
+    sum_weight: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+):
+    """Normalize an RGB accumulator in place from one scalar weight region."""
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h and gj < w:
+            weight = ti.max(sum_weight[gi, gj], 1e-6)
+            for c in ti.static(range(3)):
+                sum_img[gi, gj, c] /= weight
+
+
+@ti.kernel
+def normalize_accumulator_vec3_region_kernel(
+    sum_img: ti.types.ndarray(),
+    sum_weight: ti.types.ndarray(),
+    h: ti.i32,
+    w: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+):
+    """Normalize an RGB accumulator in place from per-channel weights."""
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h and gj < w:
+            for c in ti.static(range(3)):
+                weight = ti.max(sum_weight[gi, gj, c], 1e-8)
+                sum_img[gi, gj, c] /= weight
+
+
+@ti.kernel
+def normalize_accumulator_uniform_region_kernel(
+    sum_img: ti.types.ndarray(),
+    denominator: ti.f32,
+    h: ti.i32,
+    w: ti.i32,
+    tile_h: ti.i32,
+    tile_w: ti.i32,
+    offset_y: ti.i32,
+    offset_x: ti.i32,
+):
+    """Normalize an average accumulator in place from its scalar frame count."""
+    inverse = 1.0 / ti.max(denominator, 1e-8)
+    for i, j in ti.ndrange(tile_h, tile_w):
+        gi = i + offset_y
+        gj = j + offset_x
+        if gi < h and gj < w:
+            for c in ti.static(range(3)):
+                sum_img[gi, gj, c] *= inverse
 
 
 @ti.kernel
@@ -806,6 +1764,25 @@ def _compile_graphs(module):
     g_clear = ti.graph.GraphBuilder()
     g_clear.dispatch(clear_f32_2d_kernel, sym_clear_dst, sym_clear_h, sym_clear_w)
     module.add_graph("clear_f32_2d", g_clear.compile())
+    # Marker graph lets wrappers distinguish TCMs whose fine analysis computes
+    # gradients inline from older binaries that require materialized planes.
+    g_streaming_marker = ti.graph.GraphBuilder()
+    g_streaming_marker.dispatch(
+        clear_f32_2d_kernel, sym_clear_dst, sym_clear_h, sym_clear_w
+    )
+    module.add_graph("spatial_streaming_gradient_v1", g_streaming_marker.compile())
+
+    sym_clear3_dst = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "dst", dtype=ti.f32, ndim=3
+    )
+    sym_clear3_h = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "h", dtype=ti.i32)
+    sym_clear3_w = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "w", dtype=ti.i32)
+    sym_clear3_c = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "c", dtype=ti.i32)
+    g_clear3 = ti.graph.GraphBuilder()
+    g_clear3.dispatch(
+        clear_f32_3d_kernel, sym_clear3_dst, sym_clear3_h, sym_clear3_w, sym_clear3_c
+    )
+    module.add_graph("clear_f32_3d", g_clear3.compile())
 
     # Gradient symbols for reuse
     sym_curr_grad_x = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "curr_grad_x", dtype=ti.f32, ndim=2)
@@ -930,6 +1907,54 @@ def _compile_graphs(module):
     )
     module.add_graph("accumulate_spatial_merging_vec3", g_accum_v3.compile())
 
+    # Full-frame sources can be consumed in disjoint output regions.  Unlike
+    # the local-tile graphs below, these variants do not allocate or upload an
+    # intermediate source tile.
+    sym_region_tile_h = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "tile_h", dtype=ti.i32
+    )
+    sym_region_tile_w = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "tile_w", dtype=ti.i32
+    )
+    sym_region_offset_y = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "offset_y", dtype=ti.i32
+    )
+    sym_region_offset_x = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "offset_x", dtype=ti.i32
+    )
+    sym_region_finalize = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "finalize", dtype=ti.i32
+    )
+    sym_region_denominator = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "denominator", dtype=ti.f32
+    )
+
+    g_accum_region = ti.graph.GraphBuilder()
+    g_accum_region.dispatch(
+        accumulate_spatial_merging_region_kernel,
+        sym_curr_img_full, sym_weight_work,
+        sym_final_img_sum, sym_weight_sum_full,
+        sym_h_full, sym_w_full, sym_h_work, sym_w_work,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+        sym_region_finalize,
+    )
+    module.add_graph("accumulate_spatial_merging_region", g_accum_region.compile())
+
+    g_accum_region_v3 = ti.graph.GraphBuilder()
+    g_accum_region_v3.dispatch(
+        accumulate_spatial_merging_vec3_region_kernel,
+        sym_curr_img_full_v3, sym_weight_work_v3,
+        sym_final_img_sum_v3, sym_weight_sum_full_v3,
+        sym_h_full_v3, sym_w_full_v3, sym_h_work_v3, sym_w_work_v3,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+        sym_region_finalize,
+    )
+    module.add_graph(
+        "accumulate_spatial_merging_vec3_region", g_accum_region_v3.compile()
+    )
+
     # 4c. Output-tile accumulation graphs. The current image is a local tile;
     # the weight and accumulation maps remain global. These graphs are used by
     # the resident pipeline to avoid materializing an aligned full-resolution
@@ -998,6 +2023,17 @@ def _compile_graphs(module):
     )
     module.add_graph("accumulate_average", g_average.compile())
 
+    g_average_sum_region = ti.graph.GraphBuilder()
+    g_average_sum_region.dispatch(
+        accumulate_average_sum_region_kernel,
+        sym_curr_img_full_v3, sym_final_img_sum_v3,
+        sym_h_full_v3, sym_w_full_v3,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+        sym_region_finalize, sym_region_denominator,
+    )
+    module.add_graph("accumulate_average_sum_region", g_average_sum_region.compile())
+
     g_average_offset = ti.graph.GraphBuilder()
     g_average_offset.dispatch(
         accumulate_average_offset_kernel,
@@ -1061,6 +2097,31 @@ def _compile_graphs(module):
     )
     module.add_graph("remap_accumulate_average_tile", g_fused_average.compile())
 
+    g_fused_average_sum = ti.graph.GraphBuilder()
+    g_fused_average_sum.dispatch(
+        remap_accumulate_average_sum_tile_kernel,
+        sym_fused_source,
+        sym_fused_flow,
+        sym_fused_sum,
+        sym_fused_h_src,
+        sym_fused_w_src,
+        sym_fused_h_dst,
+        sym_fused_w_dst,
+        sym_fused_h_flow,
+        sym_fused_w_flow,
+        sym_fused_scale_x,
+        sym_fused_scale_y,
+        sym_fused_tile_h,
+        sym_fused_tile_w,
+        sym_fused_offset_y,
+        sym_fused_offset_x,
+        sym_region_finalize,
+        sym_region_denominator,
+    )
+    module.add_graph(
+        "remap_accumulate_average_sum_tile", g_fused_average_sum.compile()
+    )
+
     sym_fused_weight_2d = ti.graph.Arg(
         ti.graph.ArgKind.NDARRAY, "weight_map_work", dtype=ti.f32, ndim=2
     )
@@ -1121,6 +2182,161 @@ def _compile_graphs(module):
         "remap_accumulate_spatial_vec3_tile", g_fused_spatial_vec3.compile()
     )
 
+    # CFA FusionNet path.  Four dispatches (one per Bayer lattice) replace
+    # the old per-tile remap/download/NumPy accumulation loop.  The source,
+    # sums and denominator remain scalar 2D buffers, while flow and WeightNet
+    # confidence remain work-resolution vector fields.
+    sym_cfa_source_plane = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "source_plane", dtype=ti.f32, ndim=2
+    )
+    sym_cfa_sum = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "final_cfa_sum", dtype=ti.f32, ndim=2
+    )
+    sym_cfa_weight_sum = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "final_cfa_weight", dtype=ti.f32, ndim=2
+    )
+    sym_cfa_h_plane = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "h_plane", dtype=ti.i32
+    )
+    sym_cfa_w_plane = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "w_plane", dtype=ti.i32
+    )
+    sym_cfa_origin_y = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "plane_origin_y", dtype=ti.i32
+    )
+    sym_cfa_origin_x = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "plane_origin_x", dtype=ti.i32
+    )
+    sym_cfa_channel = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "cfa_channel", dtype=ti.i32
+    )
+    g_fused_cfa = ti.graph.GraphBuilder()
+    g_fused_cfa.dispatch(
+        remap_accumulate_cfa_weighted_plane_kernel,
+        sym_cfa_source_plane,
+        sym_fused_flow,
+        sym_fused_weight_3d,
+        sym_cfa_sum,
+        sym_cfa_weight_sum,
+        sym_fused_h_dst,
+        sym_fused_w_dst,
+        sym_fused_h_flow,
+        sym_fused_w_flow,
+        sym_fused_h_work,
+        sym_fused_w_work,
+        sym_cfa_h_plane,
+        sym_cfa_w_plane,
+        sym_cfa_origin_y,
+        sym_cfa_origin_x,
+        sym_cfa_channel,
+        sym_fused_scale_x,
+        sym_fused_scale_y,
+    )
+    module.add_graph("remap_accumulate_cfa_weighted_plane", g_fused_cfa.compile())
+
+    g_fused_cfa_scalar = ti.graph.GraphBuilder()
+    g_fused_cfa_scalar.dispatch(
+        remap_accumulate_cfa_scalar_weighted_plane_kernel,
+        sym_cfa_source_plane,
+        sym_fused_flow,
+        sym_fused_weight_2d,
+        sym_cfa_sum,
+        sym_cfa_weight_sum,
+        sym_fused_h_dst,
+        sym_fused_w_dst,
+        sym_fused_h_flow,
+        sym_fused_w_flow,
+        sym_fused_h_work,
+        sym_fused_w_work,
+        sym_cfa_h_plane,
+        sym_cfa_w_plane,
+        sym_cfa_origin_y,
+        sym_cfa_origin_x,
+        sym_fused_scale_x,
+        sym_fused_scale_y,
+    )
+    module.add_graph(
+        "remap_accumulate_cfa_scalar_weighted_plane",
+        g_fused_cfa_scalar.compile(),
+    )
+
+    # Experimental direct homography gather.  This keeps the legacy
+    # plane-warp graph intact while allowing RAW parity experiments to apply
+    # the same full-resolution inverse transform directly at each CFA site.
+    sym_cfa_m_inv = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "m_inv", dtype=ti.f32, ndim=2
+    )
+    g_direct_cfa = ti.graph.GraphBuilder()
+    g_direct_cfa.dispatch(
+        accumulate_cfa_homography_weighted_plane_kernel,
+        sym_cfa_source_plane,
+        sym_cfa_m_inv,
+        sym_fused_weight_3d,
+        sym_cfa_sum,
+        sym_cfa_weight_sum,
+        sym_fused_h_dst,
+        sym_fused_w_dst,
+        sym_fused_h_work,
+        sym_fused_w_work,
+        sym_cfa_h_plane,
+        sym_cfa_w_plane,
+        sym_cfa_origin_y,
+        sym_cfa_origin_x,
+        sym_cfa_channel,
+    )
+    module.add_graph(
+        "accumulate_cfa_homography_weighted_plane",
+        g_direct_cfa.compile(),
+    )
+
+    g_direct_cfa_scalar = ti.graph.GraphBuilder()
+    g_direct_cfa_scalar.dispatch(
+        accumulate_cfa_homography_scalar_weighted_plane_kernel,
+        sym_cfa_source_plane,
+        sym_cfa_m_inv,
+        sym_fused_weight_2d,
+        sym_cfa_sum,
+        sym_cfa_weight_sum,
+        sym_fused_h_dst,
+        sym_fused_w_dst,
+        sym_fused_h_work,
+        sym_fused_w_work,
+        sym_cfa_h_plane,
+        sym_cfa_w_plane,
+        sym_cfa_origin_y,
+        sym_cfa_origin_x,
+    )
+    module.add_graph(
+        "accumulate_cfa_homography_scalar_weighted_plane",
+        g_direct_cfa_scalar.compile(),
+    )
+
+    # Normalization has its own runtime argument names.  Do not reuse the
+    # fused-accumulation symbols above: AOT binds arguments by name, so using
+    # ``final_cfa_sum`` here would make ``normalize_accumulator_cfa`` require
+    # a value that its public wrapper never supplies.
+    sym_norm_cfa_sum = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "cfa_sum", dtype=ti.f32, ndim=2
+    )
+    sym_norm_cfa_weight = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "cfa_weight", dtype=ti.f32, ndim=2
+    )
+    sym_norm_cfa_h = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "h", dtype=ti.i32
+    )
+    sym_norm_cfa_w = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "w", dtype=ti.i32
+    )
+    g_norm_cfa = ti.graph.GraphBuilder()
+    g_norm_cfa.dispatch(
+        normalize_accumulator_cfa_kernel,
+        sym_norm_cfa_sum,
+        sym_norm_cfa_weight,
+        sym_norm_cfa_h,
+        sym_norm_cfa_w,
+    )
+    module.add_graph("normalize_accumulator_cfa", g_norm_cfa.compile())
+
     # 4e. Mean Division Vec3 Weight Graph (per-channel normalization)
     sym_sum_img_md = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "sum_img", dtype=ti.f32, ndim=3)
     sym_sum_weight_md = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "sum_weight", dtype=ti.f32, ndim=3)
@@ -1136,6 +2352,75 @@ def _compile_graphs(module):
         sym_h_md, sym_w_md,
     )
     module.add_graph("mean_division_vec3_weight", g_md_v3.compile())
+
+    sym_sum_weight_md_scalar = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "sum_weight", dtype=ti.f32, ndim=2
+    )
+    g_md_scalar = ti.graph.GraphBuilder()
+    g_md_scalar.dispatch(
+        mean_division_vec3_scalar_weight_kernel,
+        sym_sum_img_md,
+        sym_sum_weight_md_scalar,
+        sym_ref_img_md,
+        sym_dst_md,
+        sym_h_md,
+        sym_w_md,
+    )
+    module.add_graph(
+        "mean_division_vec3_scalar_weight", g_md_scalar.compile()
+    )
+
+    # In-place block normalization.  The resident pipeline seeds every lane
+    # with reference weight 1, so no separate full-resolution reference/output
+    # buffer is required during this terminal pass.
+    sym_norm_sum = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "sum_img", dtype=ti.f32, ndim=3
+    )
+    sym_norm_weight_2d = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "sum_weight", dtype=ti.f32, ndim=2
+    )
+    sym_norm_weight_3d = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "sum_weight", dtype=ti.f32, ndim=3
+    )
+    sym_norm_denominator = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "denominator", dtype=ti.f32
+    )
+
+    g_norm_scalar_region = ti.graph.GraphBuilder()
+    g_norm_scalar_region.dispatch(
+        normalize_accumulator_scalar_region_kernel,
+        sym_norm_sum, sym_norm_weight_2d,
+        sym_h_md, sym_w_md,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+    )
+    module.add_graph(
+        "normalize_accumulator_scalar_region", g_norm_scalar_region.compile()
+    )
+
+    g_norm_vec3_region = ti.graph.GraphBuilder()
+    g_norm_vec3_region.dispatch(
+        normalize_accumulator_vec3_region_kernel,
+        sym_norm_sum, sym_norm_weight_3d,
+        sym_h_md, sym_w_md,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+    )
+    module.add_graph(
+        "normalize_accumulator_vec3_region", g_norm_vec3_region.compile()
+    )
+
+    g_norm_uniform_region = ti.graph.GraphBuilder()
+    g_norm_uniform_region.dispatch(
+        normalize_accumulator_uniform_region_kernel,
+        sym_norm_sum, sym_norm_denominator,
+        sym_h_md, sym_w_md,
+        sym_region_tile_h, sym_region_tile_w,
+        sym_region_offset_y, sym_region_offset_x,
+    )
+    module.add_graph(
+        "normalize_accumulator_uniform_region", g_norm_uniform_region.compile()
+    )
 
     # 4f. Spatial weight postprocess (ghost penalty + cutoff)
     sym_weight_src_pp = ti.graph.Arg(
@@ -1297,6 +2582,166 @@ def _compile_graphs(module):
         sym_use_stability, sym_use_guidance, sym_early_exit_threshold,
     )
     module.add_graph("generate_fine_weights_4passes", g_4passes.compile())
+
+    # Compact fine analysis: compute one confidence per tile, then gather all
+    # overlapping tile contributions with a single writer per output pixel.
+    # The composition dispatch also applies the ghost transform, so the runtime
+    # can skip both the full-frame clear and the separate postprocess pass.
+    sym_compact_guidance = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "guidance_map", dtype=ti.f32, ndim=2
+    )
+    sym_compact_stability = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "stability_map", dtype=ti.f32, ndim=2
+    )
+    sym_tile_confidence = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "tile_confidence", dtype=ti.f32, ndim=2
+    )
+    sym_compact_weight = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "weight_map", dtype=ti.f32, ndim=2
+    )
+    sym_compact_rows = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "row_starts", dtype=ti.i32, ndim=1
+    )
+    sym_compact_cols = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "col_starts", dtype=ti.i32, ndim=1
+    )
+    sym_compact_tile_h = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "tile_h", dtype=ti.i32
+    )
+    sym_compact_tile_w = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "tile_w", dtype=ti.i32
+    )
+    sym_compact_stride_h = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "stride_h", dtype=ti.i32
+    )
+    sym_compact_stride_w = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "stride_w", dtype=ti.i32
+    )
+    sym_compact_exponent = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "exponent", dtype=ti.f32
+    )
+    sym_compact_cutoff = ti.graph.Arg(
+        ti.graph.ArgKind.SCALAR, "cutoff", dtype=ti.f32
+    )
+    g_compact = ti.graph.GraphBuilder()
+    g_compact.dispatch(
+        compute_fine_tile_confidence_kernel,
+        sym_current,
+        sym_reference,
+        sym_compact_guidance,
+        sym_stability_map,
+        sym_tile_confidence,
+        sym_row_starts,
+        sym_col_starts,
+        sym_tile_h,
+        sym_tile_w,
+        sym_h_fine,
+        sym_w_fine,
+        sym_noise_sigma,
+        sym_motion_sens,
+        sym_noise_offset,
+        sym_use_stability,
+        sym_use_guidance,
+        sym_early_exit_threshold,
+    )
+    g_compact.dispatch(
+        compose_spatial_weights_regular_tiles_kernel,
+        sym_tile_confidence,
+        sym_compact_rows,
+        sym_compact_cols,
+        sym_compact_weight,
+        sym_compact_tile_h,
+        sym_compact_tile_w,
+        sym_compact_stride_h,
+        sym_compact_stride_w,
+        sym_h_fine,
+        sym_w_fine,
+        sym_compact_exponent,
+        sym_compact_cutoff,
+    )
+    module.add_graph("generate_spatial_weights_compact_v1", g_compact.compile())
+
+    # 5c. Per-sample reliability (reconstruction guidance).
+    # Same four fine-analysis passes, but the window confidence and the window
+    # weight are accumulated in separate planes so the caller can divide them.
+    # The denoising graph above is intentionally left untouched.
+    sym_reliability_num = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "reliability_num", dtype=ti.f32, ndim=2
+    )
+    sym_reliability_den = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "reliability_den", dtype=ti.f32, ndim=2
+    )
+
+    g_reliability = ti.graph.GraphBuilder()
+    for _pass_sym in (sym_pass_idx_0, sym_pass_idx_1, sym_pass_idx_2, sym_pass_idx_3):
+        g_reliability.dispatch(
+            phase2_fine_reliability_kernel,
+            sym_current, sym_reference,
+            sym_curr_grad_x, sym_curr_grad_y,
+            sym_ref_grad_x, sym_ref_grad_y,
+            sym_guidance_map, sym_stability_map,
+            sym_reliability_num, sym_reliability_den,
+            sym_base_window,
+            sym_row_starts, sym_col_starts,
+            _pass_sym,
+            sym_tile_h, sym_tile_w, sym_h_fine, sym_w_fine,
+            sym_noise_sigma, sym_motion_sens, sym_noise_offset,
+            sym_use_stability, sym_use_guidance, sym_early_exit_threshold,
+        )
+    module.add_graph("generate_reliability_weights_4passes", g_reliability.compile())
+
+    sym_reliability_dst = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "dst", dtype=ti.f32, ndim=2
+    )
+    sym_reliability_h = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "h", dtype=ti.i32)
+    sym_reliability_w = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "w", dtype=ti.i32)
+
+    g_normalize_reliability = ti.graph.GraphBuilder()
+    g_normalize_reliability.dispatch(
+        normalize_reliability_kernel,
+        sym_reliability_num, sym_reliability_den,
+        sym_reliability_dst,
+        sym_reliability_h, sym_reliability_w,
+    )
+    module.add_graph("normalize_reliability", g_normalize_reliability.compile())
+
+    # 5d. Hann-weighted HR tile blend for splat reconstruction.
+    sym_hann_result_tile = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "result_tile", dtype=ti.f32, ndim=2
+    )
+    sym_hann_coverage_tile = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "coverage_tile", dtype=ti.f32, ndim=2
+    )
+    sym_hann_window = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "hann_tile", dtype=ti.f32, ndim=2
+    )
+    sym_hann_acc_num = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "acc_num", dtype=ti.f32, ndim=3
+    )
+    sym_hann_acc_den = ti.graph.Arg(
+        ti.graph.ArgKind.NDARRAY, "acc_den", dtype=ti.f32, ndim=2
+    )
+    sym_hann_tile_h = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "tile_h", dtype=ti.i32)
+    sym_hann_tile_w = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "tile_w", dtype=ti.i32)
+    sym_hann_channel = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "channel", dtype=ti.i32)
+    sym_hann_offset_y = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "offset_y", dtype=ti.i32)
+    sym_hann_offset_x = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "offset_x", dtype=ti.i32)
+
+    g_tile_hann = ti.graph.GraphBuilder()
+    g_tile_hann.dispatch(
+        accumulate_tile_hann_kernel,
+        sym_hann_result_tile,
+        sym_hann_coverage_tile,
+        sym_hann_window,
+        sym_hann_acc_num,
+        sym_hann_acc_den,
+        sym_hann_channel,
+        sym_hann_tile_h,
+        sym_hann_tile_w,
+        sym_hann_offset_y,
+        sym_hann_offset_x,
+    )
+    module.add_graph("accumulate_tile_hann", g_tile_hann.compile())
 
 
 def _find_app_assets_dir():
@@ -1683,7 +3128,8 @@ def generate_spatial_weights_taichi(
             estimate_noise,
         )
 
-        noise_sigma = float(estimate_noise(reference_image))
+        noise_score, _ = estimate_noise(reference_image)
+        noise_sigma = float(noise_score)
     else:
         noise_sigma = float(np.clip(noise_sigma, 1e-5, 0.99999))
 
@@ -1754,11 +3200,7 @@ def generate_spatial_weights_taichi(
         round(coarse_texture_radius, 6),
         single_pass_coarse,
     )
-    reference_cache_names = (
-        ["ref_l2_direct"]
-        if single_pass_coarse
-        else ["ref_l1", "ref_l2"]
-    )
+    reference_cache_names = ["ref_l1"]
     if coarse_texture_boost > 1e-6:
         reference_cache_names.append("ref_texture_boost")
     reuse_reference = (
@@ -1809,65 +3251,30 @@ def generate_spatial_weights_taichi(
         hotspots["2. Brightness Equalization"] = (time.perf_counter() - t_prev) * 1000
         t_prev = time.perf_counter()
 
-    # 4. Phase 1: Coarse Analysis for Guidance Map (Level 2: 1/4 Resolution)
-    # The established path downsamples in two steps (L0 -> L1 -> L2) to
-    # prevent aliasing.  A single L0 -> L2 path is available only as an
-    # explicit experiment because resize kernels can differ at edges.
+    # 4. Phase 1: Coarse Analysis for Guidance Map (Level 1: 1/2 Resolution)
+    # Direct single-step downscale (L0 -> L1) to 1/2 resolution
     curr_l0 = analysis_input
-    curr_l1 = None
-    if single_pass_coarse:
-        curr_l2 = taichi_aot.resize(
-            curr_l0,
-            (w // 4, h // 4),
-            interpolation=taichi_aot.INTER_LINEAR,
-            return_gpu=True,
-            dst=_alloc("curr_l2_direct", (h // 4, w // 4)),
-        )
+    curr_l1 = engine.allocate((h // 2, w // 2), dtype=np.float32)
+    taichi_aot.resize(
+        curr_l0,
+        (w // 2, h // 2),
+        interpolation=taichi_aot.INTER_LINEAR,
+        return_gpu=True,
+        dst=curr_l1,
+    )
+
+    if reuse_reference:
+        ref_l1 = scratch._slots["ref_l1"]
     else:
-        curr_l1 = taichi_aot.resize(
-            curr_l0,
+        ref_l0 = analysis_reference
+        ref_l1 = _alloc("ref_l1", (h // 2, w // 2))
+        taichi_aot.resize(
+            ref_l0,
             (w // 2, h // 2),
             interpolation=taichi_aot.INTER_LINEAR,
             return_gpu=True,
-            dst=_alloc("curr_l1", (h // 2, w // 2)),
+            dst=ref_l1,
         )
-        curr_l2 = taichi_aot.resize(
-            curr_l1,
-            (w // 4, h // 4),
-            interpolation=taichi_aot.INTER_LINEAR,
-            return_gpu=True,
-            dst=_alloc("curr_l2", (h // 4, w // 4)),
-        )
-
-    if reuse_reference:
-        ref_l1 = None
-        ref_l2 = scratch._slots[reference_cache_names[0]]
-    else:
-        ref_l0 = analysis_reference
-        if single_pass_coarse:
-            ref_l1 = None
-            ref_l2 = taichi_aot.resize(
-                ref_l0,
-                (w // 4, h // 4),
-                interpolation=taichi_aot.INTER_LINEAR,
-                return_gpu=True,
-                dst=_alloc("ref_l2_direct", (h // 4, w // 4)),
-            )
-        else:
-            ref_l1 = taichi_aot.resize(
-                ref_l0,
-                (w // 2, h // 2),
-                interpolation=taichi_aot.INTER_LINEAR,
-                return_gpu=True,
-                dst=_alloc("ref_l1", (h // 2, w // 2)),
-            )
-            ref_l2 = taichi_aot.resize(
-                ref_l1,
-                (w // 4, h // 4),
-                interpolation=taichi_aot.INTER_LINEAR,
-                return_gpu=True,
-                dst=_alloc("ref_l2", (h // 4, w // 4)),
-            )
 
     if profile_hotspots:
         engine.sync()
@@ -1882,17 +3289,21 @@ def generate_spatial_weights_taichi(
     ref_coarse_grad_y = None
 
     try:
-        # Run coarse analysis ONLY at the coarsest level (Level 2) to match C++
-        curr_level = curr_l2
-        ref_level = ref_l2
+        # Run coarse analysis at Level 1 (1/2 Resolution)
+        curr_level = curr_l1
+        ref_level = ref_l1
 
         h_level, w_level = curr_level.shape[0], curr_level.shape[1]
 
-        # Allocate coarse gradients
-        curr_coarse_grad_x = _alloc("curr_coarse_grad_x", (h_level, w_level))
-        curr_coarse_grad_y = _alloc("curr_coarse_grad_y", (h_level, w_level))
-        ref_coarse_grad_x = _alloc("ref_coarse_grad_x", (h_level, w_level))
-        ref_coarse_grad_y = _alloc("ref_coarse_grad_y", (h_level, w_level))
+        # Allocate coarse gradients as transient buffers to avoid retaining resident VRAM
+        curr_coarse_grad_x = engine.allocate((h_level, w_level), dtype=np.float32)
+        curr_coarse_grad_y = engine.allocate((h_level, w_level), dtype=np.float32)
+        if reuse_reference and "ref_coarse_grad_x" in scratch._slots and "ref_coarse_grad_y" in scratch._slots:
+            ref_coarse_grad_x = scratch._slots["ref_coarse_grad_x"]
+            ref_coarse_grad_y = scratch._slots["ref_coarse_grad_y"]
+        else:
+            ref_coarse_grad_x = _alloc("ref_coarse_grad_x", (h_level, w_level))
+            ref_coarse_grad_y = _alloc("ref_coarse_grad_y", (h_level, w_level))
 
         # Run precompute_gradients on coarse level
         if not reuse_reference:
@@ -1950,7 +3361,7 @@ def generate_spatial_weights_taichi(
         num_tiles_h = max(1, h_level // level_tile_h)
         num_tiles_w = max(1, w_level // level_tile_w)
 
-        level_conf_gpu = _alloc("level_conf", (num_tiles_h, num_tiles_w))
+        level_conf_gpu = engine.allocate((num_tiles_h, num_tiles_w), dtype=np.float32)
 
         mod.run(
             "phase1_coarse_analysis",
@@ -1975,25 +3386,14 @@ def generate_spatial_weights_taichi(
             hotspots["3c. Phase 1 Coarse Analysis Kernel"] = (time.perf_counter() - t_prev) * 1000
             t_prev = time.perf_counter()
 
-        # Upsample coarse tile grid to Level 2 resolution
+        # Direct upsample from Level 1 coarse tile grid to full resolution (1-step bicubic)
         guidance_gpu = taichi_aot.resize(
             level_conf_gpu,
-            (w_level, h_level),
+            (w, h),
             interpolation=taichi_aot.INTER_CUBIC,
             return_gpu=True,
-            dst=_alloc("guidance_level", (h_level, w_level)),
+            dst=_alloc("guidance_full", (h, w)),
         )
-
-        # Final upsample from Level 2 resolution to full resolution
-        if guidance_gpu is not None and (
-            guidance_gpu.shape[0] != h or guidance_gpu.shape[1] != w
-        ):
-            final_guidance = taichi_aot.resize(
-                guidance_gpu, (w, h), interpolation=taichi_aot.INTER_CUBIC, return_gpu=True,
-                dst=_alloc("guidance_full", (h, w)),
-            )
-            _destroy(guidance_gpu)
-            guidance_gpu = final_guidance
 
         if profile_hotspots:
             engine.sync()
@@ -2001,21 +3401,17 @@ def generate_spatial_weights_taichi(
             t_prev = time.perf_counter()
 
     finally:
-        # Cleanup pyramids and temp buffers
-        _destroy(curr_l1)
-        _destroy(curr_l2)
-        _destroy(ref_l1)
-        _destroy(ref_l2)
+        # Cleanup transient pyramids and coarse gradient buffers eagerly to reclaim VRAM before Phase 2
+        if curr_l1 is not None:
+            curr_l1.destroy()
         if curr_coarse_grad_x is not None:
-            _destroy(curr_coarse_grad_x)
+            curr_coarse_grad_x.destroy()
         if curr_coarse_grad_y is not None:
-            _destroy(curr_coarse_grad_y)
-        if ref_coarse_grad_x is not None:
-            _destroy(ref_coarse_grad_x)
-        if ref_coarse_grad_y is not None:
-            _destroy(ref_coarse_grad_y)
+            curr_coarse_grad_y.destroy()
         if level_conf_gpu is not None:
-            _destroy(level_conf_gpu)
+            level_conf_gpu.destroy()
+        if scratch is None and ref_l1 is not None:
+            ref_l1.destroy()
 
         if profile_hotspots:
             engine.sync()
@@ -2090,35 +3486,104 @@ def generate_spatial_weights_taichi(
         # Extract early_exit_threshold from kwargs
         early_exit_threshold = float(kwargs.get("early_exit_threshold", 0.05))
 
-        mod.run(
-            "generate_fine_weights_4passes",
-            current=analysis_input,
-            reference=analysis_reference,
-            curr_grad_x=curr_grad_x,
-            curr_grad_y=curr_grad_y,
-            ref_grad_x=ref_grad_x,
-            ref_grad_y=ref_grad_y,
-            guidance_map=guidance_gpu,
-            stability_map=stability_map,
-            weight_map_sum=weight_map_sum,
-            base_window=0,
-            row_starts=row_starts,
-            col_starts=col_starts,
-            pass_idx_0=0,
-            pass_idx_1=1,
-            pass_idx_2=2,
-            pass_idx_3=3,
-            tile_h=int(tile_h),
-            tile_w=int(tile_w),
-            h=int(h),
-            w=int(w),
-            noise_sigma=float(noise_sigma),
-            motion_sensitivity=float(motion_sensitivity),
-            noise_offset_factor=float(noise_offset_factor),
-            use_stability=int(use_stability),
-            use_guidance=1,
-            early_exit_threshold=early_exit_threshold,
-        )
+        # ``reliability_mode`` selects the reconstruction-guidance output: the
+        # window confidence and the window weight are accumulated in separate
+        # planes and then divided, giving a normalized per-sample reliability in
+        # [0, 1] that no longer depends on the tile overlap configuration.
+        if kwargs.get("reliability_mode", False):
+            reliability_num = _alloc("reliability_num", (h, w), dtype=np.float32)
+            reliability_den = _alloc("reliability_den", (h, w), dtype=np.float32)
+            try:
+                if _tcm_graph_available(tcm_path, "clear_f32_2d"):
+                    for plane in (reliability_num, reliability_den):
+                        mod.run(
+                            "clear_f32_2d",
+                            dst=plane,
+                            h=int(h),
+                            w=int(w),
+                        )
+                else:
+                    from taichi_vision.taichi_aot.engine import _LIB, _RUNTIME
+
+                    for plane in (reliability_num, reliability_den):
+                        zeros = np.zeros(plane.shape, dtype=np.float32)
+                        _LIB.write_to_gpu_buffer(
+                            _RUNTIME,
+                            plane.handle,
+                            zeros.ctypes.data,
+                            plane.size_bytes,
+                        )
+                mod.run(
+                    "generate_reliability_weights_4passes",
+                    current=analysis_input,
+                    reference=analysis_reference,
+                    curr_grad_x=curr_grad_x,
+                    curr_grad_y=curr_grad_y,
+                    ref_grad_x=ref_grad_x,
+                    ref_grad_y=ref_grad_y,
+                    guidance_map=guidance_gpu,
+                    stability_map=stability_map,
+                    reliability_num=reliability_num,
+                    reliability_den=reliability_den,
+                    base_window=0,
+                    row_starts=row_starts,
+                    col_starts=col_starts,
+                    pass_idx_0=0,
+                    pass_idx_1=1,
+                    pass_idx_2=2,
+                    pass_idx_3=3,
+                    tile_h=int(tile_h),
+                    tile_w=int(tile_w),
+                    h=int(h),
+                    w=int(w),
+                    noise_sigma=float(noise_sigma),
+                    motion_sensitivity=float(motion_sensitivity),
+                    noise_offset_factor=float(noise_offset_factor),
+                    use_stability=int(use_stability),
+                    use_guidance=1,
+                    early_exit_threshold=early_exit_threshold,
+                )
+                mod.run(
+                    "normalize_reliability",
+                    reliability_num=reliability_num,
+                    reliability_den=reliability_den,
+                    dst=weight_map_sum,
+                    h=int(h),
+                    w=int(w),
+                )
+            finally:
+                _destroy(reliability_num)
+                _destroy(reliability_den)
+        else:
+            mod.run(
+                "generate_fine_weights_4passes",
+                current=analysis_input,
+                reference=analysis_reference,
+                curr_grad_x=curr_grad_x,
+                curr_grad_y=curr_grad_y,
+                ref_grad_x=ref_grad_x,
+                ref_grad_y=ref_grad_y,
+                guidance_map=guidance_gpu,
+                stability_map=stability_map,
+                weight_map_sum=weight_map_sum,
+                base_window=0,
+                row_starts=row_starts,
+                col_starts=col_starts,
+                pass_idx_0=0,
+                pass_idx_1=1,
+                pass_idx_2=2,
+                pass_idx_3=3,
+                tile_h=int(tile_h),
+                tile_w=int(tile_w),
+                h=int(h),
+                w=int(w),
+                noise_sigma=float(noise_sigma),
+                motion_sensitivity=float(motion_sensitivity),
+                noise_offset_factor=float(noise_offset_factor),
+                use_stability=int(use_stability),
+                use_guidance=1,
+                early_exit_threshold=early_exit_threshold,
+            )
 
         if profile_hotspots:
             engine.sync()
@@ -2225,6 +3690,67 @@ def accumulate_spatial_merging_taichi(
         )
 
 
+def accumulate_spatial_merging_region_taichi(
+    current_image_full,
+    weight_map_work,
+    final_image_sum,
+    weight_map_sum_full,
+    *,
+    offset,
+    tile_shape,
+    finalize=False,
+):
+    """Accumulate one disjoint output region from a resident RGB frame."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    h_full, w_full = (int(final_image_sum.shape[0]), int(final_image_sum.shape[1]))
+    offset_y, offset_x = (int(offset[0]), int(offset[1]))
+    tile_h, tile_w = (int(tile_shape[0]), int(tile_shape[1]))
+    h_work, w_work = (int(weight_map_work.shape[0]), int(weight_map_work.shape[1]))
+    if tuple(int(v) for v in current_image_full.shape) != (h_full, w_full, 3):
+        raise ValueError("region accumulation expects matching full-resolution RGB buffers")
+    if tile_h <= 0 or tile_w <= 0:
+        raise ValueError("region dimensions must be positive")
+    if offset_y < 0 or offset_x < 0 or offset_y + tile_h > h_full or offset_x + tile_w > w_full:
+        raise ValueError("accumulation region is outside the full output")
+
+    is_vec3_weight = len(weight_map_work.shape) == 3
+    graph_name = (
+        "accumulate_spatial_merging_vec3_region"
+        if is_vec3_weight
+        else "accumulate_spatial_merging_region"
+    )
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    engine.load(tcm_path).run(
+        graph_name,
+        current_image_full=_scalar_3d(current_image_full),
+        weight_map_work=_scalar_3d(weight_map_work) if is_vec3_weight else weight_map_work,
+        final_image_sum=_scalar_3d(final_image_sum),
+        weight_map_sum_full=(
+            _scalar_3d(weight_map_sum_full) if is_vec3_weight else weight_map_sum_full
+        ),
+        h_full=h_full,
+        w_full=w_full,
+        h_work=h_work,
+        w_work=w_work,
+        tile_h=tile_h,
+        tile_w=tile_w,
+        offset_y=offset_y,
+        offset_x=offset_x,
+        finalize=int(bool(finalize)),
+    )
+
+
 def accumulate_spatial_merging_tile_taichi(
     current_image_tile,
     weight_map_work,
@@ -2303,6 +3829,129 @@ def accumulate_spatial_merging_tile_taichi(
     )
 
 
+def clear_f32_3d_taichi(dst):
+    """Zero a resident multi-channel f32 buffer on the active backend.
+
+    The engine buffer pool can return storage that still holds a previous
+    frame's values, so a reconstruction accumulator must be cleared explicitly.
+    Doing it on the device avoids a host allocation the size of the accumulator.
+    """
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    if not _tcm_graph_available(tcm_path, "clear_f32_3d"):
+        raise RuntimeError(
+            "clear_f32_3d requested but the resolved spatial TCM lacks the "
+            f"graph: {tcm_path}. Recompile the spatial TCM for the active "
+            "backend."
+        )
+    h, w, c = (int(dst.shape[0]), int(dst.shape[1]), int(dst.shape[2]))
+    mod = engine.load(tcm_path)
+
+    def _scalar_3d(buf):
+        if getattr(buf, "is_vector", False):
+            return buf.view_as_vector(False)
+        return buf
+
+    mod.run("clear_f32_3d", dst=_scalar_3d(dst), h=h, w=w, c=c)
+
+
+def clear_f32_2d_taichi(dst):
+    """Zero a resident single-channel f32 buffer on the active backend."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    if not _tcm_graph_available(tcm_path, "clear_f32_2d"):
+        raise RuntimeError(
+            "clear_f32_2d requested but the resolved spatial TCM lacks the "
+            f"graph: {tcm_path}. Recompile the spatial TCM for the active "
+            "backend."
+        )
+    h, w = (int(dst.shape[0]), int(dst.shape[1]))
+    mod = engine.load(tcm_path)
+    mod.run("clear_f32_2d", dst=dst, h=h, w=w)
+
+
+def accumulate_tile_hann_taichi(
+    result_tile,
+    coverage_tile,
+    hann_tile,
+    acc_num,
+    acc_den,
+    *,
+    channel,
+    offset,
+):
+    """Blend one reconstructed HR plane into the global Hann accumulators.
+
+    ``result_tile`` and ``coverage_tile`` come from the splat graph and
+    ``hann_tile`` is a window buffer produced by
+    ``taichi_aot.generate_hanning_window_2d``.  ``acc_num`` is a
+    ``(HR_H, HR_W, C)`` accumulator and ``acc_den`` a shared ``(HR_H, HR_W)``
+    weight; divide them afterwards (for example with
+    ``taichi_vision...spatial_fusion.mean_division_vec3_weight_taichi``) to
+    obtain the normalized reconstruction.
+
+    Like the other offset accumulators this helper is fail-closed: a missing
+    graph is reported instead of silently changing the blend on the host.
+    """
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    tile_h, tile_w = int(result_tile.shape[0]), int(result_tile.shape[1])
+    channel = int(channel)
+    offset_y, offset_x = (int(offset[0]), int(offset[1]))
+    if getattr(acc_num, "ndim", len(getattr(acc_num, "shape", ()))) != 3:
+        raise ValueError("acc_num must be a 3-D (H, W, C) accumulator")
+    if channel < 0 or channel >= int(acc_num.shape[2]):
+        raise ValueError(
+            f"channel {channel} is outside the accumulator channel range "
+            f"{int(acc_num.shape[2])}"
+        )
+    if tuple(int(v) for v in coverage_tile.shape) != (tile_h, tile_w):
+        raise ValueError(
+            f"coverage_tile shape {tuple(coverage_tile.shape)} does not match "
+            f"result_tile {(tile_h, tile_w)}"
+        )
+    if tuple(int(v) for v in hann_tile.shape) != (tile_h, tile_w):
+        raise ValueError(
+            f"hann_tile shape {tuple(hann_tile.shape)} does not match "
+            f"result_tile {(tile_h, tile_w)}"
+        )
+    if offset_y < 0 or offset_x < 0:
+        raise ValueError(f"tile offset {(offset_y, offset_x)} must be non-negative")
+    if not _tcm_graph_available(tcm_path, "accumulate_tile_hann"):
+        raise RuntimeError(
+            "accumulate_tile_hann requested but the resolved spatial TCM lacks "
+            f"the graph: {tcm_path}. Recompile the spatial TCM for the active "
+            "backend."
+        )
+
+    mod = engine.load(tcm_path)
+
+    def _scalar_3d(buf):
+        if getattr(buf, "is_vector", False):
+            return buf.view_as_vector(False)
+        return buf
+
+    mod.run(
+        "accumulate_tile_hann",
+        result_tile=result_tile,
+        coverage_tile=coverage_tile,
+        hann_tile=hann_tile,
+        acc_num=_scalar_3d(acc_num),
+        acc_den=acc_den,
+        channel=channel,
+        tile_h=tile_h,
+        tile_w=tile_w,
+        offset_y=offset_y,
+        offset_x=offset_x,
+    )
+
+
 def accumulate_average_taichi(
     current_image_full,
     final_image_sum,
@@ -2339,6 +3988,55 @@ def accumulate_average_taichi(
         h_full=int(current_image_full.shape[0]),
         w_full=int(current_image_full.shape[1]),
         num_channels=3,
+    )
+
+
+def accumulate_average_sum_region_taichi(
+    current_image_full,
+    final_image_sum,
+    *,
+    offset,
+    tile_shape,
+    finalize=False,
+    denominator=None,
+):
+    """Accumulate a uniform-weight RGB region without a weight-map buffer."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    graph_name = "accumulate_average_sum_region"
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+    h_full, w_full = (int(final_image_sum.shape[0]), int(final_image_sum.shape[1]))
+    offset_y, offset_x = (int(offset[0]), int(offset[1]))
+    tile_h, tile_w = (int(tile_shape[0]), int(tile_shape[1]))
+    if tuple(int(v) for v in current_image_full.shape) != (h_full, w_full, 3):
+        raise ValueError("average region expects matching full-resolution RGB buffers")
+    if offset_y < 0 or offset_x < 0 or offset_y + tile_h > h_full or offset_x + tile_w > w_full:
+        raise ValueError("average region is outside the full output")
+    denominator_value = float(denominator if denominator is not None else 1.0)
+    if bool(finalize) and denominator_value <= 0.0:
+        raise ValueError("final average denominator must be positive")
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    engine.load(tcm_path).run(
+        graph_name,
+        current_image_full=_scalar_3d(current_image_full),
+        final_image_sum=_scalar_3d(final_image_sum),
+        h_full=h_full,
+        w_full=w_full,
+        tile_h=tile_h,
+        tile_w=tile_w,
+        offset_y=offset_y,
+        offset_x=offset_x,
+        finalize=int(bool(finalize)),
+        denominator=denominator_value,
     )
 
 
@@ -2512,6 +4210,370 @@ def remap_accumulate_tile_taichi(
             mod.run(graph_name, **args)
 
 
+def remap_accumulate_average_sum_tile_taichi(
+    source_full,
+    flow_work,
+    final_image_sum,
+    *,
+    full_shape,
+    offset,
+    tile_shape,
+    finalize=False,
+    denominator=None,
+):
+    """Remap and average-accumulate one tile without uniform weight storage."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    graph_name = "remap_accumulate_average_sum_tile"
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+    h_dst, w_dst = (int(full_shape[0]), int(full_shape[1]))
+    offset_y, offset_x = (int(offset[0]), int(offset[1]))
+    tile_h, tile_w = (int(tile_shape[0]), int(tile_shape[1]))
+    if tuple(int(v) for v in source_full.shape) != (h_dst, w_dst, 3):
+        raise ValueError("remap average source must match full_shape and be RGB")
+    if len(flow_work.shape) != 3 or int(flow_work.shape[2]) != 2:
+        raise ValueError("flow must have shape (H, W, 2)")
+    if offset_y < 0 or offset_x < 0 or offset_y + tile_h > h_dst or offset_x + tile_w > w_dst:
+        raise ValueError("remap average tile is outside full_shape")
+    denominator_value = float(denominator if denominator is not None else 1.0)
+    if bool(finalize) and denominator_value <= 0.0:
+        raise ValueError("final average denominator must be positive")
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    engine.load(tcm_path).run(
+        graph_name,
+        source_full=_scalar_3d(source_full),
+        flow_work=_scalar_3d(flow_work),
+        final_image_sum=_scalar_3d(final_image_sum),
+        h_src=int(source_full.shape[0]),
+        w_src=int(source_full.shape[1]),
+        h_dst=h_dst,
+        w_dst=w_dst,
+        h_flow=int(flow_work.shape[0]),
+        w_flow=int(flow_work.shape[1]),
+        scale_x=float(w_dst) / float(flow_work.shape[1]),
+        scale_y=float(h_dst) / float(flow_work.shape[0]),
+        tile_h=tile_h,
+        tile_w=tile_w,
+        offset_y=offset_y,
+        offset_x=offset_x,
+        finalize=int(bool(finalize)),
+        denominator=denominator_value,
+    )
+
+
+def remap_accumulate_cfa_weighted_taichi(
+    source_planes,
+    flow_work,
+    weight_map_work,
+    final_cfa_sum,
+    final_cfa_weight,
+    *,
+    full_shape,
+    cfa_pattern,
+    phase_origin=(0, 0),
+):
+    """Fuse one RAW support into scalar CFA accumulators without host tiles.
+
+    ``source_planes`` are the four phase-correct Bayer lattices in row-major
+    2x2 order.  The model weight map stays at its analysis resolution; each
+    dispatch selects only the R, G, or B confidence belonging to its lattice.
+    The function performs no download and leaves all supplied buffers owned by
+    the caller.
+    """
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    scalar_weight = len(weight_map_work.shape) == 2
+    graph_name = (
+        "remap_accumulate_cfa_scalar_weighted_plane"
+        if scalar_weight
+        else "remap_accumulate_cfa_weighted_plane"
+    )
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+    if len(source_planes) != 4:
+        raise ValueError("CFA weighted accumulation requires four Bayer source planes")
+    h_dst, w_dst = (int(full_shape[0]), int(full_shape[1]))
+    if tuple(int(v) for v in final_cfa_sum.shape) != (h_dst, w_dst):
+        raise ValueError("final_cfa_sum must be a scalar buffer matching full_shape")
+    if tuple(int(v) for v in final_cfa_weight.shape) != (h_dst, w_dst):
+        raise ValueError("final_cfa_weight must be a scalar buffer matching full_shape")
+    if len(flow_work.shape) != 3 or int(flow_work.shape[2]) != 2:
+        raise ValueError("flow_work must have shape (H, W, 2)")
+    if not scalar_weight and (
+        len(weight_map_work.shape) != 3 or int(weight_map_work.shape[2]) < 3
+    ):
+        raise ValueError("weight_map_work must have shape (H, W) or (H, W, >=3)")
+    if len(cfa_pattern) != 4 or len(phase_origin) != 2:
+        raise ValueError("cfa_pattern must have four entries and phase_origin two")
+    if any(np.dtype(buf.dtype) != np.dtype(np.float32) for buf in source_planes):
+        raise TypeError("CFA source planes must be float32")
+    if (
+        np.dtype(flow_work.dtype) != np.dtype(np.float32)
+        or np.dtype(weight_map_work.dtype) != np.dtype(np.float32)
+        or np.dtype(final_cfa_sum.dtype) != np.dtype(np.float32)
+        or np.dtype(final_cfa_weight.dtype) != np.dtype(np.float32)
+    ):
+        raise TypeError("CFA fusion requires float32 buffers")
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    phase_y, phase_x = (int(phase_origin[0]) & 1, int(phase_origin[1]) & 1)
+    mod = engine.load(tcm_path)
+    for index, source_plane in enumerate(source_planes):
+        plane_row, plane_col = divmod(index, 2)
+        origin_y = (plane_row - phase_y) & 1
+        origin_x = (plane_col - phase_x) & 1
+        channel = int(cfa_pattern[index])
+        if channel < 0 or channel > 2:
+            raise ValueError(
+                "CFA FusionNet requires RGB CFA codes in [0, 2], got "
+                f"{channel} at plane {index}"
+            )
+        expected_shape = (
+            len(range(origin_y, h_dst, 2)),
+            len(range(origin_x, w_dst, 2)),
+        )
+        if tuple(int(v) for v in source_plane.shape) != expected_shape:
+            raise ValueError(
+                f"CFA plane {index} shape {tuple(source_plane.shape)} does not match "
+                f"phase-correct expected shape {expected_shape}"
+            )
+        args = dict(
+            source_plane=source_plane,
+            flow_work=_scalar_3d(flow_work),
+            weight_map_work=(weight_map_work if scalar_weight else _scalar_3d(weight_map_work)),
+            final_cfa_sum=final_cfa_sum,
+            final_cfa_weight=final_cfa_weight,
+            h_dst=h_dst,
+            w_dst=w_dst,
+            h_flow=int(flow_work.shape[0]),
+            w_flow=int(flow_work.shape[1]),
+            h_work=int(weight_map_work.shape[0]),
+            w_work=int(weight_map_work.shape[1]),
+            h_plane=int(source_plane.shape[0]),
+            w_plane=int(source_plane.shape[1]),
+            plane_origin_y=origin_y,
+            plane_origin_x=origin_x,
+            scale_x=float(w_dst) / float(flow_work.shape[1]),
+            scale_y=float(h_dst) / float(flow_work.shape[0]),
+        )
+        if not scalar_weight:
+            args["cfa_channel"] = channel
+        mod.run(graph_name, **args)
+
+
+def accumulate_cfa_homography_taichi(
+    source_planes,
+    homography,
+    weight_map_work,
+    final_cfa_sum,
+    final_cfa_weight,
+    *,
+    full_shape,
+    cfa_pattern,
+    phase_origin=(0, 0),
+):
+    """Experimental direct CFA gather for a support-to-reference homography.
+
+    The public RAW pipeline can opt into this helper without changing its
+    alignment API.  The matrix is inverted once on the host (matching the
+    established remap contract), then reused for all four CFA planes.  No
+    intermediate warped plane is allocated and no buffer is downloaded.
+    """
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    scalar_weight = len(weight_map_work.shape) == 2
+    graph_name = (
+        "accumulate_cfa_homography_scalar_weighted_plane"
+        if scalar_weight
+        else "accumulate_cfa_homography_weighted_plane"
+    )
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+    if len(source_planes) != 4:
+        raise ValueError("CFA homography accumulation requires four Bayer planes")
+    h_dst, w_dst = (int(full_shape[0]), int(full_shape[1]))
+    if tuple(int(v) for v in final_cfa_sum.shape) != (h_dst, w_dst):
+        raise ValueError("final_cfa_sum must be a scalar buffer matching full_shape")
+    if tuple(int(v) for v in final_cfa_weight.shape) != (h_dst, w_dst):
+        raise ValueError("final_cfa_weight must be a scalar buffer matching full_shape")
+    if len(cfa_pattern) != 4 or len(phase_origin) != 2:
+        raise ValueError("cfa_pattern must have four entries and phase_origin two")
+    if any(np.dtype(buf.dtype) != np.dtype(np.float32) for buf in source_planes):
+        raise TypeError("CFA source planes must be float32")
+    if (
+        np.dtype(weight_map_work.dtype) != np.dtype(np.float32)
+        or np.dtype(final_cfa_sum.dtype) != np.dtype(np.float32)
+        or np.dtype(final_cfa_weight.dtype) != np.dtype(np.float32)
+    ):
+        raise TypeError("CFA homography accumulation requires float32 buffers")
+    matrix = np.asarray(homography, dtype=np.float32)
+    if matrix.shape != (3, 3):
+        raise ValueError("homography must have shape (3, 3)")
+    try:
+        matrix_inv = np.linalg.inv(matrix).astype(np.float32, copy=False)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("homography is singular") from exc
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    phase_y, phase_x = (int(phase_origin[0]) & 1, int(phase_origin[1]) & 1)
+    m_inv_gpu = taichi_aot.upload(np.ascontiguousarray(matrix_inv))
+    mod = engine.load(tcm_path)
+    try:
+        for index, source_plane in enumerate(source_planes):
+            plane_row, plane_col = divmod(index, 2)
+            origin_y = (plane_row - phase_y) & 1
+            origin_x = (plane_col - phase_x) & 1
+            channel = int(cfa_pattern[index])
+            if channel < 0 or channel > 2:
+                raise ValueError(f"invalid CFA RGB code {channel} at plane {index}")
+            expected_shape = (
+                len(range(origin_y, h_dst, 2)),
+                len(range(origin_x, w_dst, 2)),
+            )
+            if tuple(int(v) for v in source_plane.shape) != expected_shape:
+                raise ValueError(
+                    f"CFA plane {index} shape {tuple(source_plane.shape)} does not match "
+                    f"phase-correct expected shape {expected_shape}"
+                )
+            args = dict(
+                source_plane=source_plane,
+                m_inv=m_inv_gpu,
+                weight_map_work=(
+                    weight_map_work if scalar_weight else _scalar_3d(weight_map_work)
+                ),
+                final_cfa_sum=final_cfa_sum,
+                final_cfa_weight=final_cfa_weight,
+                h_dst=h_dst,
+                w_dst=w_dst,
+                h_work=int(weight_map_work.shape[0]),
+                w_work=int(weight_map_work.shape[1]),
+                h_plane=int(source_plane.shape[0]),
+                w_plane=int(source_plane.shape[1]),
+                plane_origin_y=origin_y,
+                plane_origin_x=origin_x,
+            )
+            if not scalar_weight:
+                args["cfa_channel"] = channel
+            mod.run(graph_name, **args)
+    finally:
+        m_inv_gpu.release()
+
+
+def normalize_accumulator_cfa_taichi(cfa_sum, cfa_weight):
+    """Normalize a scalar RAW accumulator in place without a host round-trip."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    graph_name = "normalize_accumulator_cfa"
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+    h, w = (int(cfa_sum.shape[0]), int(cfa_sum.shape[1]))
+    if tuple(int(v) for v in cfa_sum.shape) != (h, w):
+        raise ValueError("cfa_sum must be a scalar 2D buffer")
+    if tuple(int(v) for v in cfa_weight.shape) != (h, w):
+        raise ValueError("cfa_weight must match cfa_sum")
+    if np.dtype(cfa_sum.dtype) != np.dtype(np.float32) or np.dtype(cfa_weight.dtype) != np.dtype(np.float32):
+        raise TypeError("CFA normalization requires float32 buffers")
+    engine.load(tcm_path).run(
+        graph_name,
+        cfa_sum=cfa_sum,
+        cfa_weight=cfa_weight,
+        h=h,
+        w=w,
+    )
+
+
+def normalize_accumulator_regions_taichi(
+    sum_img,
+    sum_weight=None,
+    *,
+    uniform_weight=None,
+    tile_size=None,
+):
+    """Normalize a resident RGB accumulator in place over disjoint regions."""
+    import taichi_vision.taichi_aot as taichi_aot
+
+    engine = taichi_aot.engine
+    tcm_path = _resolve_spatial_tcm(engine)
+    h, w = int(sum_img.shape[0]), int(sum_img.shape[1])
+    if tuple(int(v) for v in sum_img.shape) != (h, w, 3):
+        raise ValueError("resident accumulator normalization expects RGB float32")
+
+    if uniform_weight is not None:
+        graph_name = "normalize_accumulator_uniform_region"
+    elif sum_weight is not None and len(sum_weight.shape) == 2:
+        graph_name = "normalize_accumulator_scalar_region"
+    elif sum_weight is not None and len(sum_weight.shape) == 3:
+        graph_name = "normalize_accumulator_vec3_region"
+    else:
+        raise ValueError("sum_weight or uniform_weight is required")
+    if not _tcm_graph_available(tcm_path, graph_name):
+        raise RuntimeError(
+            f"{graph_name} requested but the resolved spatial TCM lacks the graph: "
+            f"{tcm_path}. Recompile the spatial TCM for the active backend."
+        )
+
+    scope = taichi_aot.current_compute_block_scope() or {}
+    requested = tile_size if tile_size is not None else scope.get("block_size", 1024)
+    if isinstance(requested, (tuple, list)):
+        tile_h, tile_w = int(requested[0]), int(requested[1])
+    else:
+        tile_h = tile_w = int(requested)
+    tile_h = min(h, max(32, tile_h))
+    tile_w = min(w, max(32, tile_w))
+
+    def _scalar_3d(buf):
+        return buf.view_as_vector(False) if getattr(buf, "is_vector", False) else buf
+
+    mod = engine.load(tcm_path)
+    dispatches = 0
+    for offset_y in range(0, h, tile_h):
+        for offset_x in range(0, w, tile_w):
+            args = {
+                "sum_img": _scalar_3d(sum_img),
+                "h": h,
+                "w": w,
+                "tile_h": min(tile_h, h - offset_y),
+                "tile_w": min(tile_w, w - offset_x),
+                "offset_y": offset_y,
+                "offset_x": offset_x,
+            }
+            if uniform_weight is not None:
+                args["denominator"] = float(uniform_weight)
+            else:
+                args["sum_weight"] = _scalar_3d(sum_weight)
+            mod.run(graph_name, **args)
+            dispatches += 1
+    return {"graph": graph_name, "dispatches": dispatches, "tile_shape": (tile_h, tile_w)}
+
+
 def mean_division_vec3_weight_taichi(
     sum_img,
     sum_weight,
@@ -2540,9 +4602,15 @@ def mean_division_vec3_weight_taichi(
 
     h, w = sum_img.shape[0], sum_img.shape[1]
 
-    if not _tcm_graph_available(tcm_path, "mean_division_vec3_weight"):
+    scalar_weight = len(sum_weight.shape) == 2
+    graph_name = (
+        "mean_division_vec3_scalar_weight"
+        if scalar_weight
+        else "mean_division_vec3_weight"
+    )
+    if not _tcm_graph_available(tcm_path, graph_name):
         raise RuntimeError(
-            "mean_division_vec3_weight requested but the resolved spatial "
+            f"{graph_name} requested but the resolved spatial "
             f"TCM lacks the graph: {tcm_path}. Recompile the spatial TCM for "
             "the active backend (compile_spatial_fusion_tcm)."
         )
@@ -2564,12 +4632,12 @@ def mean_division_vec3_weight_taichi(
         return buf
 
     sum_img_v = _scalar_3d(sum_img)
-    sum_weight_v = _scalar_3d(sum_weight)
+    sum_weight_v = sum_weight if scalar_weight else _scalar_3d(sum_weight)
     ref_img_v = _scalar_3d(ref_img)
     dst_v = _scalar_3d(dst)
 
     mod.run(
-        "mean_division_vec3_weight",
+        graph_name,
         sum_img=sum_img_v,
         sum_weight=sum_weight_v,
         ref_img=ref_img_v,

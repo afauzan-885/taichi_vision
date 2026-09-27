@@ -60,6 +60,7 @@ try:
             TaichiGPUBuffer,
             InputArray,
             OutputArray,
+            cast,
             select_backend,
             resolve_backend_config,
             get_backend_config,
@@ -76,7 +77,7 @@ try:
             COLOR_RGB2GRAY,
             COLOR_GRAY2BGR,
         )
-        print("[AOT Native] Production Engine Active (C++ Compiled)")
+        print("[Taichi Vision] Mesin pemrosesan native aktif.", flush=True)
     else:
         raise ImportError("Development mode forced")
 except Exception:
@@ -86,6 +87,7 @@ except Exception:
         TaichiGPUBuffer,
         InputArray,
         OutputArray,
+        cast,
         select_backend,
         resolve_backend_config,
         get_backend_config,
@@ -376,6 +378,15 @@ from taichi_vision.taichi_algorithm.aot_api import (  # noqa: E402
     get_memory_status,
     auto_pipeline,
     configure_block_reservation,
+)
+
+# Neural AOT Engine (ONNX & PyTorch native execution, .tcm support)
+from .neural_engine import (
+    onnx,
+    pytorch,
+    NeuralModel,
+    export_neural_tcm,
+    load_neural_tcm,
 )
 
 try:

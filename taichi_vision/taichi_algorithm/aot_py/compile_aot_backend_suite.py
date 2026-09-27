@@ -45,6 +45,8 @@ COLOCATED_COMPILER_PACKAGES = {
     # aot_py modules remain compatibility shims for older direct commands.
     "compile_cast_tcm": "taichi_vision.taichi_algorithm",
     "compile_common_tcm": "taichi_vision.taichi_algorithm",
+    "compile_resident_accumulator_tcm": "taichi_vision.taichi_algorithm",
+    "compile_sr_resident_tcm": "taichi_vision.taichi_algorithm",
     "compile_research_tcm": "taichi_vision.taichi_algorithm",
     "compile_akaze_tcm": "taichi_vision.taichi_algorithm.feature_matching",
     "compile_ofb_tcm": "taichi_vision.taichi_algorithm.feature_matching",
@@ -103,6 +105,8 @@ FORK_PYTHON = (
 
 # artifact: (compiler module, callable, calling convention, generated aliases)
 JOBS = {
+    "sr_resident": ("compile_sr_resident_tcm", "compile_sr_resident", "path", ()),
+    "resident_accumulator": ("compile_resident_accumulator_tcm", "compile_resident_accumulator", "path", ()),
     "akaze": ("compile_akaze_tcm", "compile_akaze_tcm", "path", ()),
     "auto_enhance": (
         "compile_auto_enhance_tcm",

@@ -100,6 +100,76 @@ print('has_gc=' + str(bool(calls)))
     assert "has_gc=False" in result.stdout
 
 
+def test_startup_warmup_uses_intel_vulkan_compatibility_policy() -> None:
+    result = _run_probe(
+        {
+            "AOT_ARCH": "vulkan",
+            "PIXEL_REFINE_AOT_ARCH": "vulkan",
+            "TARGET_VENDOR": "intel",
+            "PIXEL_REFINE_TARGET_VENDOR": "intel",
+        },
+        """
+from pixel_refine_desktop.app_core.aot_warmup import _startup_warmup_allowed
+print('allowed=' + str(_startup_warmup_allowed()))
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "allowed=True" in result.stdout
+
+
+def test_startup_warmup_accepts_qualified_intel_vulkan_in_strict_mode() -> None:
+    result = _run_probe(
+        {
+            "AOT_ARCH": "vulkan",
+            "AOT_DEVICE": "4",
+            "TARGET_VENDOR": "intel",
+            "PIXEL_REFINE_GFX_COMPAT_MODE": "0",
+        },
+        """
+import taichi_vision.vulkan_probe as probe
+probe.intel_vulkan_is_validated = lambda device_id=None: True
+from pixel_refine_desktop.app_core.aot_warmup import _startup_warmup_allowed
+print('allowed=' + str(_startup_warmup_allowed()))
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "allowed=True" in result.stdout
+
+
+def test_startup_warmup_defers_thread_affine_intel_opengl() -> None:
+    result = _run_probe(
+        {
+            "AOT_ARCH": "opengl",
+            "PIXEL_REFINE_AOT_ARCH": "opengl",
+            "TARGET_VENDOR": "intel",
+            "PIXEL_REFINE_TARGET_VENDOR": "intel",
+        },
+        """
+from pixel_refine_desktop.app_core.aot_warmup import _startup_warmup_allowed
+print('allowed=' + str(_startup_warmup_allowed()))
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "allowed=False" in result.stdout
+
+
+def test_startup_warmup_remains_allowed_for_nvidia_opengl() -> None:
+    result = _run_probe(
+        {
+            "AOT_ARCH": "opengl",
+            "PIXEL_REFINE_AOT_ARCH": "opengl",
+            "TARGET_VENDOR": "nvidia",
+            "PIXEL_REFINE_TARGET_VENDOR": "nvidia",
+        },
+        """
+from pixel_refine_desktop.app_core.aot_warmup import _startup_warmup_allowed
+print('allowed=' + str(_startup_warmup_allowed()))
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "allowed=True" in result.stdout
+
+
 def test_native_intel_vulkan_guard_rejects_unqualified_device() -> None:
     result = _run_probe(
         {
@@ -219,3 +289,17 @@ print('enabled=' + str(graphics_compatibility_enabled({backend!r}, {vendor!r})))
     )
     assert result.returncode == 0, result.stderr
     assert f"enabled={expected}" in result.stdout
+
+
+def test_interactive_hardware_test_timeout_is_bounded() -> None:
+    result = _run_probe(
+        {"PIXEL_REFINE_HARDWARE_TEST_TIMEOUT_S": "3"},
+        """
+from pixel_refine_desktop.ui.views.settings.General.GeneralSetting import _hardware_test_timeout_seconds
+print('fast=' + str(_hardware_test_timeout_seconds('fast')))
+print('deep=' + str(_hardware_test_timeout_seconds('deep')))
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "fast=10.0" in result.stdout
+    assert "deep=10.0" in result.stdout

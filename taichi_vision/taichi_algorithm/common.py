@@ -407,6 +407,128 @@ if TAICHI_AVAILABLE:
             dst[i, j] = sum_img[i, j] * inv_w
 
     @ti.kernel
+    def _accumulate_weighted_frame_kernel(
+        current_image_full: ti.types.ndarray(),
+        weight_map_work: ti.types.ndarray(),
+        final_image_sum: ti.types.ndarray(),
+        weight_map_sum_full: ti.types.ndarray(),
+        h_full: ti.i32,
+        w_full: ti.i32,
+        h_work: ti.i32,
+        w_work: ti.i32,
+        num_channels: ti.i32
+    ):
+        """Bilinearly interpolates work resolution weights to full resolution and accumulates frames."""
+        y_scale = float(h_work) / float(h_full)
+        x_scale = float(w_work) / float(w_full)
+        for i, j in ti.ndrange(h_full, w_full):
+            y_work_f = float(i) * y_scale
+            x_work_f = float(j) * x_scale
+
+            y0 = ti.cast(ti.floor(y_work_f), ti.i32)
+            x0 = ti.cast(ti.floor(x_work_f), ti.i32)
+            y1 = ti.min(y0 + 1, h_work - 1)
+            x1 = ti.min(x0 + 1, w_work - 1)
+            y0 = ti.max(0, y0)
+            x0 = ti.max(0, x0)
+
+            wy = y_work_f - float(y0)
+            wx = x_work_f - float(x0)
+
+            w_val = (
+                (1.0 - wy) * (1.0 - wx) * weight_map_work[y0, x0] +
+                (1.0 - wy) * wx * weight_map_work[y0, x1] +
+                wy * (1.0 - wx) * weight_map_work[y1, x0] +
+                wy * wx * weight_map_work[y1, x1]
+            )
+
+            weight_map_sum_full[i, j] += w_val
+            for c in range(num_channels):
+                final_image_sum[i, j, c] += current_image_full[i, j, c] * w_val
+
+    @ti.kernel
+    def _accumulate_weighted_frame_vec3_kernel(
+        current_image_full: ti.types.ndarray(),
+        weight_map_work: ti.types.ndarray(),
+        final_image_sum: ti.types.ndarray(),
+        weight_map_sum_full: ti.types.ndarray(),
+        h_full: ti.i32,
+        w_full: ti.i32,
+        h_work: ti.i32,
+        w_work: ti.i32,
+        num_channels: ti.i32
+    ):
+        """Vec3 variant: bilinearly interpolates per-channel (3D) work-res weights
+        to full resolution and accumulates frames with per-channel weighting.
+        """
+        y_scale = float(h_work) / float(h_full)
+        x_scale = float(w_work) / float(w_full)
+        for i, j in ti.ndrange(h_full, w_full):
+            y_work_f = float(i) * y_scale
+            x_work_f = float(j) * x_scale
+
+            y0 = ti.cast(ti.floor(y_work_f), ti.i32)
+            x0 = ti.cast(ti.floor(x_work_f), ti.i32)
+            y1 = ti.min(y0 + 1, h_work - 1)
+            x1 = ti.min(x0 + 1, w_work - 1)
+            y0 = ti.max(0, y0)
+            x0 = ti.max(0, x0)
+
+            wy = y_work_f - float(y0)
+            wx = x_work_f - float(x0)
+
+            for c in range(num_channels):
+                w_val = (
+                    (1.0 - wy) * (1.0 - wx) * weight_map_work[y0, x0, c] +
+                    (1.0 - wy) * wx * weight_map_work[y0, x1, c] +
+                    wy * (1.0 - wx) * weight_map_work[y1, x0, c] +
+                    wy * wx * weight_map_work[y1, x1, c]
+                )
+                weight_map_sum_full[i, j, c] += w_val
+                final_image_sum[i, j, c] += current_image_full[i, j, c] * w_val
+
+    @ti.kernel
+    def _accumulate_weighted_frame_scalar_to_vec3_kernel(
+        current_image_full: ti.types.ndarray(),
+        weight_map_work: ti.types.ndarray(),
+        final_image_sum: ti.types.ndarray(),
+        weight_map_sum_full: ti.types.ndarray(),
+        h_full: ti.i32,
+        w_full: ti.i32,
+        h_work: ti.i32,
+        w_work: ti.i32,
+        num_channels: ti.i32
+    ):
+        """Scalar-to-vec3 variant: bilinearly interpolates 1-channel 2D weights
+        to full resolution and accumulates into a 3D (vec3) accumulator.
+        """
+        y_scale = float(h_work) / float(h_full)
+        x_scale = float(w_work) / float(w_full)
+        for i, j in ti.ndrange(h_full, w_full):
+            y_work_f = float(i) * y_scale
+            x_work_f = float(j) * x_scale
+
+            y0 = ti.cast(ti.floor(y_work_f), ti.i32)
+            x0 = ti.cast(ti.floor(x_work_f), ti.i32)
+            y1 = ti.min(y0 + 1, h_work - 1)
+            x1 = ti.min(x0 + 1, w_work - 1)
+            y0 = ti.max(0, y0)
+            x0 = ti.max(0, x0)
+
+            wy = y_work_f - float(y0)
+            wx = x_work_f - float(x0)
+
+            w_val = (
+                (1.0 - wy) * (1.0 - wx) * weight_map_work[y0, x0] +
+                (1.0 - wy) * wx * weight_map_work[y0, x1] +
+                wy * (1.0 - wx) * weight_map_work[y1, x0] +
+                wy * wx * weight_map_work[y1, x1]
+            )
+            for c in range(num_channels):
+                weight_map_sum_full[i, j, c] += w_val
+                final_image_sum[i, j, c] += current_image_full[i, j, c] * w_val
+
+    @ti.kernel
     def _scale_f32_2d_kernel(src: ti.types.ndarray(), dst: ti.types.ndarray(), scale: float):
         for i, j in dst:
             dst[i, j] = src[i, j] * scale
@@ -766,7 +888,11 @@ def split(img):
                     res_list.append(aot.extract_channel(img_v, i))
             
             if is_gpu: return tuple(res_list)
-            return tuple([r.to_numpy() for r in res_list])
+            res_np = tuple([r.to_numpy() for r in res_list])
+            for r in res_list:
+                r.release()
+            img_v.release()
+            return res_np
 
     if not TAICHI_AVAILABLE:
         raise ImportError("Taichi not available")
@@ -837,7 +963,18 @@ def merge(channels):
                     aot.insert_channel(ch_v, dst_buf, i)
             
             if is_gpu: return dst_buf
-            return dst_buf.to_numpy()
+            res_np = dst_buf.to_numpy()
+            dst_buf.release()
+            if not is_gpu:
+                if c == 3:
+                    c0.release()
+                    c1.release()
+                    c2.release()
+                else:
+                    for ch in channels:
+                        if hasattr(ch, "release"):
+                            ch.release()
+            return res_np
 
     if not TAICHI_AVAILABLE:
         raise ImportError("Taichi not available")
@@ -900,6 +1037,8 @@ def extract_channel(img, ch):
             res_gpu = aot.extract_channel(img_v, ch)
             if is_gpu: return res_gpu
             res_np = res_gpu.to_numpy()
+            res_gpu.release()
+            img_v.release()
             return res_np
 
     if not TAICHI_AVAILABLE:
@@ -1037,20 +1176,16 @@ COLOR_GRAY2RGB = 8  # Gray to BGR/RGB is identical for grayscale
 
 
 @ti_thread
-def cvtColor(src, code, dst=None):
+def cvtColor(src, code, dst=None, return_gpu=False, session=None):
     """
     Convert image color space.
-    AOT-Aware: Dispatches to AOT module if AOT_MODE=1
+    AOT-Aware: Dispatches to AOT module if AOT_MODE=1.
+    Supports GPU residency chaining when return_gpu=True or session is provided.
     """
     if AOT_MODE:
         aot = _get_aot()
-        if aot and code in [COLOR_BGR2GRAY, COLOR_RGB2GRAY]:
-            from taichi_vision.taichi_aot.engine import TaichiGPUBuffer
-            is_gpu = isinstance(src, TaichiGPUBuffer)
-            src_v = src if is_gpu else aot.upload(src)
-            res_gpu = aot.rgb2gray(src_v)
-            if is_gpu: return res_gpu
-            return res_gpu.to_numpy()
+        if aot and hasattr(aot, "cvtColor"):
+            return aot.cvtColor(src, code, dst=dst, return_gpu=return_gpu, session=session)
 
     if not TAICHI_AVAILABLE:
         raise ImportError("Taichi not available")

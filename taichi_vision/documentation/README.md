@@ -11,6 +11,7 @@ records are migration history only.
 | Document | Contents |
 |---|---|
 | [API_USAGE.md](API_USAGE.md) | Public imports, backend selection, input/output, buffers, and examples |
+| [IMAGE_ANALYSIS.md](IMAGE_ANALYSIS.md) | Simple exposure API, bounded-memory behavior, and design rules for new analyzers |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Runtime model, AOT graphs, TCM, cache, memory, and block compute |
 | [ALGORITHM_STATUS.md](ALGORITHM_STATUS.md) | Algorithm status matrix: qualified, experimental, pending |
 | [BUILD_AND_VALIDATION.md](BUILD_AND_VALIDATION.md) | Compilation, target artifacts, parity, smoke tests, and evidence |

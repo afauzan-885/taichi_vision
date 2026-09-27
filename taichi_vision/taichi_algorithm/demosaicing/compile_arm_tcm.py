@@ -70,41 +70,84 @@ def _arm_preprocess_and_green_interpolation_kernel(
     gain_c10 = wb_r if c10==0 else (wb_g1 if c10==1 else (wb_b if c10==2 else wb_g2))
     gain_c11 = wb_r if c11==0 else (wb_g1 if c11==1 else (wb_b if c11==2 else wb_g2))
 
-    for r, c in ti.ndrange(h, w):
-        r_mod = r % 2
-        c_mod = c % 2
-        color_idx = ti.select(r_mod == 0, ti.select(c_mod == 0, c00, c01), ti.select(c_mod == 0, c10, c11))
-        
-        # Preprocess and Apply WB
-        val = ti.math.clamp((bayer[r, c] - black) * inv_range, 0.0, 1.0)
-        gain = _get_gain_fast(r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
-        wb_val = val * gain
-        wb_bayer[r, c] = wb_val
+    for r2, c2 in ti.ndrange((h + 1) // 2, (w + 1) // 2):
+        for i in ti.static(range(2)):
+            for j in ti.static(range(2)):
+                r = r2 * 2 + i
+                c = c2 * 2 + j
+                if r < h and c < w:
+                    # Compile-time CFA phase: both parities are constants here, so
+                    # every gain selection below, including the twelve inside
+                    # _sample_raw, folds to a scalar instead of a select chain.
+                    r_mod = i
+                    c_mod = j
+                    colour_self = c00
+                    gain = gain_c00
+                    if ti.static(i == 0):
+                        if ti.static(j == 0):
+                            colour_self = c00
+                            gain = gain_c00
+                        else:
+                            colour_self = c01
+                            gain = gain_c01
+                    else:
+                        if ti.static(j == 0):
+                            colour_self = c10
+                            gain = gain_c10
+                        else:
+                            colour_self = c11
+                            gain = gain_c11
 
-        # Direct Green Channel Reconstruction
-        is_green = (color_idx == 1) or (color_idx == 3)
-        if is_green:
-            green[r, c] = wb_val
-        else:
-            if r > 1 and r < h - 2 and c > 1 and c < w - 2:
-                p_c = wb_val
-                p_l1, p_r1 = _sample_raw(bayer, r, c - 1, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r, c + 1, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
-                p_l2, p_r2 = _sample_raw(bayer, r, c - 2, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r, c + 2, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
-                p_u1, p_d1 = _sample_raw(bayer, r - 1, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r + 1, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
-                p_u2, p_d2 = _sample_raw(bayer, r - 2, c, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r + 2, c, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                    # Preprocess and Apply WB
+                    val = ti.math.clamp((bayer[r, c] - black) * inv_range, 0.0, 1.0)
+                    wb_val = val * gain
+                    wb_bayer[r, c] = wb_val
 
-                dh = ti.abs(p_l1 - p_r1) + ti.abs(2.0 * p_c - p_l2 - p_r2)
-                dv = ti.abs(p_u1 - p_d1) + ti.abs(2.0 * p_c - p_u2 - p_d2)
+                    # Direct Green Channel Reconstruction
+                    is_green = (colour_self == 1) or (colour_self == 3)
+                    if is_green:
+                        green[r, c] = wb_val
+                    else:
+                        if r > 2 and r < h - 3 and c > 2 and c < w - 3:
+                            p_c = wb_val
+                            p_l1, p_r1 = _sample_raw(bayer, r, c - 1, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r, c + 1, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_l2, p_r2 = _sample_raw(bayer, r, c - 2, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r, c + 2, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_u1, p_d1 = _sample_raw(bayer, r - 1, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r + 1, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_u2, p_d2 = _sample_raw(bayer, r - 2, c, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r + 2, c, black, inv_range, r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_l3, p_r3 = _sample_raw(bayer, r, c - 3, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r, c + 3, black, inv_range, r_mod, 1 - c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_u3, p_d3 = _sample_raw(bayer, r - 3, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11), _sample_raw(bayer, r + 3, c, black, inv_range, 1 - r_mod, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
 
-                eps = 1e-6
-                w_h = (dv * dv) / (dh * dh + dv * dv + eps)
-                w_v = 1.0 - w_h
+                            dh = 3.0 * (
+                                ti.abs(p_l2 - p_c) + ti.abs(p_r2 - p_c) + ti.abs(p_l1 - p_r1)
+                            ) + 2.0 * (ti.abs(p_l3 - p_l1) + ti.abs(p_r3 - p_r1))
+                            dv = 3.0 * (
+                                ti.abs(p_u2 - p_c) + ti.abs(p_d2 - p_c) + ti.abs(p_u1 - p_d1)
+                            ) + 2.0 * (ti.abs(p_u3 - p_u1) + ti.abs(p_d3 - p_d1))
 
-                g_h = (p_l1 + p_r1) * 0.5 + (2.0 * p_c - p_l2 - p_r2) * 0.25
-                g_v = (p_u1 + p_d1) * 0.5 + (2.0 * p_c - p_u2 - p_d2) * 0.25
-                green[r, c] = w_h * g_h + w_v * g_v
-            else:
-                green[r, c] = wb_val
+                            g_h = (p_l1 + p_r1) * 0.5 + (2.0 * p_c - p_l2 - p_r2) * 0.25
+                            g_v = (p_u1 + p_d1) * 0.5 + (2.0 * p_c - p_u2 - p_d2) * 0.25
+                            g_h_bounded = ti.math.clamp(g_h, ti.min(p_l1, p_r1), ti.max(p_l1, p_r1))
+                            g_v_bounded = ti.math.clamp(g_v, ti.min(p_u1, p_d1), ti.max(p_u1, p_d1))
+                            hard = ti.select(
+                                dh < dv,
+                                g_h_bounded,
+                                ti.select(dv < dh, g_v_bounded, (g_h_bounded + g_v_bounded) * 0.5),
+                            )
+                            # (w_h*g_h + w_v*g_v)/(w_h + w_v) with w = 1/(0.01 + d) collapses
+                            # to one division, removing both reciprocals.  Algebraically
+                            # identical; division dominates this kernel.
+                            soft = (g_h * (0.01 + dv) + g_v * (0.01 + dh)) / (0.02 + dh + dv)
+                            texture = ti.math.clamp((ti.min(dh, dv) - 4.0) * 0.25, 0.0, 1.0)
+                            texture = texture * texture * (3.0 - 2.0 * texture)
+                            green[r, c] = hard * (1.0 - texture) + soft * texture
+                        else:
+                            cl, cr = ti.max(0, c - 1), ti.min(w - 1, c + 1)
+                            ru, rd = ti.max(0, r - 1), ti.min(h - 1, r + 1)
+                            p_l = _sample_raw(bayer, r, cl, black, inv_range, r_mod, cl % 2, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_r = _sample_raw(bayer, r, cr, black, inv_range, r_mod, cr % 2, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_u = _sample_raw(bayer, ru, c, black, inv_range, ru % 2, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            p_d = _sample_raw(bayer, rd, c, black, inv_range, rd % 2, c_mod, gain_c00, gain_c01, gain_c10, gain_c11)
+                            green[r, c] = (p_l + p_r + p_u + p_d) * 0.25
 
 @ti.kernel
 def _arm_red_blue_residual_kernel(
@@ -131,31 +174,42 @@ def _arm_red_blue_residual_kernel(
         if color_idx == 0:  # Red pixel
             R = wb_bayer[r, c]
             if r > 0 and r < h - 1 and c > 0 and c < w - 1:
-                # Diagonal Laplacian weights
-                g_diff_diag1 = ti.abs(green[r - 1, c - 1] - green[r + 1, c + 1])
-                g_diff_diag2 = ti.abs(green[r - 1, c + 1] - green[r + 1, c - 1])
-                w1 = 1.0 / (1.0 + g_diff_diag1)
-                w2 = 1.0 / (1.0 + g_diff_diag2)
-                
-                b_diff_val = (
-                    w1 * (wb_bayer[r - 1, c - 1] - green[r - 1, c - 1] + wb_bayer[r + 1, c + 1] - green[r + 1, c + 1]) +
-                    w2 * (wb_bayer[r - 1, c + 1] - green[r - 1, c + 1] + wb_bayer[r + 1, c - 1] - green[r + 1, c - 1])
-                ) / (2.0 * (w1 + w2))
+                g11, g22 = green[r - 1, c - 1], green[r + 1, c + 1]
+                g12, g21 = green[r - 1, c + 1], green[r + 1, c - 1]
+                b11, b22 = wb_bayer[r - 1, c - 1], wb_bayer[r + 1, c + 1]
+                b12, b21 = wb_bayer[r - 1, c + 1], wb_bayer[r + 1, c - 1]
+                d1 = ((b11 - g11) + (b22 - g22)) * 0.5
+                d2 = ((b12 - g12) + (b21 - g21)) * 0.5
+                e1 = ti.abs(b11 - b22) + ti.abs(g11 - G) + ti.abs(g22 - G)
+                e2 = ti.abs(b12 - b21) + ti.abs(g12 - G) + ti.abs(g21 - G)
+                a1 = ti.abs(g11 - g22)
+                a2 = ti.abs(g12 - g21)
+                soft = (d1 * (1.0 + a2) + d2 * (1.0 + a1)) / (2.0 + a1 + a2)
+                hard = ti.select(e1 < e2, d1, ti.select(e2 < e1, d2, (d1 + d2) * 0.5))
+                edge = ti.math.clamp((0.25 - ti.min(e1, e2)) * 5.0, 0.0, 1.0)
+                edge = edge * edge * (3.0 - 2.0 * edge)
+                b_diff_val = soft * (1.0 - edge) + hard * edge
                 B = G + b_diff_val
             else:
                 B = G
         elif color_idx == 2:  # Blue pixel
             B = wb_bayer[r, c]
             if r > 0 and r < h - 1 and c > 0 and c < w - 1:
-                g_diff_diag1 = ti.abs(green[r - 1, c - 1] - green[r + 1, c + 1])
-                g_diff_diag2 = ti.abs(green[r - 1, c + 1] - green[r + 1, c - 1])
-                w1 = 1.0 / (1.0 + g_diff_diag1)
-                w2 = 1.0 / (1.0 + g_diff_diag2)
-
-                r_diff_val = (
-                    w1 * (wb_bayer[r - 1, c - 1] - green[r - 1, c - 1] + wb_bayer[r + 1, c + 1] - green[r + 1, c + 1]) +
-                    w2 * (wb_bayer[r - 1, c + 1] - green[r - 1, c + 1] + wb_bayer[r + 1, c - 1] - green[r + 1, c - 1])
-                ) / (2.0 * (w1 + w2))
+                g11, g22 = green[r - 1, c - 1], green[r + 1, c + 1]
+                g12, g21 = green[r - 1, c + 1], green[r + 1, c - 1]
+                r11, r22 = wb_bayer[r - 1, c - 1], wb_bayer[r + 1, c + 1]
+                r12, r21 = wb_bayer[r - 1, c + 1], wb_bayer[r + 1, c - 1]
+                d1 = ((r11 - g11) + (r22 - g22)) * 0.5
+                d2 = ((r12 - g12) + (r21 - g21)) * 0.5
+                e1 = ti.abs(r11 - r22) + ti.abs(g11 - G) + ti.abs(g22 - G)
+                e2 = ti.abs(r12 - r21) + ti.abs(g12 - G) + ti.abs(g21 - G)
+                a1 = ti.abs(g11 - g22)
+                a2 = ti.abs(g12 - g21)
+                soft = (d1 * (1.0 + a2) + d2 * (1.0 + a1)) / (2.0 + a1 + a2)
+                hard = ti.select(e1 < e2, d1, ti.select(e2 < e1, d2, (d1 + d2) * 0.5))
+                edge = ti.math.clamp((0.25 - ti.min(e1, e2)) * 5.0, 0.0, 1.0)
+                edge = edge * edge * (3.0 - 2.0 * edge)
+                r_diff_val = soft * (1.0 - edge) + hard * edge
                 R = G + r_diff_val
             else:
                 R = G
@@ -167,11 +221,51 @@ def _arm_red_blue_residual_kernel(
                 is_red_horizontal = (c10 if c_mod == 1 else c11) == 0
 
             if is_red_horizontal:
-                R = G + (wb_bayer[r, ti.max(0, c - 1)] - green[r, ti.max(0, c - 1)] + wb_bayer[r, ti.min(w - 1, c + 1)] - green[r, ti.min(w - 1, c + 1)]) * 0.5
-                B = G + (wb_bayer[ti.max(0, r - 1), c] - green[ti.max(0, r - 1), c] + wb_bayer[ti.min(h - 1, r + 1), c] - green[ti.min(h - 1, r + 1), c]) * 0.5
+                cl, cr = ti.max(0, c - 1), ti.min(w - 1, c + 1)
+                ru, rd = ti.max(0, r - 1), ti.min(h - 1, r + 1)
+                al, ar = ti.abs(green[r, cl] - G), ti.abs(green[r, cr] - G)
+                au, ad = ti.abs(green[ru, c] - G), ti.abs(green[rd, c] - G)
+                R = G + (
+                    (wb_bayer[r, cl] - green[r, cl]) * (0.005 + ar)
+                    + (wb_bayer[r, cr] - green[r, cr]) * (0.005 + al)
+                ) / (0.01 + al + ar)
+                B = G + (
+                    (wb_bayer[ru, c] - green[ru, c]) * (0.005 + ad)
+                    + (wb_bayer[rd, c] - green[rd, c]) * (0.005 + au)
+                ) / (0.01 + au + ad)
             else:
-                B = G + (wb_bayer[r, ti.max(0, c - 1)] - green[r, ti.max(0, c - 1)] + wb_bayer[r, ti.min(w - 1, c + 1)] - green[r, ti.min(w - 1, c + 1)]) * 0.5
-                R = G + (wb_bayer[ti.max(0, r - 1), c] - green[ti.max(0, r - 1), c] + wb_bayer[ti.min(h - 1, r + 1), c] - green[ti.min(h - 1, r + 1), c]) * 0.5
+                cl, cr = ti.max(0, c - 1), ti.min(w - 1, c + 1)
+                ru, rd = ti.max(0, r - 1), ti.min(h - 1, r + 1)
+                al, ar = ti.abs(green[r, cl] - G), ti.abs(green[r, cr] - G)
+                au, ad = ti.abs(green[ru, c] - G), ti.abs(green[rd, c] - G)
+                B = G + (
+                    (wb_bayer[r, cl] - green[r, cl]) * (0.005 + ar)
+                    + (wb_bayer[r, cr] - green[r, cr]) * (0.005 + al)
+                ) / (0.01 + al + ar)
+                R = G + (
+                    (wb_bayer[ru, c] - green[ru, c]) * (0.005 + ad)
+                    + (wb_bayer[rd, c] - green[rd, c]) * (0.005 + au)
+                ) / (0.01 + au + ad)
+
+        ru, rd = ti.max(0, r - 1), ti.min(h - 1, r + 1)
+        cl, cr = ti.max(0, c - 1), ti.min(w - 1, c + 1)
+        g_min = ti.min(G, ti.min(green[ru, c], ti.min(green[rd, c], ti.min(green[r, cl], green[r, cr]))))
+        g_max = ti.max(G, ti.max(green[ru, c], ti.max(green[rd, c], ti.max(green[r, cl], green[r, cr]))))
+        texture = ti.math.clamp((g_max - g_min - 0.16) / 0.39, 0.0, 1.0)
+        texture = texture * texture * (3.0 - 2.0 * texture)
+        rg, bg = R - G, B - G
+        magnitude = ti.min(ti.abs(rg), ti.abs(bg))
+        opponent = ti.math.clamp((magnitude - 0.015) / 0.155, 0.0, 1.0)
+        opponent = opponent * opponent * (3.0 - 2.0 * opponent)
+        blend = texture * opponent
+        if rg * bg < 0.0:
+            if color_idx == 0:
+                B = G + bg * (1.0 - blend) + rg * blend
+            elif color_idx == 2:
+                R = G + rg * (1.0 - blend) + bg * blend
+            else:
+                R = G + rg * (1.0 - blend)
+                B = G + bg * (1.0 - blend)
 
         r_diff[r, c] = R - G
         b_diff[r, c] = B - G
@@ -225,6 +319,9 @@ def _arm_reconstruct_and_postprocess_kernel(
         B = B * (1.0 - final_factor) + L * final_factor
 
         # Algebraic Sigmoid Dynamic Range Compression
+        R = ti.max(0.0, R)
+        G = ti.max(0.0, G)
+        B = ti.max(0.0, B)
         dst[r, c, 0] = R / ti.math.sqrt(1.0 + R * R)
         dst[r, c, 1] = G / ti.math.sqrt(1.0 + G * G)
         dst[r, c, 2] = B / ti.math.sqrt(1.0 + B * B)

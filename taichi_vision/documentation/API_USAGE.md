@@ -4,6 +4,22 @@ This is the complete quick-reference for the public entry points exported by
 `taichi_vision.taichi_algorithm.aot_api`, including research and compatibility
 wrappers. Function signatures in source remain authoritative.
 
+## Image analysis
+
+For a single exposure measurement, use the small image-analysis facade. The
+call uses the active Taichi Vision backend and takes no backend or tuning
+options:
+
+```python
+from taichi_vision.image_analysis import analyze_exposure
+
+exposure = analyze_exposure(linear_rgb)  # float RGB, (H, W, 3), range [0, 1]
+print(exposure.score, exposure.median_luminance)
+```
+
+See [IMAGE_ANALYSIS.md](IMAGE_ANALYSIS.md) for result fields, memory bounds,
+input validation, artifact requirements, and current evidence status.
+
 ## Canonical import and backend selection
 
 ```python

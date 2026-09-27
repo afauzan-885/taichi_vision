@@ -8,7 +8,6 @@ import signal
 import shutil
 import struct
 import tempfile
-import weakref
 import zipfile
 import numpy as np
 import typing
@@ -31,7 +30,10 @@ from .block import (
     operation_contract,
     should_use_blocks,
 )
-from .memory import CacheTelemetry, MemoryGovernor
+from .memory import CacheTelemetry
+from .memory_policy import MemoryPolicy
+from .allocator import BufferKey, BufferPool
+from .lifecycle import LifecycleManager, LiveBufferRegistry
 from .residency import DeviceResidencyCache
 from .auto_pipeline import AutoPipelinePlanner
 from .capabilities import classify_device
@@ -59,6 +61,14 @@ from .tcm_preflight import preflight_tcm
 _UNSET = object()
 _CPU_AOT_EXTRACTION_LOCK = threading.RLock()
 _OPENGL_VENDOR_INJECTED = None
+
+
+def _aot_log(message, *, detail=False):
+    """Print a concise runtime status, with diagnostics available on demand."""
+    if detail and os.environ.get("PIXEL_REFINE_AOT_VERBOSE_LOGS", "0") != "1":
+        return
+    prefix = "[Taichi Vision - Detail]" if detail else "[Taichi Vision]"
+    print(f"{prefix} {message}", flush=True)
 
 
 def _materialize_cpu_aot_directory(artifact_path):
@@ -368,20 +378,25 @@ def _schedule_intel_vulkan_qualification(device_id):
         if notice_key not in _QUALIFICATION_NOTICES:
             _QUALIFICATION_NOTICES.add(notice_key)
             if report.get("scheduled"):
-                print(
-                    "[AOTEngine] Intel Vulkan qualification scheduled after "
-                    "application shutdown; OpenGL remains active for this run."
+                _aot_log(
+                    "Pemeriksaan kompatibilitas Vulkan Intel dijadwalkan setelah aplikasi ditutup."
                 )
             elif report.get("status") == "cooldown":
-                print(
-                    "[AOTEngine] Intel Vulkan qualification is in retry "
-                    f"cooldown: {report.get('reason', 'previous gate failed')}"
+                _aot_log(
+                    "Pemeriksaan kompatibilitas Vulkan Intel akan dicoba kembali nanti.",
+                )
+                _aot_log(
+                    f"Intel Vulkan qualification cooldown: {report.get('reason', 'previous gate failed')}",
+                    detail=True,
                 )
         return report
     except Exception as exc:
-        print(
-            "[AOTEngine] Intel Vulkan auto-qualification could not be "
-            f"scheduled: {type(exc).__name__}: {exc}"
+        _aot_log(
+            "Pemeriksaan kompatibilitas Vulkan Intel tidak dapat dijadwalkan.",
+        )
+        _aot_log(
+            f"Intel Vulkan qualification scheduling failed: {type(exc).__name__}: {exc}",
+            detail=True,
         )
         return None
 
@@ -1196,7 +1211,7 @@ def _init_aot_bridge(backend=None):
         staged_bundle = None
     if staged_bundle is not None:
         aot_dll_dir = str(staged_bundle)
-        print(f"[AOTEngine] LLVM20 runtime bundle selected: {aot_dll_dir}")
+        _aot_log(f"Runtime bundle: {aot_dll_dir}", detail=True)
     target_dir = os.path.join(aot_dll_dir, target.target_id)
     backend_dir = (
         aot_dll_dir
@@ -1259,7 +1274,7 @@ def _init_aot_bridge(backend=None):
 
     try:
         _LIB = ctypes.CDLL(engine_dll_path)
-        print(f"[AOTEngine] Successfully loaded backend bridge: {engine_dll_path}")
+        _aot_log(f"Backend bridge loaded: {engine_dll_path}", detail=True)
     except Exception as e:
         raise RuntimeError(
             f"Failed to load Generic AOT Engine DLL at {engine_dll_path}\nError: {e}"
@@ -1637,9 +1652,8 @@ def resolve_backend_config(arch=None, device_id=None, *, prefer=None, strict=Non
                     "execution, use CPU/OpenGL, or run the isolated Intel "
                     "qualification probe."
                 )
-            print(
-                "[AOTEngine] Native Intel Vulkan admitted in legacy graphics "
-                "compatibility mode; qualification continues independently."
+            _aot_log(
+                "Vulkan Intel memakai mode kompatibilitas untuk menjaga stabilitas."
             )
 
     config = BackendConfig(
@@ -1817,185 +1831,6 @@ def _raise_native_engine_error(runtime, context):
 # -------------------------------------------------------------------------
 # GPU Buffer Manager
 # -------------------------------------------------------------------------
-@dataclass(frozen=True)
-class BufferKey:
-    """Physical allocation identity used by the reusable buffer pool.
-
-    A GPU allocation is raw storage; shape and dtype are carried by the
-    ``DynamicArg`` metadata at dispatch time.  The key therefore contains the
-    memory domain and vector view information (which must not be mixed), while
-    allowing different shapes with the same byte capacity to share storage.
-    The engine generation is intentionally not part of the key: each
-    ``BufferPool`` belongs to one runtime generation and is discarded on
-    reinitialisation.
-    """
-
-    size_bytes: int
-    host_accessible: bool = False
-    dtype: str = "raw"
-    is_vector: bool = False
-    vector_dim: int = 1
-    usage: str = "storage"
-
-    def __post_init__(self):
-        if int(self.size_bytes) <= 0:
-            raise ValueError("buffer allocation size must be positive")
-        object.__setattr__(self, "size_bytes", int(self.size_bytes))
-        object.__setattr__(self, "host_accessible", bool(self.host_accessible))
-        object.__setattr__(self, "dtype", str(self.dtype or "raw"))
-        object.__setattr__(self, "is_vector", bool(self.is_vector))
-        object.__setattr__(self, "vector_dim", max(1, int(self.vector_dim)))
-        object.__setattr__(self, "usage", str(self.usage or "storage"))
-
-
-class BufferPool:
-    """Bounded pool for reusable raw allocations.
-
-    The old pool only covered device-local allocations and keyed handles by
-    byte size.  Full-frame NumPy uploads use host-visible allocations, so they
-    never benefited from reuse.  This pool now accepts a domain-aware
-    ``BufferKey`` while retaining the integer-size API for old callers.
-    """
-
-    def __init__(self, engine=None):
-        self.engine = engine
-        self.free_buffers = {}  # BufferKey -> list of handles
-        self.max_bytes = 0
-        self.pooled_bytes = 0
-        self._stats = {
-            "hits": 0,
-            "misses": 0,
-            "stores": 0,
-            "evictions": 0,
-        }
-        import threading
-
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _key(
-        size_or_key,
-        *,
-        host_accessible=False,
-        dtype="raw",
-        is_vector=False,
-        vector_dim=1,
-        usage="storage",
-    ):
-        if isinstance(size_or_key, BufferKey):
-            return size_or_key
-        return BufferKey(
-            int(size_or_key),
-            host_accessible=host_accessible,
-            dtype=dtype,
-            is_vector=is_vector,
-            vector_dim=vector_dim,
-            usage=usage,
-        )
-
-    def acquire(self, size_or_key, **kwargs):
-        key = self._key(size_or_key, **kwargs)
-        with self._lock:
-            handles = self.free_buffers.get(key)
-            if handles:
-                handle = handles.pop()
-                self.pooled_bytes = max(0, self.pooled_bytes - key.size_bytes)
-                self._stats["hits"] += 1
-                if not handles:
-                    self.free_buffers.pop(key, None)
-                return handle
-            self._stats["misses"] += 1
-            return None
-
-    def store(self, size_or_key, handle, **kwargs):
-        """Store a handle for reuse (caller decides if reuse or free)."""
-        key = self._key(size_or_key, **kwargs)
-        with self._lock:
-            size = key.size_bytes
-            if self.max_bytes <= 0 or self.pooled_bytes + size > self.max_bytes:
-                runtime = self.engine.runtime if self.engine else _RUNTIME
-                if self.engine and getattr(self.engine, "arch", "").lower() == "cuda":
-                    ensure_cuda_context(getattr(self.engine, "device_id", 0))
-                if _LIB and runtime:
-                    try:
-                        _LIB.free_gpu_buffer(runtime, handle)
-                    except Exception:
-                        pass
-                self._stats["evictions"] += 1
-                return
-            if key not in self.free_buffers:
-                self.free_buffers[key] = []
-            self.free_buffers[key].append(handle)
-            self.pooled_bytes += size
-            self._stats["stores"] += 1
-
-    def set_budget(self, max_bytes):
-        """Apply an adaptive cap and evict largest idle buffers first."""
-        with self._lock:
-            self.max_bytes = max(0, int(max_bytes))
-            runtime = self.engine.runtime if self.engine else _RUNTIME
-            if self.engine and getattr(self.engine, "arch", "").lower() == "cuda":
-                ensure_cuda_context(getattr(self.engine, "device_id", 0))
-            for key in sorted(
-                tuple(self.free_buffers),
-                key=lambda item: item.size_bytes,
-                reverse=True,
-            ):
-                handles = self.free_buffers.get(key, [])
-                while handles and self.pooled_bytes > self.max_bytes:
-                    handle = handles.pop()
-                    if _LIB and runtime:
-                        try:
-                            _LIB.free_gpu_buffer(runtime, handle)
-                        except Exception:
-                            pass
-                    self.pooled_bytes = max(0, self.pooled_bytes - key.size_bytes)
-                    self._stats["evictions"] += 1
-                if not handles:
-                    self.free_buffers.pop(key, None)
-
-    def clear(self):
-        """Force-free all pooled handles from VRAM."""
-        global _LIB, _RUNTIME
-        # ``destroy()``/``release()`` may have placed handles in the engine's
-        # retired queue rather than directly in this free-list.  Preserve the
-        # historical public meaning of ``buffer_pool.clear()`` by promoting
-        # that queue first; the engine performs one synchronization only.
-        if self.engine and hasattr(self.engine, "_drain_retired"):
-            try:
-                self.engine._drain_retired(wait=True)
-            except Exception:
-                pass
-        with self._lock:
-            runtime = self.engine.runtime if self.engine else _RUNTIME
-            if self.engine and getattr(self.engine, "arch", "").lower() == "cuda":
-                ensure_cuda_context(getattr(self.engine, "device_id", 0))
-            if _LIB and runtime:
-                for handles in self.free_buffers.values():
-                    for h in handles:
-                        try:
-                            _LIB.free_gpu_buffer(runtime, h)
-                        except Exception:
-                            pass
-            self.free_buffers = {}
-            self.pooled_bytes = 0
-
-    def stats(self):
-        with self._lock:
-            requests = self._stats["hits"] + self._stats["misses"]
-            return {
-                **self._stats,
-                "enabled": bool(
-                    self.engine is None
-                    or getattr(self.engine, "_buffer_cache_enabled", True)
-                ),
-                "hit_rate": (self._stats["hits"] / requests if requests else 0.0),
-                "pooled_bytes": self.pooled_bytes,
-                "max_bytes": self.max_bytes,
-                "size_classes": len(self.free_buffers),
-            }
-
-
 class TaichiGPUBuffer:
     def __init__(
         self,
@@ -2277,6 +2112,18 @@ class TaichiGPUBuffer:
                     neginf=-32768.0,
                 )
                 converted = np.clip(source, -32768.0, 32767.0).astype(np.int16)
+            elif cast_pair == (0, 2):
+                converted = np.clip(
+                    np.nan_to_num(source) * 255.0 + 0.5, 0.0, 255.0
+                ).astype(np.uint8)
+            elif cast_pair == (2, 0):
+                converted = source.astype(np.float32) / 255.0
+            elif cast_pair == (0, 3):
+                converted = np.clip(
+                    np.nan_to_num(source) * 65535.0 + 0.5, 0.0, 65535.0
+                ).astype(np.uint16)
+            elif cast_pair == (3, 0):
+                converted = source.astype(np.float32) / 65535.0
             else:
                 converted = source.astype(target_dtype)
             return self.engine.upload(converted)
@@ -2884,13 +2731,13 @@ class AOTEngine:
                         "vendor libEGL.dll. WGL is not supported."
                     )
             if gpu_name:
-                print(
-                    f"[AOTEngine] Runtime initialized on '{arch.upper()}' ({gpu_name})"
-                )
+                _aot_log(f"Backend siap: {arch.upper()} ({gpu_name})")
                 if arch.lower() == "opengl":
                     context_backend = _get_runtime_context_backend(instance.runtime)
                     if context_backend:
-                        print(f"[AOTEngine] OpenGL context provider: {context_backend}")
+                        _aot_log(
+                            f"OpenGL context provider: {context_backend}", detail=True
+                        )
                 # Intel's legacy native Vulkan allocator (not Dozen) can assert
                 # during Taichi context teardown when AOT memory blocks are
                 # still tracked internally.  Keep the process alive by letting
@@ -2907,9 +2754,7 @@ class AOTEngine:
                     # os.environ.setdefault("AOT_INTEL_UNSAFE", "1")
                     os.environ.setdefault("VULKAN_SERIALIZE_SUBMIT", "1")
             else:
-                print(
-                    f"[AOTEngine] Runtime initialized on '{arch.upper()}' (Device {device_id})"
-                )
+                _aot_log(f"Backend siap: {arch.upper()} (perangkat {device_id})")
 
             instance.gpu_name = gpu_name or ""
             instance._graphics_compatibility_mode = _graphics_compatibility_enabled(
@@ -2922,9 +2767,8 @@ class AOTEngine:
                 # device-local ti_map_memory path without changing algorithms
                 # or silently moving execution to CPU.
                 instance._force_host_accessible = True
-                print(
-                    "[AOTEngine] Legacy graphics compatibility active: "
-                    "host-visible buffers, serialized direct graph dispatch."
+                _aot_log(
+                    "Mode kompatibilitas perangkat lama aktif untuk menjaga stabilitas."
                 )
             # The bridge is the source of truth for the actual OpenGL ICD and
             # Vulkan physical-device name.  Refresh the immutable selection
@@ -2948,6 +2792,12 @@ class AOTEngine:
             instance._retired_buffer_budget = _DEFAULT_RETIRED_BUFFER_BUDGET
             instance._staging_pool_budget = _DEFAULT_STAGING_POOL_BUDGET
             instance._staging_pool_max_entries = _MAX_STAGING_POOL_ENTRIES
+            instance._lifecycle = LifecycleManager(
+                staging_budget=instance._staging_pool_budget,
+                retired_budget=instance._retired_buffer_budget,
+                max_staging_entries=instance._staging_pool_max_entries,
+                max_retired_entries=_MAX_RETIRED_BUFFERS,
+            )
             instance._buffer_cache_enabled = (
                 os.environ.get("AOT_BUFFER_CACHE", "1") != "0"
             )
@@ -2961,7 +2811,7 @@ class AOTEngine:
             # Automatic pipeline metadata is kept per thread at dispatch time;
             # this engine-level slot makes lifecycle/reset behavior explicit.
             instance._auto_pipeline_context = None
-            instance._live_buffers = weakref.WeakSet()
+            instance._live_buffers = LiveBufferRegistry()
             instance._executor = None
             instance._async_futures = set()
             instance._async_reservations = 0
@@ -3000,7 +2850,7 @@ class AOTEngine:
                 if arch.lower() == "vulkan"
                 else None
             )
-            instance._memory_governor = MemoryGovernor(
+            instance._memory_governor = MemoryPolicy(
                 configured_max_bytes=instance._block_config.cache_bytes,
                 device_provider=instance._device_memory_provider,
             )
@@ -3016,15 +2866,19 @@ class AOTEngine:
             initial_memory = instance._memory_governor.refresh(force=True)
             instance.buffer_pool.set_budget(initial_memory.device_pool_budget)
             instance._apply_lifecycle_limits(initial_memory, trim=False)
-            print(
-                "[AOTEngine Memory] "
-                f"pressure={initial_memory.pressure.name.lower()} "
+            memory_detail = (
+                f"Memory: pressure={initial_memory.pressure.name.lower()} "
                 f"shared_budget={initial_memory.shared_device_budget // (1024 ** 2)}MB "
                 f"device_available={initial_memory.device_heap_available // (1024 ** 2)}MB "
                 f"source={initial_memory.device_budget_source} "
                 f"pipeline_limit={initial_memory.pipeline_resident_limit // (1024 ** 2)}MB "
                 f"block={initial_memory.recommended_block_size}"
             )
+            if initial_memory.pressure.name.lower() != "healthy":
+                _aot_log(
+                    "Memori grafis terbatas; ukuran pemrosesan disesuaikan agar tetap stabil."
+                )
+            _aot_log(memory_detail, detail=True)
             instance._block_cache = BlockCache(
                 instance._block_config.cache_entries,
                 max_bytes=initial_memory.host_cache_budget,
@@ -3133,6 +2987,21 @@ class AOTEngine:
             1,
             int(getattr(self, "_staging_pool_max_entries", _MAX_STAGING_POOL_ENTRIES)),
         )
+        lifecycle = getattr(self, "_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = self._lifecycle = LifecycleManager(
+                staging_budget=self._staging_pool_budget,
+                retired_budget=self._retired_buffer_budget,
+                max_staging_entries=self._staging_pool_max_entries,
+                max_retired_entries=_MAX_RETIRED_BUFFERS,
+            )
+        else:
+            lifecycle.configure(
+                staging_budget=self._staging_pool_budget,
+                retired_budget=self._retired_buffer_budget,
+                max_staging_entries=self._staging_pool_max_entries,
+                max_retired_entries=_MAX_RETIRED_BUFFERS,
+            )
         if not trim:
             return
         # Callers that explicitly opt into ``trim`` must already be at a
@@ -3140,9 +3009,9 @@ class AOTEngine:
         # ``trim=False`` so it never frees an asynchronously referenced host
         # buffer.
         self._trim_staging_pool()
-        if (
-            int(getattr(self, "_retired_bytes", 0) or 0) > self._retired_buffer_budget
-            or len(getattr(self, "_retired_buffers", ())) > _MAX_RETIRED_BUFFERS
+        if lifecycle.retired_over_budget(
+            bytes_used=getattr(self, "_retired_bytes", 0),
+            count=len(getattr(self, "_retired_buffers", ())),
         ):
             # This is a safe frame/batch boundary.  A single native wait lets
             # the queue release every retired handle; ``BufferPool`` still
@@ -3154,60 +3023,25 @@ class AOTEngine:
         pool = getattr(self, "_staging_pool", None)
         if not pool:
             return 0
-        removed = 0
         with self._lock:
-
-            def entries():
-                for key, bucket in tuple(pool.items()):
-                    for entry in tuple(bucket):
-                        yield key, bucket, entry
-
-            def totals():
-                all_entries = list(entries())
-                return len(all_entries), sum(
-                    int(getattr(item.get("buffer"), "size_bytes", 0) or 0)
-                    for _, _, item in all_entries
-                )
-
-            while True:
-                count, resident = totals()
-                if count <= int(
-                    getattr(
+            lifecycle = getattr(self, "_lifecycle", None)
+            if lifecycle is None:
+                lifecycle = self._lifecycle = LifecycleManager(
+                    staging_budget=getattr(
+                        self, "_staging_pool_budget", _DEFAULT_STAGING_POOL_BUDGET
+                    ),
+                    retired_budget=getattr(
+                        self, "_retired_buffer_budget", _DEFAULT_RETIRED_BUFFER_BUDGET
+                    ),
+                    max_staging_entries=getattr(
                         self, "_staging_pool_max_entries", _MAX_STAGING_POOL_ENTRIES
-                    )
-                ) and resident <= int(
-                    getattr(self, "_staging_pool_budget", _DEFAULT_STAGING_POOL_BUDGET)
-                ):
-                    break
-                candidates = [
-                    (float(item.get("last_used", 0.0) or 0.0), key, bucket, item)
-                    for key, bucket, item in entries()
-                    if not item.get("leased", False)
-                ]
-                if not candidates:
-                    # All entries are in use; defer eviction until release.
-                    break
-                _, key, bucket, entry = min(candidates, key=lambda item: item[0])
-                try:
-                    bucket.remove(entry)
-                except ValueError:
-                    continue
-                if not bucket:
-                    pool.pop(key, None)
-                buf = entry.get("buffer")
-                if buf is not None:
-                    try:
-                        buf._force_destroy()
-                    except Exception:
-                        # Teardown is best effort; dropping the pool reference
-                        # still prevents unbounded Python-side growth.
-                        try:
-                            buf.handle = None
-                            buf.is_owner = False
-                        except Exception:
-                            pass
-                removed += 1
-        return removed
+                    ),
+                    max_retired_entries=_MAX_RETIRED_BUFFERS,
+                )
+            return lifecycle.trim_staging(
+                pool,
+                destroy=lambda buffer: buffer._force_destroy(),
+            )
 
     def _retire_buffer(self, buffer):
         """Retire a wrapper without reusing its handle before queue completion."""
@@ -3229,14 +3063,23 @@ class AOTEngine:
                 return
             self._retired_buffers.append((key, handle))
             self._retired_bytes += key.size_bytes
-            if (
-                self._retired_bytes
-                > int(
-                    getattr(
+            lifecycle = getattr(self, "_lifecycle", None)
+            if lifecycle is None:
+                lifecycle = self._lifecycle = LifecycleManager(
+                    staging_budget=getattr(
+                        self, "_staging_pool_budget", _DEFAULT_STAGING_POOL_BUDGET
+                    ),
+                    retired_budget=getattr(
                         self, "_retired_buffer_budget", _DEFAULT_RETIRED_BUFFER_BUDGET
-                    )
+                    ),
+                    max_staging_entries=getattr(
+                        self, "_staging_pool_max_entries", _MAX_STAGING_POOL_ENTRIES
+                    ),
+                    max_retired_entries=_MAX_RETIRED_BUFFERS,
                 )
-                or len(self._retired_buffers) > _MAX_RETIRED_BUFFERS
+            if lifecycle.retired_over_budget(
+                bytes_used=self._retired_bytes,
+                count=len(self._retired_buffers),
             ):
                 # Never leave an over-budget queue alive indefinitely.  This
                 # wait is only reached on an explicit lifecycle trim/safe
@@ -3290,7 +3133,12 @@ class AOTEngine:
                 finally:
                     _op_end()
             self._retired_buffers = remaining
-            self._retired_bytes = sum(item[0].size_bytes for item in remaining)
+            lifecycle = getattr(self, "_lifecycle", None)
+            self._retired_bytes = (
+                lifecycle.retired_bytes(remaining)
+                if lifecycle is not None
+                else sum(item[0].size_bytes for item in remaining)
+            )
             if not sync_failed:
                 for retired_key, handle in selected:
                     self.buffer_pool.store(retired_key, handle)
@@ -4220,9 +4068,22 @@ class AOTEngine:
         if not hasattr(self, "_cache_telemetry"):
             self._cache_telemetry = CacheTelemetry()
         if not hasattr(self, "_memory_governor"):
-            self._memory_governor = MemoryGovernor(
+            self._memory_governor = MemoryPolicy(
                 configured_max_bytes=self._block_config.cache_bytes,
                 device_provider=getattr(self, "_device_memory_provider", None),
+            )
+        if not hasattr(self, "_lifecycle"):
+            self._lifecycle = LifecycleManager(
+                staging_budget=getattr(
+                    self, "_staging_pool_budget", _DEFAULT_STAGING_POOL_BUDGET
+                ),
+                retired_budget=getattr(
+                    self, "_retired_buffer_budget", _DEFAULT_RETIRED_BUFFER_BUDGET
+                ),
+                max_staging_entries=getattr(
+                    self, "_staging_pool_max_entries", _MAX_STAGING_POOL_ENTRIES
+                ),
+                max_retired_entries=_MAX_RETIRED_BUFFERS,
             )
         if not hasattr(self, "_block_cache"):
             self._block_cache = BlockCache(
@@ -4436,9 +4297,15 @@ class AOTEngine:
             return consumer(entry)
 
     def _log_warning(self, message):
-        """Phase 4 D2 telemetry sink.  Default falls back to ``print`` so
-        warnings are visible without wiring a logger.
+        """Emit optional resident-budget diagnostics.
+
+        Buffer-pool pressure is expected during bounded in-flight pipelines:
+        the engine may temporarily retain retired buffers until the backend
+        reaches a safe point.  Keep normal application output quiet while
+        preserving the diagnostic through the existing verbose switch.
         """
+        if os.environ.get("PIXEL_REFINE_AOT_VERBOSE_LOGS", "0") != "1":
+            return
         try:
             print(f"[AOTEngine][warn] {message}")
         except Exception:  # noqa: BLE001
@@ -4574,16 +4441,19 @@ class AOTEngine:
                 if _shared_budget > 0
                 else 0.0
             )
-            # What the auto-promotion policy would do for a 1 MiB probe.
+            # What the auto-promotion policy would do for a 1 MiB probe.  The
+            # already-computed ``status`` is passed in because this helper
+            # normally fetches its own status; re-fetching here would re-enter
+            # ``get_memory_status`` and recurse until RecursionError.
             status["auto_promote_next_allocation"] = bool(
-                self._decide_memory_domain(1 * 1024 * 1024)
+                self._decide_memory_domain(1 * 1024 * 1024, status=status)
             )
         except Exception:  # noqa: BLE001
             pass
 
         return status
 
-    def _decide_memory_domain(self, size_bytes):
+    def _decide_memory_domain(self, size_bytes, status=None):
         """Phase 4 D1: return True if the next ``size_bytes`` allocation
         should use host-accessible (shared) memory.
 
@@ -4598,6 +4468,14 @@ class AOTEngine:
              - If shared_device_budget < 1.5 * size -> True (prefer host
                over risking OOM).
              - Otherwise -> False (device-local).
+
+        ``status`` lets a caller that already holds a ``get_memory_status()``
+        result reuse it.  That matters because one field of that result is
+        computed by this helper: without it the two would call each other until
+        ``RecursionError``, which the broad handlers below would then swallow.
+        When no status is supplied the cached (non-forced) one is read, since
+        the policy only needs budget numbers and must not force a device sample
+        on every allocation.
         """
         try:
             # Caller override takes precedence.
@@ -4609,13 +4487,14 @@ class AOTEngine:
             _arch = str(getattr(self, "arch", "")).lower()
             if _arch in {"", "cpu"}:
                 return True
-            try:
-                _status = self.get_memory_status(force=True)
-            except Exception:  # noqa: BLE001
-                _status = {}
-            _shared = int(_status.get("shared_device_budget", 0) or 0)
-            _dev_budget = int(_status.get("device_heap_budget", 0) or 0)
-            _dev_avail = int(_status.get("device_heap_available", 0) or 0)
+            if status is None:
+                try:
+                    status = self.get_memory_status(force=False)
+                except Exception:  # noqa: BLE001
+                    status = {}
+            _shared = int(status.get("shared_device_budget", 0) or 0)
+            _dev_budget = int(status.get("device_heap_budget", 0) or 0)
+            _dev_avail = int(status.get("device_heap_available", 0) or 0)
             if _dev_budget <= 0:
                 # Backend did not report a device heap; treat as shared.
                 return True
@@ -5493,33 +5372,33 @@ class AOTEngine:
         self._check_max_pixel_count(arr.shape)
         # Phase 4 D2: surface a soft warning when an upload would push
         # ``live + pooled + retired`` past the adaptive
-        # ``pipeline_resident_limit``.  We do not raise here because
-        # legacy callers (notably MFDenoiser / resident_pipeline.py)
-        # intentionally commit full-res accumulators that exceed the
-        # 1 GiB default; raising here would break them.  Callers that
-        # want strict enforcement can use ``engine.allocate`` instead.
-        try:
-            _sz = int(arr.nbytes)
-            _status = self.get_memory_status(force=True)
-            _live = int(_status.get("live_bytes", 0) or 0)
-            _pooled = int(_status.get("pooled_bytes", 0) or 0)
-            _retired = int(_status.get("retired_bytes", 0) or 0)
-            _limit = int(_status.get("resident_limit", 0) or 0)
-            if _limit > 0 and (_live + _pooled + _retired + _sz) > _limit:
-                _print_fn = getattr(self, "_log_warning", None)
-                if callable(_print_fn):
-                    _print_fn(
-                        f"upload({tuple(arr.shape)!r}, {arr.dtype}) requests "
-                        f"{_sz / (1024 * 1024):.1f} MiB but live+pooled+retired "
-                        f"({(_live + _pooled + _retired) / (1024 * 1024):.1f} MiB) "
-                        f"plus this upload ({_sz / (1024 * 1024):.1f} MiB) "
-                        f"exceeds pipeline_resident_limit "
-                        f"({_limit / (1024 * 1024):.1f} MiB). "
-                        "Consider engine.reclaim_resident_buffers() or "
-                        "engine.allocate(host_accessible=True) for this size."
-                    )
-        except Exception:  # noqa: BLE001
-            pass
+        # ``pipeline_resident_limit``.  The warning is opt-in, so avoid a
+        # forced device-memory sample on every upload in the normal hot path.
+        # We do not raise here because legacy callers intentionally commit
+        # full-res accumulators that can exceed the advisory limit.
+        if os.environ.get("PIXEL_REFINE_AOT_VERBOSE_LOGS", "0") == "1":
+            try:
+                _sz = int(arr.nbytes)
+                _status = self.get_memory_status(force=True)
+                _live = int(_status.get("live_bytes", 0) or 0)
+                _pooled = int(_status.get("pooled_bytes", 0) or 0)
+                _retired = int(_status.get("retired_bytes", 0) or 0)
+                _limit = int(_status.get("resident_limit", 0) or 0)
+                if _limit > 0 and (_live + _pooled + _retired + _sz) > _limit:
+                    _print_fn = getattr(self, "_log_warning", None)
+                    if callable(_print_fn):
+                        _print_fn(
+                            f"upload({tuple(arr.shape)!r}, {arr.dtype}) requests "
+                            f"{_sz / (1024 * 1024):.1f} MiB but live+pooled+retired "
+                            f"({(_live + _pooled + _retired) / (1024 * 1024):.1f} MiB) "
+                            f"plus this upload ({_sz / (1024 * 1024):.1f} MiB) "
+                            f"exceeds pipeline_resident_limit "
+                            f"({_limit / (1024 * 1024):.1f} MiB). "
+                            "Consider engine.reclaim_resident_buffers() or "
+                            "engine.allocate(host_accessible=True) for this size."
+                        )
+            except Exception:  # noqa: BLE001
+                pass
 
         # Phase 4 D1: pass the sentinel default; let ``allocate`` apply
         # the auto-promote policy.  The historical ``host_accessible=True``
@@ -5707,7 +5586,7 @@ class AOTEngine:
                     f"  HINT: Ensure the .tcm file exists and is compatible with the active GPU backend ({self.arch.upper()})."
                     f"{detail}"
                 )
-            print(f"[AOTEngine] Loaded TCM module: {os.path.basename(p)}")
+            _aot_log(f"TCM module loaded: {os.path.basename(p)}", detail=True)
             set_status(cache_key, "valid", backend=self.arch, device=device_name)
             self.modules[p] = AOTModuleWrapper(ptr, self)
             return self.modules[p]
@@ -6358,8 +6237,9 @@ def _global_cleanup(reason: str = "atexit", force: bool = False):
         _CLEANUP_DONE = True
 
     try:
-        sys.stderr.write(f"[AOTEngine] GPU cleanup triggered (reason={reason})\n")
-        sys.stderr.flush()
+        if os.environ.get("PIXEL_REFINE_AOT_VERBOSE_LOGS", "0") == "1":
+            sys.stderr.write(f"[Taichi Vision - Detail] GPU cleanup: {reason}\n")
+            sys.stderr.flush()
     except Exception:
         pass
 
@@ -6420,13 +6300,6 @@ for _sig in crash_signals:
     except (OSError, ValueError):
         pass  # Cannot set handlers on non-main threads; skip gracefully
 
-# SIGBREAK is Windows-specific (Ctrl+Break / console close)
-if hasattr(signal, "SIGBREAK"):
-    try:
-        signal.signal(signal.SIGBREAK, _signal_cleanup_handler)
-    except (OSError, ValueError):
-        pass
-
 
 # --- Watchdog is started EARLY (before DLL/GPU init) — see top of file ---
 
@@ -6469,3 +6342,125 @@ def OutputArray(
         vector_dim=vector_dim,
         host_accessible=host_accessible,
     )
+
+
+def cast(src, target_dtype=np.uint8, out=None, host_accessible=True):
+    """
+    High-performance native type conversion with mathematical normalization.
+    Maps [0.0, 1.0] <-> [0, 255] for uint8, and [0.0, 1.0] <-> [0, 65535] for uint16.
+    Uses C++ SIMD bridge (_LIB.ti_cast_buffer) or zero-overhead integer bitshifts without float64 promotions.
+
+    Args:
+        src: TaichiGPUBuffer or numpy.ndarray
+        target_dtype: Target numpy dtype (default: np.uint8)
+        out: Optional pre-allocated destination array (numpy.ndarray)
+        host_accessible: If src is TaichiGPUBuffer, whether destination buffer should be host accessible.
+
+    Returns:
+        Converted TaichiGPUBuffer or numpy.ndarray.
+    """
+    if src is None:
+        return None
+
+    if isinstance(src, TaichiGPUBuffer):
+        return src.cast(target_dtype, host_accessible=host_accessible)
+
+    if not isinstance(src, np.ndarray):
+        src = np.asarray(src)
+
+    src_dtype = np.dtype(src.dtype).type
+    tgt_dtype = np.dtype(target_dtype).type
+
+    if src_dtype == tgt_dtype:
+        if out is None:
+            return src
+        np.copyto(out, src)
+        return out
+
+    # Fast Integer Path: uint16 -> uint8 (Bitshift >> 8, 0 float promotions, 0 memory spikes)
+    if src_dtype == np.uint16 and tgt_dtype == np.uint8:
+        if out is None:
+            return np.ascontiguousarray(src >> 8, dtype=np.uint8)
+        else:
+            np.right_shift(src, 8, out=out)
+            return out
+
+    num_elements = int(src.size)
+
+    # Native C++ SIMD Path: float32 -> uint8 (AVX2/SSE2: [0.0, 1.0] -> [0, 255])
+    if src_dtype == np.float32 and tgt_dtype == np.uint8:
+        if out is None:
+            out = np.empty(src.shape, dtype=np.uint8)
+        if _LIB is not None and hasattr(_LIB, "ti_cast_buffer"):
+            src_c = np.ascontiguousarray(src, dtype=np.float32)
+            out_c = np.ascontiguousarray(out, dtype=np.uint8)
+            success = _LIB.ti_cast_buffer(
+                ctypes.c_void_p(src_c.ctypes.data),
+                ctypes.c_void_p(out_c.ctypes.data),
+                num_elements,
+                0,  # f32
+                2,  # u8
+            )
+            if success:
+                return out_c
+        return np.clip(np.nan_to_num(src) * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+
+    # Native C++ SIMD Path: uint8 -> float32 (AVX2/SSE2: [0, 255] -> [0.0, 1.0])
+    if src_dtype == np.uint8 and tgt_dtype == np.float32:
+        if out is None:
+            out = np.empty(src.shape, dtype=np.float32)
+        if _LIB is not None and hasattr(_LIB, "ti_cast_buffer"):
+            src_c = np.ascontiguousarray(src, dtype=np.uint8)
+            out_c = np.ascontiguousarray(out, dtype=np.float32)
+            success = _LIB.ti_cast_buffer(
+                ctypes.c_void_p(src_c.ctypes.data),
+                ctypes.c_void_p(out_c.ctypes.data),
+                num_elements,
+                2,  # u8
+                0,  # f32
+            )
+            if success:
+                return out_c
+        return src.astype(np.float32) / 255.0
+
+    # Native C++ SIMD Path: float32 -> uint16 (AVX2/SSE2: [0.0, 1.0] -> [0, 65535])
+    if src_dtype == np.float32 and tgt_dtype == np.uint16:
+        if out is None:
+            out = np.empty(src.shape, dtype=np.uint16)
+        if _LIB is not None and hasattr(_LIB, "ti_cast_buffer"):
+            src_c = np.ascontiguousarray(src, dtype=np.float32)
+            out_c = np.ascontiguousarray(out, dtype=np.uint16)
+            success = _LIB.ti_cast_buffer(
+                ctypes.c_void_p(src_c.ctypes.data),
+                ctypes.c_void_p(out_c.ctypes.data),
+                num_elements,
+                0,  # f32
+                3,  # u16
+            )
+            if success:
+                return out_c
+        return np.clip(np.nan_to_num(src) * 65535.0 + 0.5, 0.0, 65535.0).astype(np.uint16)
+
+    # Native C++ SIMD Path: uint16 -> float32 (AVX2/SSE2: [0, 65535] -> [0.0, 1.0])
+    if src_dtype == np.uint16 and tgt_dtype == np.float32:
+        if out is None:
+            out = np.empty(src.shape, dtype=np.float32)
+        if _LIB is not None and hasattr(_LIB, "ti_cast_buffer"):
+            src_c = np.ascontiguousarray(src, dtype=np.uint16)
+            out_c = np.ascontiguousarray(out, dtype=np.float32)
+            success = _LIB.ti_cast_buffer(
+                ctypes.c_void_p(src_c.ctypes.data),
+                ctypes.c_void_p(out_c.ctypes.data),
+                num_elements,
+                3,  # u16
+                0,  # f32
+            )
+            if success:
+                return out_c
+        return src.astype(np.float32) / 65535.0
+
+    # Fallback path for any other datatypes
+    if out is None:
+        return src.astype(target_dtype)
+    np.copyto(out, src.astype(target_dtype))
+    return out

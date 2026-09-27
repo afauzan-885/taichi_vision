@@ -72,6 +72,16 @@ def rgb_to_bgr_i32_args():
     }
 
 
+def rgb_to_bgr_u16_args():
+    """Args for the CUDA-only f32->u16 BGR converter graph."""
+    return {
+        "src": ndarray_arg("src", ti.f32, 3),
+        "dst": ndarray_arg("dst", ti.u16, 3),
+        "h": scalar_arg("h", ti.i32),
+        "w": scalar_arg("w", ti.i32),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Bilinear family
 # ---------------------------------------------------------------------------
@@ -159,6 +169,8 @@ def register_bilinear_graphs(module, kernels):
     g.dispatch(kernels["rgb_to_bgr_i32"], conv["src"], conv["dst"], conv["h"], conv["w"])
     module.add_graph("rgb_to_bgr_i32", g.compile())
 
+    # CUDA supports u16 ndarray ABI; SPIR-V targets do not consistently expose
+    # it, so keep the graph target-qualified instead of weakening portability.
     return module
 
 
@@ -242,8 +254,11 @@ def register_hamilton_graphs(module, kernels):
     module.add_graph("hamilton_demosaic_rgb_half_res", g.compile())
 
     # 6. hamilton_demosaic_3channel (full demosaic -> grayscale luma)
+    # Only the edge-directed green pass feeds the luma output.  The former
+    # ``preprocess_wb`` dispatch wrote a full-resolution ``wb_bayer`` plane that
+    # no kernel in this graph ever read, costing one h*w float32 allocation and
+    # one extra full-frame dispatch on every call.
     g = ti.graph.GraphBuilder()
-    g.dispatch(kernels["preprocess_wb"], bayer, io["wb_bayer"], *common)
     g.dispatch(kernels["green_direct"], bayer, green, *common)
     g.dispatch(kernels["grayscale"], green, io["dst_2d"], s["h"], s["w"])
     module.add_graph("hamilton_demosaic_3channel", g.compile())
@@ -253,6 +268,12 @@ def register_hamilton_graphs(module, kernels):
     g = ti.graph.GraphBuilder()
     g.dispatch(kernels["rgb_to_bgr_i32"], conv["src"], conv["dst"], conv["h"], conv["w"])
     module.add_graph("rgb_to_bgr_i32", g.compile())
+
+    if getattr(module, "_arch", getattr(module, "arch", None)) == ti.cuda and kernels.get("rgb_to_bgr_u16") is not None:
+        conv16 = rgb_to_bgr_u16_args()
+        g = ti.graph.GraphBuilder()
+        g.dispatch(kernels["rgb_to_bgr_u16"], conv16["src"], conv16["dst"], conv16["h"], conv16["w"])
+        module.add_graph("rgb_to_bgr_u16", g.compile())
 
     return module
 
@@ -541,6 +562,10 @@ def register_mlri_graphs(module, kernels, arch):
                 kernels["admm2"],
                 wb_bayer, green, r_diff, b_diff, temp_a, temp_b, s["h"], s["w"], *cfa,
             )
+        graph.dispatch(
+            kernels["suppress_outliers"],
+            wb_bayer, green, r_diff, b_diff, s["h"], s["w"], *cfa,
+        )
 
     def dispatch_reconstruct(graph, grayscale=False):
         if is_vulkan:
